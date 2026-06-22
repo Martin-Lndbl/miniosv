@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <unistd.h>
 
-uint64_t rte_get_timer_cycles() { return processor::rdtsc(); }
+uint64_t rte_get_timer_cycles() { return processor::ticks(); }
 
 uint64_t rte_get_timer_hz() {
   auto nanos = clock::get()->processor_to_nano(NS_PER_S);
