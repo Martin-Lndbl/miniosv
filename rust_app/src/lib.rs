@@ -17,9 +17,8 @@ macro_rules! print {
     };
 }
 
-// Static buffers for our loopback device
-const MTU: usize = 1536;
-const QUEUE_SIZE: usize = 4;
+const MTU: usize = 9000;
+const QUEUE_SIZE: usize = 64;
 
 struct StaticLoopback {
     queue: [[u8; MTU]; QUEUE_SIZE],
@@ -120,18 +119,17 @@ pub extern "C" fn osv_app_main() {
     print!("Starting smoltcp loopback benchmark...\n");
 
     let device = unsafe { &mut DEVICE };
-
     let config = Config::new(EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]).into());
     let mut iface = Interface::new(config, device, Instant::from_millis(0));
     iface.update_ip_addrs(|addrs| {
         addrs.push(IpCidr::new(IpAddress::Ipv4(Ipv4Address::new(127, 0, 0, 1)), 8)).unwrap();
     });
 
-    // TCP socket buffers (static)
-    static mut RX_BUF_S: [u8; 4096] = [0u8; 4096];
-    static mut TX_BUF_S: [u8; 4096] = [0u8; 4096];
-    static mut RX_BUF_C: [u8; 4096] = [0u8; 4096];
-    static mut TX_BUF_C: [u8; 4096] = [0u8; 4096];
+    static mut RX_BUF_S: [u8; 65536] = [0u8; 65536];
+    static mut TX_BUF_S: [u8; 65536] = [0u8; 65536];
+    static mut RX_BUF_C: [u8; 65536] = [0u8; 65536];
+    static mut TX_BUF_C: [u8; 65536] = [0u8; 65536];
+    static mut DATA:     [u8; 65536] = [0x2au8; 65536];
 
     let server_socket = unsafe {
         tcp::Socket::new(
@@ -153,31 +151,25 @@ pub extern "C" fn osv_app_main() {
     let server_handle = sockets.add(server_socket);
     let client_handle = sockets.add(client_socket);
 
-    // Listen on server
-    sockets.get_mut::<tcp::Socket>(server_handle)
-        .listen(1234).unwrap();
-
-    // Connect client
+    sockets.get_mut::<tcp::Socket>(server_handle).listen(1234).unwrap();
     sockets.get_mut::<tcp::Socket>(client_handle)
         .connect(iface.context(), (Ipv4Address::new(127, 0, 0, 1), 1234), 49152).unwrap();
 
-    static mut DATA: [u8; 1024] = [0xABu8; 1024];
-
-    const TOTAL_BYTES: usize = 20 * 1024 * 1024 * 1024; // 20GB
+    const TOTAL_BYTES: usize = 100 * 1024 * 1024 * 1024;
     let mut sent = 0usize;
     let mut received = 0usize;
     let mut tick = 0i64;
 
-    print!("Transferring 20GB over loopback...\n");
+    print!("Transferring 100GB over loopback...\n");
 
     loop {
         let device = unsafe { &mut DEVICE };
         iface.poll(Instant::from_millis(tick), device, &mut sockets);
         tick += 1;
 
-        // Server: receive data
+        // Drain receiver completely
         let server = sockets.get_mut::<tcp::Socket>(server_handle);
-        if server.can_recv() {
+        while server.can_recv() {
             let n = server.recv(|buf| {
                 let len = buf.len();
                 (len, len)
@@ -185,24 +177,21 @@ pub extern "C" fn osv_app_main() {
             received += n;
         }
 
-        // Client: send data
+        // Fill sender completely
         let client = sockets.get_mut::<tcp::Socket>(client_handle);
-        if client.can_send() && sent < TOTAL_BYTES {
-            let to_send = (TOTAL_BYTES - sent).min(1024);
-            let n = unsafe {
-                client.send_slice(&DATA[..to_send]).unwrap_or(0)
-            };
+        while client.can_send() && sent < TOTAL_BYTES {
+            let to_send = (TOTAL_BYTES - sent).min(65536);
+            let n = unsafe { client.send_slice(&DATA[..to_send]).unwrap_or(0) };
+            if n == 0 { break; }
             sent += n;
         }
 
         if received >= TOTAL_BYTES {
             break;
         }
-
-        // No timeout for 20GB — just let it run
     }
 
-    print!("Done! Transferred 20GB in loopback.\n");
+    print!("Done! Transferred 100GB over loopback.\n");
 }
 
 #[unsafe(no_mangle)]
