@@ -71,6 +71,17 @@
               gdb
             ]);
         };
+
+        devShells.rust = pkgs.mkShell {
+          nativeBuildInputs =
+            buildDeps
+            ++ (with pkgs; [
+              cargo
+              gdb
+              qemu
+            ]);
+        };
+
       }
     );
 }
