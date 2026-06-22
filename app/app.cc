@@ -11,10 +11,19 @@
 
 #include <cstdio>
 #include <osv/power.hh>
+#include <osv/uperf.hh>
 
 extern "C" void osv_app_main()
 {
+    // Threads need to be pinned to core
+    uperf::Collection bench;
+    bench.startCounters();
+
     printf("Hello, world from OSv!\n");
+
+    bench.stopCounters();
+    bench.printReport(std::cout);
+
     // Do not power off: keep the machine running so the boot output stays
     // visible on the (cloud) serial console instead of the instance stopping
     // the moment it finishes booting. The empty asm keeps the compiler from
@@ -22,4 +31,6 @@ extern "C" void osv_app_main()
     while (true) {
         asm volatile("" ::: "memory");
     }
+
+    osv::poweroff();
 }
