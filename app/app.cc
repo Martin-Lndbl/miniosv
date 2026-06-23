@@ -51,6 +51,5 @@ extern "C" void osv_app_main()
         printf("  Max MAC addrs: %u\n", info.max_mac_addrs);
     }
  
-
     osv::poweroff();
 }
