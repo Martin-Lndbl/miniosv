@@ -1,9 +1,8 @@
 #pragma once
 
 // Disclaimer
-// This header targets new amd and arm chips and does not provide backward compatibility
-// Tested chips are:
-// For x86
+// This header targets new amd and arm chips and does not provide backward
+// compatibility Tested chips are: For x86
 //    - Zen 4
 //    - Zen 5
 // For ARM
@@ -12,12 +11,11 @@
 //    - Neoverse V-2
 
 #include <atomic>
-#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
-#include <memory>
+#include <chrono>
 #include <string>
 #include <vector>
 
@@ -30,6 +28,11 @@
 #endif
 
 #ifdef ARCH_TARGET_X86_64
+
+inline uint32_t pmu_num_counters() {
+  // TODO: This is currently a stub / best guess for amd processors
+  return 6;
+}
 
 inline void msr_write(uint32_t msr, uint64_t value) {
   asm volatile("wrmsr"
@@ -64,6 +67,13 @@ inline uint64_t msr_read(uint32_t msr) {
 #elif defined ARCH_TARGET_ARM64
 
 inline constexpr uint32_t midr_fixed_mask = 0xFF0F'FFF0u;
+
+// To check how many hardware counters are available
+inline uint32_t pmu_num_counters() {
+  uint64_t pmcr;
+  asm volatile("mrs %0, pmcr_el0" : "=r"(pmcr));
+  return (pmcr >> 11) & 0x1F;
+}
 
 // To check if we currently run on a specific CPU.
 inline bool is_midr(uint32_t to_check) {
@@ -118,19 +128,43 @@ inline bool is_event_supported(uint64_t value) {
 inline void enable_pmu() {
   uint64_t pmcr;
 
-  // 1. Read PMCR_EL0, set E (Enable)
-  // We could also set 0b101 to also reset the cycle counter bits but not sure
-  // if its required
-  asm volatile("mrs %0, pmcr_el0" : "=r"(pmcr));
-  asm volatile("msr pmcr_el0, %0" : : "r"(pmcr | 0b1));
-
-  // Ensure pipeline is synchronized before we start counting
-  asm volatile("isb");
+  // Clear all counters
+  asm volatile("msr pmcntenclr_el0, %0\t\n"
+               "isb" ::"r"((uint64_t)0xFFFFFFFF)
+               : "memory");
+  // 1. Read PMCR_EL0
+  // - set bit[0]: E (Enable)
+  // - set bit[1]: P (Reset event counters)
+  // - set bit[2]: C (Reset cycle counter)
+  // - clr bit[3]: D (Cycle counter divider)
+  asm volatile("mrs %0, pmcr_el0\n\t"
+               "orr %0, %0, #0b111\n\t"
+               "and %0, %0, #~0b1000\n\t"
+               "msr pmcr_el0, %0\n\t"
+               "isb\n\t"
+               : "=&r"(pmcr)
+               :
+               : "memory");
 }
 
 inline void msr_stop(int32_t counter, uint32_t evtSel) {
   // Disable counter
-  asm volatile("msr pmcntenclr_el0, %0" : : "r"(0ull | evtSel));
+  asm volatile("msr pmcntenclr_el0, %0" : : "r"((uint64_t)evtSel));
+  asm volatile("isb" ::: "memory");
+}
+
+inline void msr_write_counter(uint32_t counter, uint64_t value) {
+  switch (counter) {
+    // clang-format off
+  case 0: asm volatile("msr pmevcntr0_el0, %0" : : "r"(value)); break;
+  case 1: asm volatile("msr pmevcntr1_el0, %0" : : "r"(value)); break;
+  case 2: asm volatile("msr pmevcntr2_el0, %0" : : "r"(value)); break;
+  case 3: asm volatile("msr pmevcntr3_el0, %0" : : "r"(value)); break;
+  case 4: asm volatile("msr pmevcntr4_el0, %0" : : "r"(value)); break;
+  case 5: asm volatile("msr pmevcntr5_el0, %0" : : "r"(value)); break;
+  case (1u << 31): asm volatile("msr pmccntr_el0, %0" : : "r"(value)); break;
+    // clang-format on
+  }
 }
 
 inline void msr_start_with_conf(uint32_t counter, uint32_t evtSel,
@@ -141,83 +175,42 @@ inline void msr_start_with_conf(uint32_t counter, uint32_t evtSel,
 
   // Write event configuration into corresponding register
   switch (evtSel) {
-  case 0:
-    asm volatile("msr pmevtyper0_el0, %0" : : "r"(value));
-    break;
-  case 1:
-    asm volatile("msr pmevtyper1_el0, %0" : : "r"(value));
-    break;
-  case 2:
-    asm volatile("msr pmevtyper2_el0, %0" : : "r"(value));
-    break;
-  case 3:
-    asm volatile("msr pmevtyper3_el0, %0" : : "r"(value));
-    break;
-  case 4:
-    asm volatile("msr pmevtyper4_el0, %0" : : "r"(value));
-    break;
-  case 5:
-    asm volatile("msr pmevtyper5_el0, %0" : : "r"(value));
-    break;
+    // clang-format off
+  case 0: asm volatile("msr pmevtyper0_el0, %0" : : "r"(value)); break;
+  case 1: asm volatile("msr pmevtyper1_el0, %0" : : "r"(value)); break;
+  case 2: asm volatile("msr pmevtyper2_el0, %0" : : "r"(value)); break;
+  case 3: asm volatile("msr pmevtyper3_el0, %0" : : "r"(value)); break;
+  case 4: asm volatile("msr pmevtyper4_el0, %0" : : "r"(value)); break;
+  case 5: asm volatile("msr pmevtyper5_el0, %0" : : "r"(value)); break;
+    // clang-format on
+  case (1u << 31):
+    asm volatile("msr pmcntenset_el0, %0\n\t"
+                 "isb" ::"r"((uint64_t)(1u << 31))
+                 : "memory");
+    return;
   }
+  // Ensure pipeline is synchronized before we enable counter
+  asm volatile("isb" ::: "memory");
 
   // enable counter at index counter
   asm volatile("msr pmcntenset_el0, %0" : : "r"(1ull << counter));
 
   // Ensure pipeline is synchronized before we start counting
-  asm volatile("isb");
-}
-
-inline void msr_write_counter(uint32_t counter, uint64_t value) {
-  switch (counter) {
-  case 0:
-    asm volatile("msr pmevcntr0_el0, %0" : : "r"(value));
-    break;
-  case 1:
-    asm volatile("msr pmevcntr1_el0, %0" : : "r"(value));
-    break;
-  case 2:
-    asm volatile("msr pmevcntr2_el0, %0" : : "r"(value));
-    break;
-  case 3:
-    asm volatile("msr pmevcntr3_el0, %0" : : "r"(value));
-    break;
-  case 4:
-    asm volatile("msr pmevcntr4_el0, %0" : : "r"(value));
-    break;
-  case 5:
-    asm volatile("msr pmevcntr5_el0, %0" : : "r"(value));
-    break;
-  case (1u << 31):
-    asm volatile("msr pmccntr_el0, %0" : : "r"(value));
-    break;
-  }
+  asm volatile("isb" ::: "memory");
 }
 
 inline uint64_t msr_read(uint32_t counter) {
   uint64_t value;
   switch (counter) {
-  case 0:
-    asm volatile("mrs %0, pmevcntr0_el0" : "=r"(value));
-    break;
-  case 1:
-    asm volatile("mrs %0, pmevcntr1_el0" : "=r"(value));
-    break;
-  case 2:
-    asm volatile("mrs %0, pmevcntr2_el0" : "=r"(value));
-    break;
-  case 3:
-    asm volatile("mrs %0, pmevcntr3_el0" : "=r"(value));
-    break;
-  case 4:
-    asm volatile("mrs %0, pmevcntr4_el0" : "=r"(value));
-    break;
-  case 5:
-    asm volatile("mrs %0, pmevcntr5_el0" : "=r"(value));
-    break;
-  case (1u << 31):
-    asm volatile("mrs %0, pmccntr_el0" : "=r"(value));
-    break;
+    // clang-format off
+  case 0: asm volatile("mrs %0, pmevcntr0_el0" : "=r"(value)); break;
+  case 1: asm volatile("mrs %0, pmevcntr1_el0" : "=r"(value)); break;
+  case 2: asm volatile("mrs %0, pmevcntr2_el0" : "=r"(value)); break;
+  case 3: asm volatile("mrs %0, pmevcntr3_el0" : "=r"(value)); break;
+  case 4: asm volatile("mrs %0, pmevcntr4_el0" : "=r"(value)); break;
+  case 5: asm volatile("mrs %0, pmevcntr5_el0" : "=r"(value)); break;
+  case (1u << 31): asm volatile("mrs %0, pmccntr_el0" : "=r"(value)); break;
+    // clang-format on
   }
   return value;
 }
@@ -225,7 +218,7 @@ inline uint64_t msr_read(uint32_t counter) {
 #endif
 
 // Implementer=0x41, Arch=0xF, Part=0xD46
-inline constexpr uint32_t midr_neoverseV1 = 0x410F'D460u;
+inline constexpr uint32_t midr_neoverseV1 = 0x410F'D400u;
 
 namespace uperf {
 
@@ -260,40 +253,41 @@ struct PMC {
   PMClass pmClass;
 
   // Whether or not this pmc is currently counting
-  std::unique_ptr<std::atomic<bool>> free;
+  mutable std::atomic<bool> free{true};
 
   PMC(uint32_t perfEvtSel, uint32_t perfCtr, PMClass pmClass)
-      : perfEvtSel(perfEvtSel), perfCtr(perfCtr), pmClass(pmClass),
-        free(nullptr) {}
+      : perfEvtSel(perfEvtSel), perfCtr(perfCtr), pmClass(pmClass), free(true) {
+  }
 
+  // atomic is not copyable, so define it manually
   PMC(PMC const &pmc)
       : perfEvtSel(pmc.perfEvtSel), perfCtr(pmc.perfCtr), pmClass(pmc.pmClass),
-        free(std::make_unique<std::atomic<bool>>(true)) {}
+        free(true) {}
+
+  PMC &operator=(PMC const &pmc) {
+    perfEvtSel = pmc.perfEvtSel;
+    perfCtr = pmc.perfCtr;
+    pmClass = pmc.pmClass;
+    free.store(true);
+    return *this;
+  }
 
   uint64_t probe() { return msr_read(perfCtr); }
-
   void start_with_conf(uint64_t value) {
     msr_write_counter(perfCtr, 0);
     msr_start_with_conf(perfCtr, perfEvtSel, value);
   }
-
-  void stop() { msr_stop(perfCtr, perfEvtSel); };
+  void stop() { msr_stop(perfCtr, perfEvtSel); }
 };
 
-// TODO: Extend this logic to support sharing counters between groups of cores
 struct PMCSelect {
-  PMCSelect(std::initializer_list<PMC> pmcs) : pmcs(pmcs) {
-    if (is_midr(midr_neoverseV1)) {
-      this->pmcs.pop_back();
-      std::cout << "Detected ARM Neoverse V1: Disabling counter 0. You only have 5 counters available." << std::endl;
-    }
-  }
+  PMCSelect(std::initializer_list<PMC> pmcs) : pmcs(pmcs) {}
 
   PMC *acquire(PMClass pmClass, uint8_t retries = 0) {
     for (auto &pmc : pmcs) {
       bool expected = true;
       if (pmc.pmClass == pmClass &&
-          pmc.free->compare_exchange_strong(expected, false))
+          pmc.free.compare_exchange_strong(expected, false))
         return &pmc;
     }
     if (retries == 6)
@@ -304,32 +298,37 @@ struct PMCSelect {
     return acquire(pmClass, retries);
   }
 
-  void release(PMC *pmc) { pmc->free->store(true); }
+  void release(PMC *pmc) { pmc->free.store(true); }
 
-private:
+protected:
   std::vector<PMC> pmcs;
 };
 
-inline PMCSelect pmcSelect{
-#ifdef ARCH_TARGET_X86_64
-    PMC{0xC0010200, 0xC0010201, CORE}, PMC{0xC0010202, 0xC0010203, CORE},
-    PMC{0xC0010204, 0xC0010205, CORE}, PMC{0xC0010206, 0xC0010207, CORE},
-    PMC{0xC0010208, 0xC0010209, CORE}, PMC{0xC001020A, 0xC001020B, CORE},
-#elif defined ARCH_TARGET_ARM64
-    // On graviton 3, core counters cannot count cycles, but the designated
-    // cycles counter can. Note that the id is made up. Make sure it doesn't
-    // conflict with anything else later on.
-    PMC{1u << 31, 1u << 31, CYCLES},
+// Specification for core-local counters.
+// This adjust the number of available counters at runtime,
+// since AWS slices the number of counters per VM.
+struct PMCSelectCore : PMCSelect {
+  PMCSelectCore(std::initializer_list<PMC> pmcs) : PMCSelect(pmcs) {
+    uint32_t act_ctrs = pmu_num_counters();
+    uint32_t exp_ctrs{0};
+    for (auto &c : this->pmcs) {
+      exp_ctrs += c.pmClass == CORE ? 1 : 0;
+    }
+    if (act_ctrs < exp_ctrs) {
+      std::cout << "Expected " << exp_ctrs << " hardware counters, but only "
+                << act_ctrs << " are available." << std::endl
+                << " Removing the last " << (exp_ctrs - act_ctrs)
+                << " entries..." << std::endl;
+      this->pmcs.erase(this->pmcs.begin() + act_ctrs, this->pmcs.end());
+    }
 
-    // Armv8_pmu3 usually has 6 counters (ids 0-5)
-    PMC{5, 5, CORE},
-    PMC{4, 4, CORE},
-    PMC{3, 3, CORE},
-    PMC{2, 2, CORE},
-    PMC{1, 1, CORE},
-    // Note: id 0 is last here so we can pop() it for graviton3 chips
-    PMC{0, 0, CORE},
-#endif
+    if (is_midr(midr_neoverseV1)) {
+      std::cout << "Detected ARM Neoverse V1: Disabling counter 0 since it "
+                   "doesn't work reliably on this CPU. You have "
+                << act_ctrs - 1 << " counters available" << std::endl;
+      this->pmcs.erase(this->pmcs.begin());
+    }
+  }
 };
 
 struct PMCEvent {
@@ -482,10 +481,10 @@ struct Event {
   uint64_t before;
   uint64_t after;
 
-  Event(PMCEvent pmce) : pmce(pmce) {}
+  Event(PMCEvent pmce, PMCSelect &pmcs) : pmce(pmce), pmcs(pmcs) {}
 
   void start() {
-    pmc = corePMCs.acquire(pmce.pmClass);
+    pmc = pmcs.acquire(pmce.pmClass);
     if (!pmc) {
       std::cerr << "[ERROR] All hardware counters are occupied. Event "
                 << pmce.name << " will not be measured." << std::endl;
@@ -500,33 +499,51 @@ struct Event {
       return;
     after = pmc->probe();
     pmc->stop();
-    corePMCs.release(pmc);
+    pmcs.release(pmc);
   }
 
   uint64_t report() { return after - before; }
 
 private:
-  PMCSelect &corePMCs{pmcSelect};
+  PMCSelect &pmcs;
   PMC *pmc;
 };
 
+// The uperf interface to the application:
+// A number of counters that are started and stopped simultaneously.
+// The default constructor sets popular counters and assumes no other
+// performance measurements on the same core.
+//
+// To select different counters:
 struct Collection {
+  // The selection of hardware counters available to this collection.
+  PMCSelect &pmcs = default_pmcs;
+
+  // A vector of registered events. Must not be larger than the number of
+  // available hardware counters.
   std::vector<Event> events;
+
   std::chrono::time_point<std::chrono::steady_clock> startTime;
   std::chrono::time_point<std::chrono::steady_clock> stopTime;
 
-  Collection() {
+  // Constructor to use with default set of counters.
+  // Common use case: On-core measurements, single Collection per core.
+  Collection(bool set_default_counters = true) {
     enable_pmu();
 
-    // There are usually 6 hardware counters of type CORE.
-    // Trying to register more than that will
-    registerCounter(Events::CPU_CYCLES);
-    registerCounter(Events::INSTRUCTIONS);
-    registerCounter(Events::L2_CACHE_MISS);
-    registerCounter(Events::BRANCH_MISS);
+    if (set_default_counters) {
+      registerCounter(Events::CPU_CYCLES);
+      registerCounter(Events::INSTRUCTIONS);
+      registerCounter(Events::L2_CACHE_MISS);
+      registerCounter(Events::BRANCH_MISS);
+    }
   }
 
-  void registerCounter(PMCEvent pmce) { events.push_back(Event(pmce)); }
+  // Constructor to use with custom set of counters.
+  // Common use case: Share counters between multiple collections
+  Collection(PMCSelect &pmcSelect) : pmcs(pmcSelect) { enable_pmu(); }
+
+  void registerCounter(PMCEvent pmce) { events.push_back(Event(pmce, pmcs)); }
   void registerCounter(PMCEvent pmce, const char *name) {
     pmce.name = name;
     registerCounter(pmce);
@@ -612,5 +629,27 @@ struct Collection {
       event.stop();
     }
   }
+
+private:
+  // By default, each collection operates on known core-local counters,
+  // but selections can also be shared between cores to measure uncore counters
+  // (e.g. L3 cache counters)
+  PMCSelectCore default_pmcs{
+#ifdef ARCH_TARGET_X86_64
+      PMC{0xC0010200, 0xC0010201, CORE}, PMC{0xC0010202, 0xC0010203, CORE},
+      PMC{0xC0010204, 0xC0010205, CORE}, PMC{0xC0010206, 0xC0010207, CORE},
+      PMC{0xC0010208, 0xC0010209, CORE}, PMC{0xC001020A, 0xC001020B, CORE},
+#elif defined ARCH_TARGET_ARM64
+      PMC{1u << 31, 1u << 31, CYCLES},
+
+      // Armv8_pmu3 usually has 6 counters (ids 0-5)
+      PMC{0, 0, CORE},
+      PMC{1, 1, CORE},
+      PMC{2, 2, CORE},
+      PMC{3, 3, CORE},
+      PMC{4, 4, CORE},
+      PMC{5, 5, CORE},
+#endif
+  };
 };
 } // namespace uperf
