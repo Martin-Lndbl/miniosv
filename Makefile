@@ -495,6 +495,7 @@ drivers += drivers/pci-bridge.o
 drivers += drivers/msi.o
 endif
 ifeq ($(conf_drivers_ena),1)
+drivers += drivers/ena.o
 drivers += drivers/enav2/base/ena_eth_com.o
 drivers += drivers/enav2/base/ena_com.o
 drivers += drivers/enav2/ena_ethdev.o
