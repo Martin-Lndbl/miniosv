@@ -235,6 +235,7 @@ public:
       assert(m->iova == get_iova(m) + sizeof(mbuf) + kDefaultHeadroom);
       objs->push(reinterpret_cast<void* const*>(&m), 1);
       off += obj_size;
+      top--;
     }
   }
 

@@ -35,6 +35,7 @@ static int probe_port(port_info &info) {
   static constexpr uint16_t kDescNum = 64;
   static constexpr uint32_t kMempoolCacheSize = 32;
   static constexpr uint32_t kPoolSize = 128;
+  static constexpr uint32_t kDataRoomSize = 1536;
 
   info.dev = eth_os::get_eth_for_port(info.port_id);
   if (!info.dev) {
@@ -51,10 +52,10 @@ static int probe_port(port_info &info) {
   std::cout << "  max rx queues:" << dinfo.max_rx_queues << std::endl;
   std::cout << "  max tx queues:" << dinfo.max_tx_queues << std::endl;
 
-  info.pool = pool_ptr(rte_pktmbuf_pool_create("probe-pool", kPoolSize,
-                                               kMempoolCacheSize, 0,
-                                               RTE_MBUF_DEFAULT_BUF_SIZE, 0),
-                       &rte_mempool_free);
+  info.pool =
+      pool_ptr(rte_pktmbuf_pool_create("probe-pool", kPoolSize,
+                                       kMempoolCacheSize, 0, kDataRoomSize, 0),
+               &rte_mempool_free);
   if (!info.pool) {
     std::cout << "FAIL: could not allocate packet pool" << std::endl;
     return ENOMEM;
