@@ -121,7 +121,4 @@ extern "C" void osv_app_main() {
       break;
     }
   }
-  while (true) {
-    asm volatile("" ::: "memory");
-  }
 }
