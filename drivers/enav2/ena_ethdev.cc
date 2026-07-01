@@ -2384,7 +2384,6 @@ int ena_attach(pci::device *dev, ena_adapter **_adapter) {
   adapter = aligned_new<ena_adapter>();
   *_adapter = adapter;
   adapter->dev = dev;
-  new (adapter) ena_adapter{};
   ena_dev = &adapter->ena_dev;
   edev = static_cast<ena_eth_dev *>(calloc(1, sizeof(ena_eth_dev)));
   adapter->edev = edev;
