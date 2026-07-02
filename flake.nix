@@ -58,6 +58,7 @@
           ninja
           git
           ctags
+          mtools
           gptfdisk
           (python3.withPackages (ps: [ ps.pyyaml ]))
         ];
@@ -93,6 +94,18 @@
               ))
             ]
             ++ default.nativeBuildInputs;
+          });
+
+          cli = aws.overrideAttrs (default: {
+            nativeBuildInputs =
+              with pkgs;
+              [
+                bear
+                black
+                clang-tools
+                pyright
+              ]
+              ++ aws.nativeBuildInputs;
           });
         };
 

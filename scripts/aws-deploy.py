@@ -9,27 +9,22 @@ import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import boto3
+import argparse
 
 BLOCK_SIZE = 524288  # 512 KiB
 MAX_WORKERS = 64
-INSTANCE_TYPES = {
-    "t3.large": "x86_64",
-    "c5a.large": "x86_64",
-    "c6a.large": "x86_64",
-    "c7a.large": "x86_64",
-
-    "t4g.large": "arm64",
-    "c6g.large": "arm64",
-    "c7g.large": "arm64",
-    "c8g.large": "arm64",
-}
 
 def aws_login() -> None:
     if subprocess.run(
         ["aws", "sts", "get-caller-identity", "--query", "Arn", "--output", "text"],
-        stderr=subprocess.DEVNULL
+        stderr=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
     ).returncode != 0:
         subprocess.run(["aws", "login", "--remote"])
+
+def get_instance_arch(instance_type: str):
+    response = boto3.client('ec2').describe_instance_types(InstanceTypes=[instance_type])
+    return response['InstanceTypes'][0]['ProcessorInfo']['SupportedArchitectures'][0]
 
 def convert_to_raw(src: str) -> tuple[str, bool]:
     ext = src.rsplit(".", 1)[-1].lower()
@@ -71,14 +66,18 @@ def upload_block_worker(ebs_client, snapshot_id, block_index, data, counters, co
             print(f"  {current_processed}/{total_blocks} blocks ({pct:.1f}%), {current_changed} uploaded")
 
 def main():
-    if len(sys.argv) != 4:
-        print(f"Usage: {sys.argv[0]} <src> <region> <instance>")
-        print(f"  <instance> is one of: {', '.join(sorted(INSTANCE_TYPES))}")
-        sys.exit(1)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("src", nargs="?", default="build/last/loader.img",
+                        help="Path to the source image file to upload (default: build/last/loader.img)")
+    parser.add_argument("region", help="AWS region to deploy to (e.g. us-east-1)")
+    parser.add_argument("instance", help="EC2 instance type to launch (e.g. t3.micro)")
+    parser.add_argument("--attach", action="store_true", help="Stream system log and terminate instance on Ctrl+C")
+    args = parser.parse_args()
 
     aws_login()
 
-    src, region, instance = sys.argv[1], sys.argv[2], sys.argv[3]
+    src, region, instance = args.src, args.region, args.instance
+    instance_arch = get_instance_arch(instance)
 
     if src.endswith(".raw"):
         virtual_size = os.path.getsize(src)
@@ -168,7 +167,7 @@ def main():
     ami_response = ec2_client.register_image(
         Name=ami_name,
         Description=f"MiniOSv image created from {src}",
-        Architecture=INSTANCE_TYPES[instance],
+        Architecture=instance_arch,
         RootDeviceName="/dev/xvda",
         BlockDeviceMappings=[
             {
@@ -226,6 +225,28 @@ def main():
     print(f"Instance running: {instance_id} ({instance})")
     print(f"  Public DNS: {public_dns}")
     print(f"  Public IP:  {public_ip}")
+
+    if args.attach:
+        print("\nStreaming system log (Ctrl+C to stop and terminate instance)...")
+        seen_lines = 0
+
+        def terminate_and_exit():
+            print(f"\nTerminating instance {instance_id}...")
+            ec2_client.terminate_instances(InstanceIds=[instance_id])
+            print(f"Termination request sent to instance {instance_id}.")
+
+        try:
+            while True:
+                log_response = ec2_client.get_console_output(InstanceId=instance_id, Latest=True)
+                output = log_response.get("Output", "")
+                if output:
+                    lines = output.splitlines()
+                    if len(lines) > seen_lines:
+                        print("\n".join(lines[seen_lines:]), flush=True)
+                        seen_lines = len(lines)
+                time.sleep(5)
+        except KeyboardInterrupt:
+            terminate_and_exit()
 
 if __name__ == "__main__":
     main()
