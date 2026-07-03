@@ -553,6 +553,8 @@ endif
 app ?= default
 ifeq ($(app),tests)
 include test/Makefile
+else ifeq ($(app),rust)
+include rust_app/Makefile
 else
 include app/Makefile
 endif

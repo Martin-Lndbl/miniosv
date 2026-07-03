@@ -64,7 +64,6 @@
         ];
 
         ovmf_prefix = if system == "x86_64-linux" then "OVMF" else "AAVMF";
-
       in
       {
         devShells = rec {
