@@ -322,10 +322,13 @@ const GUEST_IP: Ipv4Address = Ipv4Address::new(172, 31, 28, 134);
 const GUEST_PREFIX: u8 = 20;
 const GATEWAY_IP: Ipv4Address = Ipv4Address::new(172, 31, 16, 1);
 
-// Point at a plain `nc -l -p 8080` running on the host's primary ENI.
-// Same VPC subnet as the guest, so no internet-gateway hop is needed.
+// Point at the host's SSH port on its primary ENI. Same VPC subnet
+// as the guest and always allowed by the AWS security group (the
+// user is SSH'd in), so no SG changes are needed. sshd will send its
+// version banner ("SSH-2.0-...") on connect, which is enough to
+// prove the TCP handshake + rx path work end to end.
 const TARGET_IP: Ipv4Address = Ipv4Address::new(172, 31, 24, 241);
-const TARGET_PORT: u16 = 8080;
+const TARGET_PORT: u16 = 22;
 const LOCAL_PORT: u16 = 49152;
 
 const REQUEST: &[u8] = b"POST /smoltcp HTTP/1.1\r\n\
