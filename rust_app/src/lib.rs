@@ -322,12 +322,14 @@ const GUEST_IP: Ipv4Address = Ipv4Address::new(172, 31, 28, 134);
 const GUEST_PREFIX: u8 = 20;
 const GATEWAY_IP: Ipv4Address = Ipv4Address::new(172, 31, 16, 1);
 
-const TARGET_IP: Ipv4Address = Ipv4Address::new(93, 184, 215, 14);
-const TARGET_PORT: u16 = 80;
+// Point at a plain `nc -l -p 8080` running on the host's primary ENI.
+// Same VPC subnet as the guest, so no internet-gateway hop is needed.
+const TARGET_IP: Ipv4Address = Ipv4Address::new(172, 31, 24, 241);
+const TARGET_PORT: u16 = 8080;
 const LOCAL_PORT: u16 = 49152;
 
-const REQUEST: &[u8] = b"POST / HTTP/1.1\r\n\
-                         Host: example.com\r\n\
+const REQUEST: &[u8] = b"POST /smoltcp HTTP/1.1\r\n\
+                         Host: 172.31.24.241:8080\r\n\
                          User-Agent: minidpdk-smoltcp/0.1\r\n\
                          Content-Type: text/plain\r\n\
                          Content-Length: 2\r\n\
@@ -372,14 +374,31 @@ fn http_post(mac: [u8; 6], mut dev: DpdkDevice) {
     let mut request_sent = false;
     let mut bytes_received: usize = 0;
     let mut clock_ms: i64 = 0;
-    // Rough timeout: 60 s worth of poll ticks. Each iteration bumps
-    // the fake monotonic clock by 1ms.
-    const TIMEOUT_MS: i64 = 60_000;
+    let mut iter: u64 = 0;
+    let mut last_state: tcp::State = tcp::State::Closed;
+
+    // Real-iteration budget. Each iteration is a poll+RX check; we
+    // advance the fake monotonic clock by 1 fake-ms every CLOCK_STRIDE
+    // iterations so smoltcp's retransmit timers don't run away faster
+    // than the real network can respond.
+    const CLOCK_STRIDE: u64 = 5_000;
+    const STATS_STRIDE: u64 = 500_000;
+    // ~5B iterations is 'forever' at these tight-loop speeds — leaves
+    // plenty of wall-clock time for ARP+SYN+response on a real NIC.
+    const ITER_BUDGET: u64 = 5_000_000_000;
+
+    let port_id_dbg = dev.port_id;
 
     loop {
         iface.poll(Instant::from_millis(clock_ms), &mut dev, &mut sockets);
 
         let s = sockets.get_mut::<tcp::Socket>(handle);
+
+        let state = s.state();
+        if state != last_state {
+            println!("tcp state: {:?}", state);
+            last_state = state;
+        }
 
         if !request_sent && s.can_send() {
             match s.send_slice(REQUEST) {
@@ -388,8 +407,6 @@ fn http_post(mac: [u8; 6], mut dev: DpdkDevice) {
                     request_sent = true;
                 }
                 Ok(n) => {
-                    // Partial send is unlikely for a request this small,
-                    // but handle it — retry next iteration.
                     println!("PARTIAL: queued {}/{} bytes", n, REQUEST.len());
                 }
                 Err(_) => {
@@ -410,16 +427,41 @@ fn http_post(mac: [u8; 6], mut dev: DpdkDevice) {
             });
         }
 
-        // Peer closed (or we never got past SYN/ARP).
         if request_sent && !s.is_active() {
             println!();
-            println!("OK: connection closed by peer ({} bytes received)", bytes_received);
+            println!(
+                "OK: connection closed by peer ({} bytes received)",
+                bytes_received
+            );
             return;
         }
 
-        clock_ms = clock_ms.wrapping_add(1);
-        if clock_ms > TIMEOUT_MS {
-            println!("TIMEOUT after {} ms (received {} bytes)", clock_ms, bytes_received);
+        iter = iter.wrapping_add(1);
+        if iter.is_multiple_of(CLOCK_STRIDE) {
+            clock_ms = clock_ms.wrapping_add(1);
+        }
+        if iter.is_multiple_of(STATS_STRIDE) {
+            let (mut i_pkts, mut o_pkts, mut i_bytes, mut o_bytes) = (0u64, 0u64, 0u64, 0u64);
+            unsafe {
+                shim_get_stats(
+                    port_id_dbg,
+                    &mut i_pkts,
+                    &mut o_pkts,
+                    &mut i_bytes,
+                    &mut o_bytes,
+                );
+            }
+            println!(
+                "stats: iter={} clock={}ms rx={} pkts/{} B  tx={} pkts/{} B",
+                iter, clock_ms, i_pkts, i_bytes, o_pkts, o_bytes
+            );
+        }
+
+        if iter > ITER_BUDGET {
+            println!(
+                "TIMEOUT after {} iters (fake clock {} ms, received {} bytes)",
+                iter, clock_ms, bytes_received
+            );
             return;
         }
     }
