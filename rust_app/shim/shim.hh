@@ -57,4 +57,17 @@ void shim_macaddr_get(uint16_t port_id, uint8_t *addr_bytes);
 int shim_get_stats(uint16_t port_id, uint64_t *ipackets, uint64_t *opackets,
                     uint64_t *ibytes, uint64_t *obytes);
 
+// Allocate an mbuf from `pool`, copy `len` bytes from `data` into it, and
+// hand it to rte_eth_tx_burst(). If the burst returns 0 (queue full,
+// device not ready), the mbuf is freed. Returns 0 on success, -1 on
+// alloc/tx failure.
+int shim_tx_packet(uint16_t port_id, uint16_t queue_id, void *pool,
+                    const uint8_t *data, uint16_t len);
+
+// Poll rte_eth_rx_burst() for one packet. If a packet is available,
+// copy up to `max_len` bytes into `buf`, free the mbuf, and return the
+// number of bytes copied (>0). Returns 0 if no packet was available.
+int shim_rx_packet(uint16_t port_id, uint16_t queue_id, uint8_t *buf,
+                    uint16_t max_len);
+
 }  // extern "C"

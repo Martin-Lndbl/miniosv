@@ -124,4 +124,41 @@ int shim_get_stats(uint16_t port_id, uint64_t *ipackets, uint64_t *opackets,
   return 0;
 }
 
+int shim_tx_packet(uint16_t port_id, uint16_t queue_id, void *pool,
+                    const uint8_t *data, uint16_t len) {
+  auto *mp = static_cast<rte_mempool *>(pool);
+  rte_mbuf *m = rte_pktmbuf_alloc(mp);
+  if (m == nullptr) {
+    return -1;
+  }
+  std::memcpy(rte_pktmbuf_mtod(m, uint8_t *), data, len);
+  m->data_len = len;
+  m->pkt_len = len;
+  m->nb_segs = 1;
+  m->next = nullptr;
+
+  uint16_t sent = rte_eth_tx_burst(port_id, queue_id, &m, 1);
+  if (sent == 0) {
+    rte_pktmbuf_free(m);
+    return -1;
+  }
+  return 0;
+}
+
+int shim_rx_packet(uint16_t port_id, uint16_t queue_id, uint8_t *buf,
+                    uint16_t max_len) {
+  rte_mbuf *m = nullptr;
+  uint16_t nb = rte_eth_rx_burst(port_id, queue_id, &m, 1);
+  if (nb == 0 || m == nullptr) {
+    return 0;
+  }
+  uint16_t len = m->data_len;
+  if (len > max_len) {
+    len = max_len;
+  }
+  std::memcpy(buf, rte_pktmbuf_mtod(m, uint8_t *), len);
+  rte_pktmbuf_free(m);
+  return static_cast<int>(len);
+}
+
 }  // extern "C"

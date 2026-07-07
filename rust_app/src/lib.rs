@@ -1,14 +1,19 @@
 #![no_std]
 #![allow(non_camel_case_types, dead_code)]
 
-use core::ffi::{c_int, c_void};
+use core::ffi::c_int;
 use core::fmt::{self, Write};
 use core::panic::PanicInfo;
 
+use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
+use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use smoltcp::socket::tcp;
+use smoltcp::time::Instant;
+use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address};
+
 // =====================================================================
 // Minimal console output (no std::cout in no_std).
-// Assumes a libc `write(2)` is linkable in the OSv environment, same
-// as the original app implicitly relied on via libstdc++/iostream.
+// Assumes a libc `write(2)` is linkable in the OSv environment.
 // =====================================================================
 extern "C" {
     fn write(fd: c_int, buf: *const u8, count: usize) -> isize;
@@ -31,6 +36,12 @@ impl Write for Stdout {
     }
 }
 
+macro_rules! print {
+    ($($arg:tt)*) => {{
+        let _ = Stdout.write_fmt(format_args!($($arg)*));
+    }};
+}
+
 macro_rules! println {
     () => {{
         let _ = Stdout.write_str("\n");
@@ -42,15 +53,7 @@ macro_rules! println {
 }
 
 // =====================================================================
-// minidpdk FFI surface
-//
-// These declarations mirror rust_app/shim/shim.h exactly. The shim
-// (shim.cc) is the only thing that ever touches real minidpdk structs
-// (rte_eth_dev_info, rte_eth_conf, rte_eth_rxconf, rte_eth_txconf,
-// rte_eth_stats) and the C++-only rte_eth_dev virtual methods /
-// eth_os::get_eth_for_port(). Only plain integers and an opaque pool
-// pointer cross the FFI boundary, so there is no struct-layout risk
-// here — if you change a signature, change shim.h/shim.cc to match.
+// minidpdk FFI surface (mirrors rust_app/shim/shim.hh)
 // =====================================================================
 
 /// Opaque handle to a minidpdk packet-mbuf pool. Never dereferenced on
@@ -61,14 +64,8 @@ pub struct rte_pktmbuf_pool {
 }
 
 extern "C" {
-    // Returns 1 if a device exists for `port_id`, else 0.
     fn shim_is_valid_port(port_id: u16) -> c_int;
-
-    // Fills *max_rx_queues / *max_tx_queues. Returns 0 on success, -1
-    // if the port doesn't exist.
     fn shim_get_dev_info(port_id: u16, max_rx_queues: *mut u16, max_tx_queues: *mut u16) -> c_int;
-
-    // Wraps rte_pktmbuf_pool_create(); returns null on failure.
     fn shim_pktmbuf_pool_create(
         name: *const u8,
         n: u32,
@@ -77,31 +74,18 @@ extern "C" {
         data_room_size: u16,
     ) -> *mut rte_pktmbuf_pool;
     fn shim_mempool_free(pool: *mut rte_pktmbuf_pool);
-
-    // Wraps rte_eth_dev_configure() with a zero-initialized rte_eth_conf.
     fn shim_eth_dev_configure(port_id: u16, nb_rx_q: u16, nb_tx_q: u16) -> c_int;
-
     fn shim_adjust_nb_rx_tx_desc(port_id: u16, nb_rx_desc: *mut u16, nb_tx_desc: *mut u16);
-
-    // Wraps rte_eth_rx_queue_setup() with a zero-initialized rte_eth_rxconf.
     fn shim_rx_queue_setup(
         port_id: u16,
         queue_id: u16,
         nb_desc: u16,
         mempool: *mut rte_pktmbuf_pool,
     ) -> c_int;
-    // Wraps rte_eth_tx_queue_setup() with a zero-initialized rte_eth_txconf.
     fn shim_tx_queue_setup(port_id: u16, queue_id: u16, nb_desc: u16) -> c_int;
-
     fn shim_dev_start(port_id: u16) -> c_int;
-    // No-op if the port doesn't exist.
     fn shim_dev_stop(port_id: u16);
-
-    // Writes 6 bytes into addr_bytes.
     fn shim_macaddr_get(port_id: u16, addr_bytes: *mut u8);
-
-    // Fills the four counters. Returns 0 on success, -1 if the port
-    // doesn't exist.
     fn shim_get_stats(
         port_id: u16,
         ipackets: *mut u64,
@@ -109,52 +93,25 @@ extern "C" {
         ibytes: *mut u64,
         obytes: *mut u64,
     ) -> c_int;
+
+    // New: copy-in tx and copy-out rx (single packet).
+    fn shim_tx_packet(
+        port_id: u16,
+        queue_id: u16,
+        pool: *mut rte_pktmbuf_pool,
+        data: *const u8,
+        len: u16,
+    ) -> c_int;
+    fn shim_rx_packet(port_id: u16, queue_id: u16, buf: *mut u8, max_len: u16) -> c_int;
 }
 
-// errno values (Linux/glibc numbering — adjust if OSv's libc differs).
 const ENODEV: c_int = 19;
 const ENOMEM: c_int = 12;
 
 // =====================================================================
-// App types
+// Packet pool RAII
 // =====================================================================
 
-#[derive(Clone, Copy)]
-struct EtherAddr {
-    addr_bytes: [u8; 6],
-}
-
-impl Default for EtherAddr {
-    fn default() -> Self {
-        EtherAddr { addr_bytes: [0; 6] }
-    }
-}
-
-#[allow(dead_code)]
-struct AppConfig {
-    src: EtherAddr,
-    dst: EtherAddr,
-    sip: u32,
-    dip: u32,
-    l4port: u32,
-    mtu: u32,
-}
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        AppConfig {
-            src: EtherAddr::default(),
-            dst: EtherAddr::default(),
-            sip: 0,
-            dip: 0,
-            l4port: 0,
-            mtu: 128,
-        }
-    }
-}
-
-/// RAII wrapper around the packet pool, mirroring the C++ `pool_ptr`
-/// (`unique_ptr<rte_pktmbuf_pool, decltype(&rte_mempool_free)>`).
 struct PktPool(*mut rte_pktmbuf_pool);
 
 impl Drop for PktPool {
@@ -165,128 +122,351 @@ impl Drop for PktPool {
     }
 }
 
-struct PortInfo {
-    port_id: u16,
-    addr: EtherAddr,
-    pool: Option<PktPool>,
-}
-
-impl Default for PortInfo {
-    fn default() -> Self {
-        PortInfo {
-            port_id: 0,
-            addr: EtherAddr::default(),
-            pool: None,
-        }
-    }
-}
-
 // =====================================================================
-// Probe logic
+// NIC probe + setup.
+//
+// Returns the MAC address on success. Unlike the old app that also
+// stopped the device before returning, this leaves the port started so
+// the caller can pump packets through it via the smoltcp interface.
 // =====================================================================
 
-fn probe_port(info: &mut PortInfo) -> c_int {
+fn probe_and_open(port_id: u16, pool_out: &mut Option<PktPool>) -> Result<[u8; 6], c_int> {
     const DESC_NUM: u16 = 64;
     const MEMPOOL_CACHE_SIZE: u32 = 32;
-    const POOL_SIZE: u32 = 128;
-    const DATA_ROOM_SIZE: u16 = 1536;
+    const POOL_SIZE: u32 = 256;
+    const DATA_ROOM_SIZE: u16 = 2048;
 
-    let valid = unsafe { shim_is_valid_port(info.port_id) };
-    if valid == 0 {
-        println!("FAIL: no device found for port {}", info.port_id);
-        return ENODEV;
+    if unsafe { shim_is_valid_port(port_id) } == 0 {
+        return Err(ENODEV);
     }
-    println!("OK: device found");
+    println!("OK: device found on port {}", port_id);
 
-    let mut max_rx_queues: u16 = 0;
-    let mut max_tx_queues: u16 = 0;
-    if unsafe { shim_get_dev_info(info.port_id, &mut max_rx_queues, &mut max_tx_queues) } != 0 {
-        println!("FAIL: could not read device info");
-        return ENODEV;
+    let mut max_rx: u16 = 0;
+    let mut max_tx: u16 = 0;
+    if unsafe { shim_get_dev_info(port_id, &mut max_rx, &mut max_tx) } != 0 {
+        return Err(ENODEV);
     }
-    println!("OK: device info retrieved");
-    println!("  max rx queues:{}", max_rx_queues);
-    println!("  max tx queues:{}", max_tx_queues);
+    println!("  max rx queues:{}  max tx queues:{}", max_rx, max_tx);
 
-    let pool_name = b"probe-pool\0";
-    let pool = unsafe {
+    let name = b"http-pool\0";
+    let p = unsafe {
         shim_pktmbuf_pool_create(
-            pool_name.as_ptr(),
+            name.as_ptr(),
             POOL_SIZE,
             MEMPOOL_CACHE_SIZE,
             0,
             DATA_ROOM_SIZE,
         )
     };
-    if pool.is_null() {
-        println!("FAIL: could not allocate packet pool");
-        return ENOMEM;
+    if p.is_null() {
+        return Err(ENOMEM);
     }
-    info.pool = Some(PktPool(pool));
+    *pool_out = Some(PktPool(p));
     println!("OK: packet pool allocated");
 
-    if unsafe { shim_eth_dev_configure(info.port_id, 1, 1) } != 0 {
-        println!("FAIL: device configure failed");
-        return 1;
+    if unsafe { shim_eth_dev_configure(port_id, 1, 1) } != 0 {
+        return Err(1);
     }
-    println!("OK: device configured (1 rx queue, 1 tx queue)");
+    println!("OK: device configured (1 rx, 1 tx queue)");
 
-    let mut rx_desc: u16 = DESC_NUM;
-    let mut tx_desc: u16 = DESC_NUM;
-    unsafe { shim_adjust_nb_rx_tx_desc(info.port_id, &mut rx_desc, &mut tx_desc) };
+    let mut rx_desc = DESC_NUM;
+    let mut tx_desc = DESC_NUM;
+    unsafe { shim_adjust_nb_rx_tx_desc(port_id, &mut rx_desc, &mut tx_desc) };
 
-    let pool_ptr = info.pool.as_ref().unwrap().0;
-    if unsafe { shim_rx_queue_setup(info.port_id, 0, rx_desc, pool_ptr) } != 0 {
-        println!("FAIL: rx queue setup failed");
-        return 1;
+    let pool_ptr = pool_out.as_ref().unwrap().0;
+    if unsafe { shim_rx_queue_setup(port_id, 0, rx_desc, pool_ptr) } != 0 {
+        return Err(1);
     }
     println!("OK: rx queue set up ({} descriptors)", rx_desc);
 
-    if unsafe { shim_tx_queue_setup(info.port_id, 0, tx_desc) } != 0 {
-        println!("FAIL: tx queue setup failed");
-        return 1;
+    if unsafe { shim_tx_queue_setup(port_id, 0, tx_desc) } != 0 {
+        return Err(1);
     }
     println!("OK: tx queue set up ({} descriptors)", tx_desc);
 
-    if unsafe { shim_dev_start(info.port_id) } != 0 {
-        println!("FAIL: device start failed");
-        return 1;
+    if unsafe { shim_dev_start(port_id) } != 0 {
+        return Err(1);
     }
     println!("OK: device started");
 
-    unsafe { shim_macaddr_get(info.port_id, info.addr.addr_bytes.as_mut_ptr()) };
-
-    let (mut ipackets, mut opackets, mut ibytes, mut obytes) = (0u64, 0u64, 0u64, 0u64);
-    unsafe {
-        shim_get_stats(
-            info.port_id,
-            &mut ipackets,
-            &mut opackets,
-            &mut ibytes,
-            &mut obytes,
-        )
-    };
+    let mut mac = [0u8; 6];
+    unsafe { shim_macaddr_get(port_id, mac.as_mut_ptr()) };
     println!(
-        "OK: stats readable (rx: {} pkts, {} bytes)",
-        ipackets, ibytes
+        "OK: MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+    );
+    Ok(mac)
+}
+
+// =====================================================================
+// smoltcp Device backed by minidpdk tx/rx bursts.
+//
+// The RxToken/TxToken split forces us to hand out both tokens with
+// non-overlapping borrows. We reuse the trick from the earlier
+// loopback experiment: the RX buffer lives in a `static mut` so the
+// RxToken holds an immutable slice unrelated to `&mut self`, while
+// the TxToken holds the `&mut self` reference for tx_scratch access.
+// =====================================================================
+
+const MTU: usize = 1514;
+
+// Ethernet frame staging buffer for RX. Only one DpdkDevice instance
+// exists at a time (`osv_app_main` is single-threaded), so a single
+// static slot is enough.
+static mut RX_STAGING: [u8; MTU] = [0u8; MTU];
+static mut RX_STAGING_LEN: usize = 0;
+
+struct DpdkDevice {
+    port_id: u16,
+    pool: *mut rte_pktmbuf_pool,
+    tx_scratch: [u8; MTU],
+}
+
+struct DpdkRxToken<'a> {
+    buf: &'a [u8],
+}
+
+struct DpdkTxToken<'a> {
+    dev: &'a mut DpdkDevice,
+}
+
+impl<'a> RxToken for DpdkRxToken<'a> {
+    fn consume<R, F>(self, f: F) -> R
+    where
+        F: FnOnce(&[u8]) -> R,
+    {
+        let r = f(self.buf);
+        unsafe {
+            RX_STAGING_LEN = 0;
+        }
+        r
+    }
+}
+
+impl<'a> TxToken for DpdkTxToken<'a> {
+    fn consume<R, F>(self, len: usize, f: F) -> R
+    where
+        F: FnOnce(&mut [u8]) -> R,
+    {
+        let n = core::cmp::min(len, self.dev.tx_scratch.len());
+        let r = f(&mut self.dev.tx_scratch[..n]);
+        unsafe {
+            shim_tx_packet(
+                self.dev.port_id,
+                0,
+                self.dev.pool,
+                self.dev.tx_scratch.as_ptr(),
+                n as u16,
+            );
+        }
+        r
+    }
+}
+
+impl Device for DpdkDevice {
+    type RxToken<'a>
+        = DpdkRxToken<'a>
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = DpdkTxToken<'a>
+    where
+        Self: 'a;
+
+    fn receive(&mut self, _t: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        use core::ptr::{addr_of, addr_of_mut};
+        let staging_ptr: *mut u8 = addr_of_mut!(RX_STAGING) as *mut u8;
+        let staging_cap: u16 = MTU as u16;
+        let len = unsafe {
+            if RX_STAGING_LEN == 0 {
+                let n = shim_rx_packet(self.port_id, 0, staging_ptr, staging_cap);
+                if n <= 0 {
+                    return None;
+                }
+                RX_STAGING_LEN = n as usize;
+            }
+            RX_STAGING_LEN
+        };
+        // SAFETY: RX_STAGING is only mutated from receive(), and the
+        // returned slice is invalidated by the consume() path resetting
+        // RX_STAGING_LEN before the next receive() would touch the buffer.
+        let buf: &[u8] =
+            unsafe { core::slice::from_raw_parts(addr_of!(RX_STAGING) as *const u8, len) };
+        Some((DpdkRxToken { buf }, DpdkTxToken { dev: self }))
+    }
+
+    fn transmit(&mut self, _t: Instant) -> Option<Self::TxToken<'_>> {
+        Some(DpdkTxToken { dev: self })
+    }
+
+    fn capabilities(&self) -> DeviceCapabilities {
+        let mut c = DeviceCapabilities::default();
+        c.max_transmission_unit = MTU;
+        c.medium = Medium::Ethernet;
+        c
+    }
+}
+
+// =====================================================================
+// HTTP POST driver (mimics `curl -d "Hi" http://<target>/`).
+//
+// Network config is hard-coded for QEMU user-mode SLIRP:
+//   guest   10.0.2.15/24
+//   gateway 10.0.2.2
+//   target  93.184.215.14:80   (example.com, current A record)
+//
+// SLIRP does NAT and will open a real TCP connection to the target
+// on the host's behalf, so no DNS is needed inside the guest.
+// =====================================================================
+
+const TARGET_IP: Ipv4Address = Ipv4Address::new(93, 184, 215, 14);
+const TARGET_PORT: u16 = 80;
+const LOCAL_PORT: u16 = 49152;
+
+const REQUEST: &[u8] = b"POST / HTTP/1.1\r\n\
+                         Host: example.com\r\n\
+                         User-Agent: minidpdk-smoltcp/0.1\r\n\
+                         Content-Type: text/plain\r\n\
+                         Content-Length: 2\r\n\
+                         Connection: close\r\n\
+                         \r\n\
+                         Hi";
+
+fn http_post(mac: [u8; 6], mut dev: DpdkDevice) {
+    let config = Config::new(EthernetAddress(mac).into());
+    let mut iface = Interface::new(config, &mut dev, Instant::from_millis(0));
+
+    iface.update_ip_addrs(|addrs| {
+        let _ = addrs.push(IpCidr::new(
+            IpAddress::Ipv4(Ipv4Address::new(10, 0, 2, 15)),
+            24,
+        ));
+    });
+    let _ = iface
+        .routes_mut()
+        .add_default_ipv4_route(Ipv4Address::new(10, 0, 2, 2));
+
+    // Static TCP socket buffers (smoltcp needs owned slices).
+    static mut TCP_RX: [u8; 8192] = [0u8; 8192];
+    static mut TCP_TX: [u8; 4096] = [0u8; 4096];
+    let tcp_sock = tcp::Socket::new(
+        tcp::SocketBuffer::new(unsafe { &mut TCP_RX[..] }),
+        tcp::SocketBuffer::new(unsafe { &mut TCP_TX[..] }),
     );
 
-    0
+    static mut STORAGE: [SocketStorage; 1] = [SocketStorage::EMPTY; 1];
+    let mut sockets = unsafe { SocketSet::new(&mut STORAGE[..]) };
+    let handle = sockets.add(tcp_sock);
+
+    {
+        let s = sockets.get_mut::<tcp::Socket>(handle);
+        if let Err(_) = s.connect(iface.context(), (TARGET_IP, TARGET_PORT), LOCAL_PORT) {
+            println!("FAIL: tcp connect() rejected");
+            return;
+        }
+    }
+    let o = TARGET_IP.octets();
+    println!(
+        "connecting to {}.{}.{}.{}:{} ...",
+        o[0], o[1], o[2], o[3], TARGET_PORT
+    );
+
+    let mut request_sent = false;
+    let mut bytes_received: usize = 0;
+    let mut clock_ms: i64 = 0;
+    // Rough timeout: 60 s worth of poll ticks. Each iteration bumps
+    // the fake monotonic clock by 1ms.
+    const TIMEOUT_MS: i64 = 60_000;
+
+    loop {
+        iface.poll(Instant::from_millis(clock_ms), &mut dev, &mut sockets);
+
+        let s = sockets.get_mut::<tcp::Socket>(handle);
+
+        if !request_sent && s.can_send() {
+            match s.send_slice(REQUEST) {
+                Ok(n) if n == REQUEST.len() => {
+                    println!("OK: sent {} bytes of HTTP request", n);
+                    request_sent = true;
+                }
+                Ok(n) => {
+                    // Partial send is unlikely for a request this small,
+                    // but handle it — retry next iteration.
+                    println!("PARTIAL: queued {}/{} bytes", n, REQUEST.len());
+                }
+                Err(_) => {
+                    println!("FAIL: send_slice error");
+                    return;
+                }
+            }
+        }
+
+        if s.can_recv() {
+            let _ = s.recv(|buf| {
+                bytes_received += buf.len();
+                match core::str::from_utf8(buf) {
+                    Ok(txt) => print!("{}", txt),
+                    Err(_) => print!("<{} non-utf8 bytes>", buf.len()),
+                }
+                (buf.len(), ())
+            });
+        }
+
+        // Peer closed (or we never got past SYN/ARP).
+        if request_sent && !s.is_active() {
+            println!();
+            println!("OK: connection closed by peer ({} bytes received)", bytes_received);
+            return;
+        }
+
+        clock_ms = clock_ms.wrapping_add(1);
+        if clock_ms > TIMEOUT_MS {
+            println!("TIMEOUT after {} ms (received {} bytes)", clock_ms, bytes_received);
+            return;
+        }
+    }
 }
+
+// =====================================================================
+// Entry point
+// =====================================================================
 
 #[unsafe(no_mangle)]
 pub extern "C" fn osv_app_main() {
-    let mut info = PortInfo::default();
+    let mut pool: Option<PktPool> = None;
+    let mut mac_opt: Option<[u8; 6]> = None;
+    let mut port_id_used: u16 = 0;
+
     for i in 0u16..64 {
-        info.port_id = i;
-        println!("Probing port {}...", info.port_id);
-        let rc = probe_port(&mut info);
-        if rc == 0 {
-            println!("RESULT: NIC probe succeeded (code {})", rc);
-            unsafe { shim_dev_stop(info.port_id) };
-            break;
+        println!("Probing port {}...", i);
+        match probe_and_open(i, &mut pool) {
+            Ok(mac) => {
+                mac_opt = Some(mac);
+                port_id_used = i;
+                break;
+            }
+            Err(_) => {
+                // Drop any half-built pool before trying the next port.
+                pool = None;
+            }
         }
     }
+
+    match (mac_opt, pool.as_ref()) {
+        (Some(mac), Some(pool_ref)) => {
+            let dev = DpdkDevice {
+                port_id: port_id_used,
+                pool: pool_ref.0,
+                tx_scratch: [0u8; MTU],
+            };
+            http_post(mac, dev);
+            unsafe { shim_dev_stop(port_id_used) };
+        }
+        _ => {
+            println!("FAIL: no usable NIC found");
+        }
+    }
+
     loop {
         core::hint::spin_loop();
     }
