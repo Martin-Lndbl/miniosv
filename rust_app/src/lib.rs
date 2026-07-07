@@ -134,7 +134,7 @@ fn probe_and_open(port_id: u16, pool_out: &mut Option<PktPool>) -> Result<[u8; 6
     const DESC_NUM: u16 = 64;
     const MEMPOOL_CACHE_SIZE: u32 = 32;
     const POOL_SIZE: u32 = 256;
-    const DATA_ROOM_SIZE: u16 = 2048;
+    const DATA_ROOM_SIZE: u16 = 1536;
 
     if unsafe { shim_is_valid_port(port_id) } == 0 {
         return Err(ENODEV);
@@ -310,14 +310,17 @@ impl Device for DpdkDevice {
 // =====================================================================
 // HTTP POST driver (mimics `curl -d "Hi" http://<target>/`).
 //
-// Network config is hard-coded for QEMU user-mode SLIRP:
-//   guest   10.0.2.15/24
-//   gateway 10.0.2.2
-//   target  93.184.215.14:80   (example.com, current A record)
-//
-// SLIRP does NAT and will open a real TCP connection to the target
-// on the host's behalf, so no DNS is needed inside the guest.
+// Hard-coded for the AWS ENI passed through via VFIO on the current
+// host. Grab these from the instance metadata service if the ENI
+// changes:
+//   guest   172.31.28.134/20
+//   gateway 172.31.16.1        (subnet base + 1)
+//   target  93.184.215.14:80   (example.com A record)
 // =====================================================================
+
+const GUEST_IP: Ipv4Address = Ipv4Address::new(172, 31, 28, 134);
+const GUEST_PREFIX: u8 = 20;
+const GATEWAY_IP: Ipv4Address = Ipv4Address::new(172, 31, 16, 1);
 
 const TARGET_IP: Ipv4Address = Ipv4Address::new(93, 184, 215, 14);
 const TARGET_PORT: u16 = 80;
@@ -337,14 +340,9 @@ fn http_post(mac: [u8; 6], mut dev: DpdkDevice) {
     let mut iface = Interface::new(config, &mut dev, Instant::from_millis(0));
 
     iface.update_ip_addrs(|addrs| {
-        let _ = addrs.push(IpCidr::new(
-            IpAddress::Ipv4(Ipv4Address::new(10, 0, 2, 15)),
-            24,
-        ));
+        let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(GUEST_IP), GUEST_PREFIX));
     });
-    let _ = iface
-        .routes_mut()
-        .add_default_ipv4_route(Ipv4Address::new(10, 0, 2, 2));
+    let _ = iface.routes_mut().add_default_ipv4_route(GATEWAY_IP);
 
     // Static TCP socket buffers (smoltcp needs owned slices).
     static mut TCP_RX: [u8; 8192] = [0u8; 8192];
