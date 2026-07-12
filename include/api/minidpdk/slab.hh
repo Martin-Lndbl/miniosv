@@ -131,8 +131,6 @@ struct alignas(64) obj_header {
   uintptr_t iova;
 };
 
-inline void mbuf_free(mbuf *buf);
-
 struct alignas(64) page_header {
   page_header *next;
   page_header *prev;
@@ -147,8 +145,6 @@ struct alignas(64) page_header {
 };
 
 static_assert(sizeof(page_header) % 64 == 0, "");
-
-inline void mbuf_free(mbuf *buf);
 
 using init_fn_t = void (*)(mbuf **, uint16_t, void *);
 struct page_storage {

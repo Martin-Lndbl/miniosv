@@ -36,14 +36,6 @@
 
 #define ENA_MMIO_DISABLE_REG_READ BIT(0)
 
-#define ENA_WD_TIMEOUT_SEC 3
-#define ENA_DEVICE_KALIVE_TIMEOUT (ENA_WD_TIMEOUT_SEC * rte_get_timer_hz())
-
-#define ENA_TX_TIMEOUT (5 * rte_get_timer_hz())
-#define ENA_MAX_TX_TIMEOUT_SECONDS 60
-#define ENA_MONITORED_TX_QUEUES 3
-#define ENA_DEFAULT_MISSING_COMP 256U
-
 #define ENA_MAX_CONTROL_PATH_POLL_INTERVAL_MSEC 1000
 
 /* While processing submitted and completed descriptors (rx and tx path
@@ -86,11 +78,7 @@
 #define ENA_MAX_MSIX_VEC(io_queues) (ENA_ADMIN_MSIX_VEC + (io_queues))
 #define ENA_IRQNAME_SIZE 40
 
-extern struct ena_shared_data *ena_shared_data;
-
 struct ena_adapter;
-
-#define ERR
 
 struct ena_irq {
   void *data;
@@ -118,8 +106,6 @@ struct ena_tx_buffer {
   rte_mbuf *mbuf;
   unsigned int tx_descs;
   unsigned int num_of_bufs;
-  uint64_t timestamp;
-  bool print_once;
   struct ena_com_buf bufs[ENA_PKT_MAX_BUFS];
 };
 
@@ -172,7 +158,6 @@ struct ena_vendor_info_t {
 struct __rte_cache_aligned ena_ring {
   u16 next_to_use;
   u16 next_to_clean;
-  uint64_t last_cleanup_ticks;
 
   enum ena_ring_type type;
   enum ena_admin_placement_policy_type tx_mem_queue_type;
@@ -226,8 +211,6 @@ struct __rte_cache_aligned ena_ring {
   };
 
   unsigned int numa_socket_id;
-
-  uint32_t missing_tx_completion_threshold;
 
   /* Per-queue MSI-X interrupt support (RX). The ISR wakes the registered
    * waiter thread; the consumer re-arms the interrupt after draining. */
@@ -365,10 +348,6 @@ struct __rte_cache_aligned ena_adapter {
 
   enum ena_regs_reset_reason_types reset_reason;
 
-  rte_timer timer_wd;
-  uint64_t timestamp_wd;
-  uint64_t keep_alive_timeout;
-
   struct ena_stats_dev dev_stats;
   struct ena_admin_basic_stats basic_stats;
 
@@ -379,11 +358,6 @@ struct __rte_cache_aligned ena_adapter {
 
   bool trigger_reset;
   ena_llq_policy llq_header_policy;
-
-  uint32_t last_tx_comp_qid;
-  uint64_t missing_tx_completion_to;
-  uint64_t missing_tx_completion_budget;
-  uint64_t tx_cleanup_stall_delay;
 
   uint64_t memzone_cnt;
 
@@ -401,13 +375,6 @@ struct __rte_cache_aligned ena_adapter {
 int ena_rss_reta_update(struct rte_eth_dev *dev,
                         struct rte_eth_rss_reta_entry64 *reta_conf,
                         uint16_t reta_size);
-int ena_rss_reta_query(struct rte_eth_dev *dev,
-                       struct rte_eth_rss_reta_entry64 *reta_conf,
-                       uint16_t reta_size);
-int ena_rss_hash_update(struct rte_eth_dev *dev,
-                        struct rte_eth_rss_conf *rss_conf);
-int ena_rss_hash_conf_get(struct rte_eth_dev *dev,
-                          struct rte_eth_rss_conf *rss_conf);
 int ena_rss_configure(ena_adapter *adapter);
 
 #endif /* _ENA_ETHDEV_H_ */
