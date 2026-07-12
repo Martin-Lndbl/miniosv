@@ -55,18 +55,37 @@ void shim_macaddr_get(uint16_t port_id, uint8_t *addr_bytes);
 int shim_get_stats(uint16_t port_id, uint64_t *ipackets, uint64_t *opackets,
                     uint64_t *ibytes, uint64_t *obytes);
 
-// Allocate an mbuf from `pool`, copy `len` bytes from `data` into it, and
-// hand it to rte_eth_tx_burst(). If the burst returns 0 (queue full,
-// device not ready), the mbuf is freed. Returns 0 on success, -1 on
-// alloc/tx failure.
-int shim_tx_packet(uint16_t port_id, uint16_t queue_id, void *pool,
-                    const uint8_t *data, uint16_t len);
+// Zero-copy TX: allocate an mbuf from `pool`, expose its data area to
+// the caller for direct write, and return the mbuf handle. On success
+// *out_handle is set and the returned pointer is the writable start of
+// the mbuf's data buffer; *out_cap is the max number of bytes that can
+// be written there. On alloc failure returns nullptr and zeroes the
+// out params. The caller must eventually pass the handle to
+// shim_mbuf_tx() or shim_mbuf_free().
+uint8_t *shim_mbuf_alloc_tx(void *pool, void **out_handle, uint16_t *out_cap);
 
-// Poll rte_eth_rx_burst() for one packet. If a packet is available,
-// copy up to `max_len` bytes into `buf`, free the mbuf, and return the
-// number of bytes copied (>0). Returns 0 if no packet was available.
-int shim_rx_packet(uint16_t port_id, uint16_t queue_id, uint8_t *buf,
-                    uint16_t max_len);
+// Hand a previously-allocated mbuf to rte_eth_tx_burst(). `len` is the
+// packet length now sitting in the mbuf's data area. This is where we
+// derive ol_flags / l2_len / l3_len from the frame contents for the NIC
+// checksum-offload path. Returns 0 on success (mbuf is consumed by the
+// NIC); returns -1 on tx failure (the mbuf is freed).
+int shim_mbuf_tx(uint16_t port_id, uint16_t queue_id, void *handle,
+                  uint16_t len);
+
+// Release an mbuf back to its pool without transmitting. Used by the
+// RxToken drop path and by TX callers that abandon a partially-built
+// packet.
+void shim_mbuf_free(void *handle);
+
+// Zero-copy RX: poll rte_eth_rx_burst() for a single packet. On success
+// (return value == 1), sets *out_handle to an mbuf handle, *out_data
+// to the packet's readable data start, and *out_len to its length. The
+// caller must eventually free the mbuf via shim_mbuf_free().
+// Returns 0 if no packet was available OR the packet was dropped
+// because the NIC flagged a bad checksum (in the latter case the mbuf
+// is freed by the shim before return).
+int shim_mbuf_rx_burst(uint16_t port_id, uint16_t queue_id, void **out_handle,
+                        const uint8_t **out_data, uint16_t *out_len);
 
 // --- Checksum-offload diagnostics ----------------------------------------
 

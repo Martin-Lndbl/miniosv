@@ -6,9 +6,10 @@ extern crate alloc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::alloc::{GlobalAlloc, Layout};
-use core::ffi::c_int;
+use core::ffi::{c_int, c_void};
 use core::fmt::{self, Write};
 use core::panic::PanicInfo;
+use core::ptr;
 
 use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
 use smoltcp::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
@@ -174,14 +175,30 @@ extern "C" {
         obytes: *mut u64,
     ) -> c_int;
 
-    fn shim_tx_packet(
+    // Zero-copy TX: alloc → write into `data[..cap]` → shim_mbuf_tx.
+    fn shim_mbuf_alloc_tx(
+        pool: *mut rte_pktmbuf_pool,
+        out_handle: *mut *mut c_void,
+        out_cap: *mut u16,
+    ) -> *mut u8;
+    fn shim_mbuf_tx(
         port_id: u16,
         queue_id: u16,
-        pool: *mut rte_pktmbuf_pool,
-        data: *const u8,
+        handle: *mut c_void,
         len: u16,
     ) -> c_int;
-    fn shim_rx_packet(port_id: u16, queue_id: u16, buf: *mut u8, max_len: u16) -> c_int;
+    fn shim_mbuf_free(handle: *mut c_void);
+
+    // Zero-copy RX: burst one packet; the shim hands back the mbuf
+    // handle + data pointer + length. Rust owns the handle until it
+    // calls shim_mbuf_free.
+    fn shim_mbuf_rx_burst(
+        port_id: u16,
+        queue_id: u16,
+        out_handle: *mut *mut c_void,
+        out_data: *mut *const u8,
+        out_len: *mut u16,
+    ) -> c_int;
 }
 
 // =====================================================================
@@ -266,46 +283,54 @@ fn probe_and_open(port_id: u16) -> Option<(PktPool, [u8; 6])> {
 }
 
 // =====================================================================
-// smoltcp Device backed by minidpdk tx/rx bursts.
-//
-// The RxToken/TxToken split forces us to hand out both tokens with
-// non-overlapping borrows. The RX buffer lives in a `static mut` so
-// the RxToken holds an immutable slice unrelated to `&mut self`; the
-// TxToken holds a `&mut DpdkDevice` for its scratch buffer.
+// smoltcp Device backed by minidpdk tx/rx bursts, zero-copy on both
+// directions: TX writes straight into an mbuf's data area (no
+// Rust-side scratch, no memcpy), RX carries the mbuf pointer through
+// the RxToken and frees it after smoltcp/rustls has consumed the
+// bytes. rustls's unbuffered `next_record` writes plaintext into a
+// separate buffer anyway, so the mbuf can go back to the pool as soon
+// as consume() returns.
 // =====================================================================
 
 const MTU: usize = 1514;
 
-// Ethernet frame staging buffer for RX. Only one DpdkDevice instance
-// exists at a time (`osv_app_main` is single-threaded), so one static
-// slot suffices.
-static mut RX_STAGING: [u8; MTU] = [0u8; MTU];
-static mut RX_STAGING_LEN: usize = 0;
-
 struct DpdkDevice {
     port_id: u16,
     pool: *mut rte_pktmbuf_pool,
-    tx_scratch: [u8; MTU],
 }
 
-struct DpdkRxToken<'a> {
-    buf: &'a [u8],
+/// Holds an owned mbuf handle from `shim_mbuf_rx_burst`. `consume()`
+/// hands the mbuf's data slice to smoltcp/rustls and then frees.
+/// `Drop` covers the "smoltcp drops the token without consuming"
+/// path, so we never leak an mbuf regardless of upstream behaviour.
+struct DpdkRxToken {
+    handle: *mut c_void,
+    data: *const u8,
+    len: usize,
 }
 
 struct DpdkTxToken<'a> {
     dev: &'a mut DpdkDevice,
 }
 
-impl<'a> RxToken for DpdkRxToken<'a> {
+impl RxToken for DpdkRxToken {
     fn consume<R, F>(self, f: F) -> R
     where
         F: FnOnce(&[u8]) -> R,
     {
-        let r = f(self.buf);
-        unsafe {
-            RX_STAGING_LEN = 0;
-        }
+        // Take ownership of the handle so Drop is a no-op — otherwise
+        // we'd double-free after the explicit shim_mbuf_free below.
+        let this = core::mem::ManuallyDrop::new(self);
+        let slice = unsafe { core::slice::from_raw_parts(this.data, this.len) };
+        let r = f(slice);
+        unsafe { shim_mbuf_free(this.handle) };
         r
+    }
+}
+
+impl Drop for DpdkRxToken {
+    fn drop(&mut self) {
+        unsafe { shim_mbuf_free(self.handle) };
     }
 }
 
@@ -314,24 +339,31 @@ impl<'a> TxToken for DpdkTxToken<'a> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let n = core::cmp::min(len, self.dev.tx_scratch.len());
-        let r = f(&mut self.dev.tx_scratch[..n]);
-        unsafe {
-            shim_tx_packet(
-                self.dev.port_id,
-                0,
-                self.dev.pool,
-                self.dev.tx_scratch.as_ptr(),
-                n as u16,
-            );
+        let mut handle: *mut c_void = ptr::null_mut();
+        let mut cap: u16 = 0;
+        let data =
+            unsafe { shim_mbuf_alloc_tx(self.dev.pool, &mut handle, &mut cap) };
+        if data.is_null() || handle.is_null() {
+            // Pool exhausted. smoltcp expects `f` to be called; discard
+            // its output into a stack scratch and let it retransmit.
+            let mut scratch = [0u8; MTU];
+            let n = core::cmp::min(len, scratch.len());
+            return f(&mut scratch[..n]);
         }
+        let n = core::cmp::min(len, cap as usize);
+        let slice = unsafe { core::slice::from_raw_parts_mut(data, n) };
+        let r = f(slice);
+        // shim_mbuf_tx consumes the mbuf on success and frees it on
+        // tx_burst failure. Either way, `handle` must not be touched
+        // after this call.
+        let _ = unsafe { shim_mbuf_tx(self.dev.port_id, 0, handle, n as u16) };
         r
     }
 }
 
 impl Device for DpdkDevice {
     type RxToken<'a>
-        = DpdkRxToken<'a>
+        = DpdkRxToken
     where
         Self: 'a;
     type TxToken<'a>
@@ -340,25 +372,21 @@ impl Device for DpdkDevice {
         Self: 'a;
 
     fn receive(&mut self, _t: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        use core::ptr::{addr_of, addr_of_mut};
-        let staging_ptr: *mut u8 = addr_of_mut!(RX_STAGING) as *mut u8;
-        let staging_cap: u16 = MTU as u16;
-        let len = unsafe {
-            if RX_STAGING_LEN == 0 {
-                let n = shim_rx_packet(self.port_id, 0, staging_ptr, staging_cap);
-                if n <= 0 {
-                    return None;
-                }
-                RX_STAGING_LEN = n as usize;
-            }
-            RX_STAGING_LEN
+        let mut handle: *mut c_void = ptr::null_mut();
+        let mut data: *const u8 = ptr::null();
+        let mut len: u16 = 0;
+        let rc = unsafe {
+            shim_mbuf_rx_burst(self.port_id, 0, &mut handle, &mut data, &mut len)
         };
-        // SAFETY: RX_STAGING is only mutated from receive(), and the
-        // returned slice is invalidated by the consume() path resetting
-        // RX_STAGING_LEN before the next receive() would touch the buffer.
-        let buf: &[u8] =
-            unsafe { core::slice::from_raw_parts(addr_of!(RX_STAGING) as *const u8, len) };
-        Some((DpdkRxToken { buf }, DpdkTxToken { dev: self }))
+        if rc != 1 || handle.is_null() {
+            return None;
+        }
+        let rx = DpdkRxToken {
+            handle,
+            data,
+            len: len as usize,
+        };
+        Some((rx, DpdkTxToken { dev: self }))
     }
 
     fn transmit(&mut self, _t: Instant) -> Option<Self::TxToken<'_>> {
@@ -838,7 +866,6 @@ pub extern "C" fn osv_app_main() {
             let dev = DpdkDevice {
                 port_id,
                 pool: pool.0,
-                tx_scratch: [0u8; MTU],
             };
             run_net(mac, dev);
             unsafe { shim_dev_stop(port_id) };

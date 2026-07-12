@@ -242,15 +242,22 @@ static void ena_tx_offload_prepare(rte_mbuf *m, uint8_t *buf, uint16_t len) {
   }
 }
 
-int shim_tx_packet(uint16_t port_id, uint16_t queue_id, void *pool,
-                    const uint8_t *data, uint16_t len) {
+uint8_t *shim_mbuf_alloc_tx(void *pool, void **out_handle, uint16_t *out_cap) {
   auto *mp = static_cast<rte_mempool *>(pool);
   rte_mbuf *m = rte_pktmbuf_alloc(mp);
   if (m == nullptr) {
-    return -1;
+    *out_handle = nullptr;
+    *out_cap = 0;
+    return nullptr;
   }
-  uint8_t *dst = rte_pktmbuf_mtod(m, uint8_t *);
-  std::memcpy(dst, data, len);
+  *out_handle = m;
+  *out_cap = m->buf_len;
+  return rte_pktmbuf_mtod(m, uint8_t *);
+}
+
+int shim_mbuf_tx(uint16_t port_id, uint16_t queue_id, void *handle,
+                  uint16_t len) {
+  auto *m = static_cast<rte_mbuf *>(handle);
   m->data_len = len;
   m->pkt_len = len;
   m->nb_segs = 1;
@@ -258,7 +265,7 @@ int shim_tx_packet(uint16_t port_id, uint16_t queue_id, void *pool,
 
   // NIC offload: patch ol_flags / l2_len / l3_len and blank out the
   // cksum fields so hardware fills them.
-  ena_tx_offload_prepare(m, dst, len);
+  ena_tx_offload_prepare(m, rte_pktmbuf_mtod(m, uint8_t *), len);
 
   uint16_t sent = rte_eth_tx_burst(port_id, queue_id, &m, 1);
   if (sent == 0) {
@@ -268,8 +275,14 @@ int shim_tx_packet(uint16_t port_id, uint16_t queue_id, void *pool,
   return 0;
 }
 
-int shim_rx_packet(uint16_t port_id, uint16_t queue_id, uint8_t *buf,
-                    uint16_t max_len) {
+void shim_mbuf_free(void *handle) {
+  if (handle) {
+    rte_pktmbuf_free(static_cast<rte_mbuf *>(handle));
+  }
+}
+
+int shim_mbuf_rx_burst(uint16_t port_id, uint16_t queue_id, void **out_handle,
+                        const uint8_t **out_data, uint16_t *out_len) {
   rte_mbuf *m = nullptr;
   uint16_t nb = rte_eth_rx_burst(port_id, queue_id, &m, 1);
   if (nb == 0 || m == nullptr) {
@@ -304,13 +317,11 @@ int shim_rx_packet(uint16_t port_id, uint16_t queue_id, uint8_t *buf,
     rte_pktmbuf_free(m);
     return 0;
   }
-  uint16_t len = m->data_len;
-  if (len > max_len) {
-    len = max_len;
-  }
-  std::memcpy(buf, rte_pktmbuf_mtod(m, uint8_t *), len);
-  rte_pktmbuf_free(m);
-  return static_cast<int>(len);
+
+  *out_handle = m;
+  *out_data = rte_pktmbuf_mtod(m, const uint8_t *);
+  *out_len = m->data_len;
+  return 1;
 }
 
 void shim_offload_report(void) {
