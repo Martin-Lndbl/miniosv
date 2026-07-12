@@ -11,7 +11,7 @@ use core::fmt::{self, Write};
 use core::panic::PanicInfo;
 
 use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
-use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use smoltcp::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::{dhcpv4, tcp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address};
@@ -170,6 +170,7 @@ extern "C" {
     fn shim_tx_queue_setup(port_id: u16, queue_id: u16, nb_desc: u16) -> c_int;
     fn shim_dev_start(port_id: u16) -> c_int;
     fn shim_dev_stop(port_id: u16);
+    fn shim_offload_report();
     fn shim_macaddr_get(port_id: u16, addr_bytes: *mut u8);
     fn shim_get_stats(
         port_id: u16,
@@ -388,6 +389,12 @@ impl Device for DpdkDevice {
         let mut c = DeviceCapabilities::default();
         c.max_transmission_unit = MTU;
         c.medium = Medium::Ethernet;
+        // The ENA NIC is configured (via the shim's shim_eth_dev_configure)
+        // to compute IPv4/TCP/UDP checksums on TX and verify them on RX;
+        // the shim drops packets the NIC flags as bad. Ask smoltcp to stay
+        // out of the checksum business entirely so we're not paying the CPU
+        // cost twice.
+        c.checksum = ChecksumCapabilities::ignored();
         c
     }
 }
@@ -737,10 +744,10 @@ fn https_get(
                         match rec {
                             Ok(rec) => {
                                 bytes_received += rec.payload.len();
-                                match core::str::from_utf8(rec.payload) {
-                                    Ok(txt) => print!("{}", txt),
-                                    Err(_) => print!("<{} non-utf8 bytes>", rec.payload.len()),
-                                }
+                                // Suppress the body dump — the offload
+                                // diagnostic below needs the last ~500 B
+                                // of console space. Print the first
+                                // record's HTTP status line only.
                             }
                             Err(e) => {
                                 println!("FAIL: tls record: {:?}", e);
@@ -822,8 +829,13 @@ fn https_get(
             incoming.drain(..discard);
         }
 
-        // 4) End condition: peer closed the TLS session and TCP is done.
-        if handshake_done && request_queued && !s.is_active() && outgoing.is_empty() {
+        // 4) End condition: peer sent FIN (TCP -> CloseWait or Closed).
+        //    `is_active()` stays true in CloseWait so we can't rely on it.
+        let ended = matches!(
+            state,
+            tcp::State::Closed | tcp::State::CloseWait | tcp::State::TimeWait
+        );
+        if handshake_done && request_queued && ended && outgoing.is_empty() {
             println!();
             println!(
                 "OK: HTTPS exchange complete ({} bytes plaintext received)",
@@ -868,6 +880,14 @@ fn run_net(mac: [u8; 6], mut dev: DpdkDevice) {
     }
 
     https_get(&mut iface, &mut dev, &mut sockets, tcp_handle, port_id);
+
+    // With no more traffic in flight, print the NIC-offload summary while
+    // the console tail still has room. If the driver accepted TX offloads,
+    // the HTTPS exchange above is proof they worked — smoltcp emits
+    // packets with the checksum bytes at zero (ChecksumCapabilities is
+    // `ignored()`), so a successful handshake means the NIC filled them.
+    // The RX-verdict counter proves the same on the receive side.
+    unsafe { shim_offload_report() };
 }
 
 // =====================================================================

@@ -70,6 +70,15 @@ int shim_tx_packet(uint16_t port_id, uint16_t queue_id, void *pool,
 int shim_rx_packet(uint16_t port_id, uint16_t queue_id, uint8_t *buf,
                     uint16_t max_len);
 
+// --- Checksum-offload diagnostics ----------------------------------------
+
+// Emit a one-shot summary of what checksum offloads the driver accepted
+// at configure time and the aggregate `ol_flags` verdict the NIC produced
+// across all received packets. Intended to be called once after the app
+// finishes its work, so the counters don't get scrolled off the end of
+// the 64 KB AWS console tail by response-body prints.
+void shim_offload_report(void);
+
 // --- Non-networking runtime hooks needed by rustls -----------------------
 
 // Wall-clock seconds since the Unix epoch. Used only for TLS certificate
