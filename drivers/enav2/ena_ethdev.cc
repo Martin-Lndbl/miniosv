@@ -2080,6 +2080,16 @@ int ena_dma_alloc(rte_eth_dev_data *dmadev, bus_size_t size,
     return ENA_COM_NO_MEM;
   }
 
+  /* Zero the buffer. ENA_MEM_ALLOC_COHERENT is a dma_alloc_coherent()
+   * analogue and its Linux/FreeBSD counterparts return zeroed memory.
+   * The admin CQ relies on that: it polls each entry's phase bit and
+   * treats a match as a real completion. Uninitialised memory whose
+   * phase bit happens to be 1 (~50% chance per byte) is processed as a
+   * bogus completion with a garbage command_id, which then flips the
+   * admin queue to `running_state = false` and every subsequent admin
+   * command returns -ENODEV. */
+  memset(dma->vaddr, 0, size);
+
   dma->paddr = mmu::virt_to_phys(dma->vaddr);
 
   return (0);

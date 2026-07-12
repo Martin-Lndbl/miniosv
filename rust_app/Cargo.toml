@@ -18,5 +18,7 @@ default-features = false
 features = [
     "medium-ethernet",
     "proto-ipv4",
+    "proto-dhcpv4",
     "socket-tcp",
+    "socket-dhcpv4",
 ]

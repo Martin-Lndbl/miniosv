@@ -7,9 +7,9 @@ use core::panic::PanicInfo;
 
 use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
-use smoltcp::socket::tcp;
+use smoltcp::socket::{dhcpv4, tcp};
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address};
+use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address};
 
 // =====================================================================
 // Minimal console output (no std::cout in no_std).
@@ -308,61 +308,120 @@ impl Device for DpdkDevice {
 }
 
 // =====================================================================
-// HTTP POST driver (mimics `curl -d "Hi" http://<target>/`).
+// DHCP + HTTP GET against the AWS instance metadata service.
 //
-// Hard-coded for the AWS ENI passed through via VFIO on the current
-// host. Grab these from the instance metadata service if the ENI
-// changes:
-//   guest   172.31.28.134/20
-//   gateway 172.31.16.1        (subnet base + 1)
-//   target  93.184.215.14:80   (example.com A record)
+// The IP/gateway/subnet we get from AWS's DHCP server. The target is
+// 169.254.169.254:80 (IMDSv1), which is a well-known link-local IP
+// reachable from every VPC instance without any security-group
+// changes. We ask for /latest/meta-data/instance-id — a short
+// plaintext body that proves TCP-connect → HTTP request → response →
+// close all worked end to end.
 // =====================================================================
 
-const GUEST_IP: Ipv4Address = Ipv4Address::new(172, 31, 28, 134);
-const GUEST_PREFIX: u8 = 20;
-const GATEWAY_IP: Ipv4Address = Ipv4Address::new(172, 31, 16, 1);
-
-// Point at the host's SSH port on its primary ENI. Same VPC subnet
-// as the guest and always allowed by the AWS security group (the
-// user is SSH'd in), so no SG changes are needed. sshd will send its
-// version banner ("SSH-2.0-...") on connect, which is enough to
-// prove the TCP handshake + rx path work end to end.
-const TARGET_IP: Ipv4Address = Ipv4Address::new(172, 31, 24, 241);
-const TARGET_PORT: u16 = 22;
+const TARGET_IP: Ipv4Address = Ipv4Address::new(169, 254, 169, 254);
+const TARGET_PORT: u16 = 80;
 const LOCAL_PORT: u16 = 49152;
 
-const REQUEST: &[u8] = b"POST /smoltcp HTTP/1.1\r\n\
-                         Host: 172.31.24.241:8080\r\n\
+const REQUEST: &[u8] = b"GET /latest/meta-data/instance-id HTTP/1.0\r\n\
+                         Host: 169.254.169.254\r\n\
                          User-Agent: minidpdk-smoltcp/0.1\r\n\
-                         Content-Type: text/plain\r\n\
-                         Content-Length: 2\r\n\
                          Connection: close\r\n\
-                         \r\n\
-                         Hi";
+                         \r\n";
 
-fn http_post(mac: [u8; 6], mut dev: DpdkDevice) {
-    let config = Config::new(EthernetAddress(mac).into());
-    let mut iface = Interface::new(config, &mut dev, Instant::from_millis(0));
+// smoltcp fake-clock stride: one "ms" every CLOCK_STRIDE poll iterations.
+// STATS_STRIDE tunes how often we dump NIC counters. ITER_BUDGET is a
+// safety net so a hung run doesn't spin forever.
+const CLOCK_STRIDE: u64 = 5_000;
+const STATS_STRIDE: u64 = 500_000;
+const ITER_BUDGET: u64 = 5_000_000_000;
 
-    iface.update_ip_addrs(|addrs| {
-        let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(GUEST_IP), GUEST_PREFIX));
-    });
-    let _ = iface.routes_mut().add_default_ipv4_route(GATEWAY_IP);
+fn tick_clock(clock_ms: &mut i64, iter: &mut u64) {
+    *iter = iter.wrapping_add(1);
+    if iter.is_multiple_of(CLOCK_STRIDE) {
+        *clock_ms = clock_ms.wrapping_add(1);
+    }
+}
 
-    // Static TCP socket buffers (smoltcp needs owned slices).
-    static mut TCP_RX: [u8; 8192] = [0u8; 8192];
-    static mut TCP_TX: [u8; 4096] = [0u8; 4096];
-    let tcp_sock = tcp::Socket::new(
-        tcp::SocketBuffer::new(unsafe { &mut TCP_RX[..] }),
-        tcp::SocketBuffer::new(unsafe { &mut TCP_TX[..] }),
+fn dump_stats(port_id: u16, iter: u64, clock_ms: i64) {
+    let (mut i_pkts, mut o_pkts, mut i_bytes, mut o_bytes) = (0u64, 0u64, 0u64, 0u64);
+    unsafe {
+        shim_get_stats(
+            port_id,
+            &mut i_pkts,
+            &mut o_pkts,
+            &mut i_bytes,
+            &mut o_bytes,
+        );
+    }
+    println!(
+        "stats: iter={} clock={}ms rx={} pkts/{} B  tx={} pkts/{} B",
+        iter, clock_ms, i_pkts, i_bytes, o_pkts, o_bytes
     );
+}
 
-    static mut STORAGE: [SocketStorage; 1] = [SocketStorage::EMPTY; 1];
-    let mut sockets = unsafe { SocketSet::new(&mut STORAGE[..]) };
-    let handle = sockets.add(tcp_sock);
+/// Runs a DHCPv4 exchange until the server hands us an address, then
+/// installs it (with default route + subnet mask) on the interface.
+/// Returns the acquired (address, gateway) tuple.
+fn dhcp_acquire(
+    iface: &mut Interface,
+    dev: &mut DpdkDevice,
+    sockets: &mut SocketSet<'_>,
+    dhcp_handle: smoltcp::iface::SocketHandle,
+    port_id: u16,
+) -> Option<(smoltcp::wire::Ipv4Cidr, Ipv4Address)> {
+    let mut clock_ms: i64 = 0;
+    let mut iter: u64 = 0;
+    println!("DHCP: requesting lease...");
+    loop {
+        iface.poll(Instant::from_millis(clock_ms), dev, sockets);
 
+        let s = sockets.get_mut::<dhcpv4::Socket>(dhcp_handle);
+        match s.poll() {
+            Some(dhcpv4::Event::Configured(cfg)) => {
+                let a = cfg.address;
+                let o = a.address().octets();
+                println!(
+                    "DHCP: address {}.{}.{}.{}/{}",
+                    o[0], o[1], o[2], o[3], a.prefix_len()
+                );
+                let router = cfg.router.unwrap_or(Ipv4Address::new(0, 0, 0, 0));
+                let r = router.octets();
+                println!("DHCP: gateway {}.{}.{}.{}", r[0], r[1], r[2], r[3]);
+                iface.update_ip_addrs(|addrs| {
+                    let _ = addrs.push(IpCidr::Ipv4(a));
+                });
+                if let Some(gw) = cfg.router {
+                    let _ = iface.routes_mut().add_default_ipv4_route(gw);
+                }
+                return Some((a, router));
+            }
+            Some(dhcpv4::Event::Deconfigured) => {
+                println!("DHCP: deconfigured (lease lost)");
+            }
+            None => {}
+        }
+
+        tick_clock(&mut clock_ms, &mut iter);
+        if iter.is_multiple_of(STATS_STRIDE) {
+            dump_stats(port_id, iter, clock_ms);
+        }
+        // DHCP is fast on AWS; a fraction of ITER_BUDGET is more than enough.
+        if iter > ITER_BUDGET / 10 {
+            println!("DHCP: timeout ({} iters, {} fake-ms)", iter, clock_ms);
+            return None;
+        }
+    }
+}
+
+fn http_get(
+    iface: &mut Interface,
+    dev: &mut DpdkDevice,
+    sockets: &mut SocketSet<'_>,
+    tcp_handle: smoltcp::iface::SocketHandle,
+    port_id: u16,
+) {
     {
-        let s = sockets.get_mut::<tcp::Socket>(handle);
+        let s = sockets.get_mut::<tcp::Socket>(tcp_handle);
         if let Err(_) = s.connect(iface.context(), (TARGET_IP, TARGET_PORT), LOCAL_PORT) {
             println!("FAIL: tcp connect() rejected");
             return;
@@ -380,22 +439,9 @@ fn http_post(mac: [u8; 6], mut dev: DpdkDevice) {
     let mut iter: u64 = 0;
     let mut last_state: tcp::State = tcp::State::Closed;
 
-    // Real-iteration budget. Each iteration is a poll+RX check; we
-    // advance the fake monotonic clock by 1 fake-ms every CLOCK_STRIDE
-    // iterations so smoltcp's retransmit timers don't run away faster
-    // than the real network can respond.
-    const CLOCK_STRIDE: u64 = 5_000;
-    const STATS_STRIDE: u64 = 500_000;
-    // ~5B iterations is 'forever' at these tight-loop speeds — leaves
-    // plenty of wall-clock time for ARP+SYN+response on a real NIC.
-    const ITER_BUDGET: u64 = 5_000_000_000;
-
-    let port_id_dbg = dev.port_id;
-
     loop {
-        iface.poll(Instant::from_millis(clock_ms), &mut dev, &mut sockets);
-
-        let s = sockets.get_mut::<tcp::Socket>(handle);
+        iface.poll(Instant::from_millis(clock_ms), dev, sockets);
+        let s = sockets.get_mut::<tcp::Socket>(tcp_handle);
 
         let state = s.state();
         if state != last_state {
@@ -409,9 +455,7 @@ fn http_post(mac: [u8; 6], mut dev: DpdkDevice) {
                     println!("OK: sent {} bytes of HTTP request", n);
                     request_sent = true;
                 }
-                Ok(n) => {
-                    println!("PARTIAL: queued {}/{} bytes", n, REQUEST.len());
-                }
+                Ok(n) => println!("PARTIAL: queued {}/{} bytes", n, REQUEST.len()),
                 Err(_) => {
                     println!("FAIL: send_slice error");
                     return;
@@ -433,33 +477,16 @@ fn http_post(mac: [u8; 6], mut dev: DpdkDevice) {
         if request_sent && !s.is_active() {
             println!();
             println!(
-                "OK: connection closed by peer ({} bytes received)",
+                "OK: HTTP exchange complete ({} bytes received)",
                 bytes_received
             );
             return;
         }
 
-        iter = iter.wrapping_add(1);
-        if iter.is_multiple_of(CLOCK_STRIDE) {
-            clock_ms = clock_ms.wrapping_add(1);
-        }
+        tick_clock(&mut clock_ms, &mut iter);
         if iter.is_multiple_of(STATS_STRIDE) {
-            let (mut i_pkts, mut o_pkts, mut i_bytes, mut o_bytes) = (0u64, 0u64, 0u64, 0u64);
-            unsafe {
-                shim_get_stats(
-                    port_id_dbg,
-                    &mut i_pkts,
-                    &mut o_pkts,
-                    &mut i_bytes,
-                    &mut o_bytes,
-                );
-            }
-            println!(
-                "stats: iter={} clock={}ms rx={} pkts/{} B  tx={} pkts/{} B",
-                iter, clock_ms, i_pkts, i_bytes, o_pkts, o_bytes
-            );
+            dump_stats(port_id, iter, clock_ms);
         }
-
         if iter > ITER_BUDGET {
             println!(
                 "TIMEOUT after {} iters (fake clock {} ms, received {} bytes)",
@@ -468,6 +495,30 @@ fn http_post(mac: [u8; 6], mut dev: DpdkDevice) {
             return;
         }
     }
+}
+
+fn run_net(mac: [u8; 6], mut dev: DpdkDevice) {
+    let config = Config::new(EthernetAddress(mac).into());
+    let mut iface = Interface::new(config, &mut dev, Instant::from_millis(0));
+
+    static mut TCP_RX: [u8; 8192] = [0u8; 8192];
+    static mut TCP_TX: [u8; 4096] = [0u8; 4096];
+    let tcp_sock = tcp::Socket::new(
+        tcp::SocketBuffer::new(unsafe { &mut TCP_RX[..] }),
+        tcp::SocketBuffer::new(unsafe { &mut TCP_TX[..] }),
+    );
+
+    static mut STORAGE: [SocketStorage; 2] = [SocketStorage::EMPTY; 2];
+    let mut sockets = unsafe { SocketSet::new(&mut STORAGE[..]) };
+    let tcp_handle = sockets.add(tcp_sock);
+    let dhcp_handle = sockets.add(dhcpv4::Socket::new());
+
+    let port_id = dev.port_id;
+    if dhcp_acquire(&mut iface, &mut dev, &mut sockets, dhcp_handle, port_id).is_none() {
+        return;
+    }
+
+    http_get(&mut iface, &mut dev, &mut sockets, tcp_handle, port_id);
 }
 
 // =====================================================================
@@ -502,7 +553,7 @@ pub extern "C" fn osv_app_main() {
                 pool: pool_ref.0,
                 tx_scratch: [0u8; MTU],
             };
-            http_post(mac, dev);
+            run_net(mac, dev);
             unsafe { shim_dev_stop(port_id_used) };
         }
         _ => {
