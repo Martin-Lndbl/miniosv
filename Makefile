@@ -156,6 +156,7 @@ conf_interrupt_stack_size=0x1000
 # --- device drivers --------------------------------------------------------
 conf_drivers_acpi=1
 conf_drivers_pci=1
+conf_drivers_ena=1
 
 ifneq ($(MAKECMDGOALS),clean)
 $(info Building into $(out))
@@ -512,6 +513,13 @@ drivers += drivers/pci-function.o
 drivers += drivers/pci-bridge.o
 drivers += drivers/msi.o
 endif
+ifeq ($(conf_drivers_ena),1)
+drivers += drivers/ena.o
+drivers += drivers/enav2/base/ena_eth_com.o
+drivers += drivers/enav2/base/ena_com.o
+drivers += drivers/enav2/ena_ethdev.o
+drivers += drivers/enav2/ena_rss.o
+endif
 drivers += drivers/driver.o
 
 # ACPI is the device-discovery model on both architectures under UEFI boot.
@@ -614,6 +622,10 @@ objects += core/condvar.o
 objects += core/debug.o
 objects += core/rcu.o
 objects += core/mempool.o
+objects += core/callout.o
+objects += core/time.o
+objects += core/mem.o
+objects += core/dev.o
 ifeq ($(conf_memory_tracker),1)
 objects += core/alloctracker.o
 endif

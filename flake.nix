@@ -63,7 +63,6 @@
         ];
 
         ovmf_prefix = if system == "x86_64-linux" then "OVMF" else "AAVMF";
-
       in
       {
         devShells = rec {
@@ -95,8 +94,8 @@
             ++ default.nativeBuildInputs;
           });
 
-          cli = aws.overrideattrs (aws: {
-            nativebuildinputs =
+          cli = aws.overrideAttrs (aws: {
+            nativeBuildInputs =
               with pkgs;
               [
                 bear
@@ -110,9 +109,7 @@
           rust = cli.overrideattrs (cli: {
             nativebuildinputs = [ pkgs.cargo ] ++ cli.nativebuildinputs;
           });
-
         };
-
       }
     );
 }
