@@ -1,6 +1,5 @@
 {
   description = "miniosv — slim unikernel OS";
-
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     flake-utils.url = "github:numtide/flake-utils";
@@ -104,23 +103,13 @@
                 clang-tools
                 pyright
               ]
-              ++ aws.nativeBuildInputs;
+              ++ aws.nativebuildinputs;
           });
 
-          rust = cli.overrideAttrs (cli: {
-            nativeBuildInputs =
-              with pkgs;
-              [
-                bear
-                black
-                clang-tools
-                cargo
-                pyright
-              ]
-              ++ cli.nativeBuildInputs;
+          rust = cli.overrideattrs (cli: {
+            nativebuildinputs = [ pkgs.cargo ] ++ cli.nativebuildinputs;
           });
         };
-
       }
     );
 }
