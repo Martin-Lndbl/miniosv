@@ -1,5 +1,3 @@
-// rust_app/shim/shim.h
-//
 // extern "C" bridge between the Rust port and the C++-only minidpdk
 // API (rte_eth_dev exposes get_dev_info/get_stats/stop as virtual
 // methods, and eth_os::get_eth_for_port() returns a C++ pointer —

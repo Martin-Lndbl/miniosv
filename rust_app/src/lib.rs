@@ -1,5 +1,5 @@
 #![no_std]
-#![allow(non_camel_case_types, dead_code)]
+#![allow(non_camel_case_types)]
 
 extern crate alloc;
 
@@ -121,12 +121,6 @@ impl Write for Stdout {
     }
 }
 
-macro_rules! print {
-    ($($arg:tt)*) => {{
-        let _ = Stdout.write_fmt(format_args!($($arg)*));
-    }};
-}
-
 macro_rules! println {
     () => {{
         let _ = Stdout.write_str("\n");
@@ -180,7 +174,6 @@ extern "C" {
         obytes: *mut u64,
     ) -> c_int;
 
-    // New: copy-in tx and copy-out rx (single packet).
     fn shim_tx_packet(
         port_id: u16,
         queue_id: u16,
@@ -190,9 +183,6 @@ extern "C" {
     ) -> c_int;
     fn shim_rx_packet(port_id: u16, queue_id: u16, buf: *mut u8, max_len: u16) -> c_int;
 }
-
-const ENODEV: c_int = 19;
-const ENOMEM: c_int = 12;
 
 // =====================================================================
 // Packet pool RAII
@@ -209,49 +199,41 @@ impl Drop for PktPool {
 }
 
 // =====================================================================
-// NIC probe + setup.
-//
-// Returns the MAC address on success. Unlike the old app that also
-// stopped the device before returning, this leaves the port started so
-// the caller can pump packets through it via the smoltcp interface.
+// NIC probe + setup. Returns (owned pool, MAC) if the port exists and
+// was successfully started; None otherwise. Leaves the port running so
+// the caller can pump packets through it.
 // =====================================================================
 
-fn probe_and_open(port_id: u16, pool_out: &mut Option<PktPool>) -> Result<[u8; 6], c_int> {
+fn probe_and_open(port_id: u16) -> Option<(PktPool, [u8; 6])> {
     const DESC_NUM: u16 = 64;
     const MEMPOOL_CACHE_SIZE: u32 = 32;
     const POOL_SIZE: u32 = 256;
     const DATA_ROOM_SIZE: u16 = 1536;
 
     if unsafe { shim_is_valid_port(port_id) } == 0 {
-        return Err(ENODEV);
+        return None;
     }
     println!("OK: device found on port {}", port_id);
 
     let mut max_rx: u16 = 0;
     let mut max_tx: u16 = 0;
     if unsafe { shim_get_dev_info(port_id, &mut max_rx, &mut max_tx) } != 0 {
-        return Err(ENODEV);
+        return None;
     }
     println!("  max rx queues:{}  max tx queues:{}", max_rx, max_tx);
 
     let name = b"http-pool\0";
-    let p = unsafe {
-        shim_pktmbuf_pool_create(
-            name.as_ptr(),
-            POOL_SIZE,
-            MEMPOOL_CACHE_SIZE,
-            0,
-            DATA_ROOM_SIZE,
-        )
+    let raw = unsafe {
+        shim_pktmbuf_pool_create(name.as_ptr(), POOL_SIZE, MEMPOOL_CACHE_SIZE, 0, DATA_ROOM_SIZE)
     };
-    if p.is_null() {
-        return Err(ENOMEM);
+    if raw.is_null() {
+        return None;
     }
-    *pool_out = Some(PktPool(p));
+    let pool = PktPool(raw);
     println!("OK: packet pool allocated");
 
     if unsafe { shim_eth_dev_configure(port_id, 1, 1) } != 0 {
-        return Err(1);
+        return None;
     }
     println!("OK: device configured (1 rx, 1 tx queue)");
 
@@ -259,19 +241,18 @@ fn probe_and_open(port_id: u16, pool_out: &mut Option<PktPool>) -> Result<[u8; 6
     let mut tx_desc = DESC_NUM;
     unsafe { shim_adjust_nb_rx_tx_desc(port_id, &mut rx_desc, &mut tx_desc) };
 
-    let pool_ptr = pool_out.as_ref().unwrap().0;
-    if unsafe { shim_rx_queue_setup(port_id, 0, rx_desc, pool_ptr) } != 0 {
-        return Err(1);
+    if unsafe { shim_rx_queue_setup(port_id, 0, rx_desc, pool.0) } != 0 {
+        return None;
     }
     println!("OK: rx queue set up ({} descriptors)", rx_desc);
 
     if unsafe { shim_tx_queue_setup(port_id, 0, tx_desc) } != 0 {
-        return Err(1);
+        return None;
     }
     println!("OK: tx queue set up ({} descriptors)", tx_desc);
 
     if unsafe { shim_dev_start(port_id) } != 0 {
-        return Err(1);
+        return None;
     }
     println!("OK: device started");
 
@@ -281,24 +262,23 @@ fn probe_and_open(port_id: u16, pool_out: &mut Option<PktPool>) -> Result<[u8; 6
         "OK: MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
     );
-    Ok(mac)
+    Some((pool, mac))
 }
 
 // =====================================================================
 // smoltcp Device backed by minidpdk tx/rx bursts.
 //
 // The RxToken/TxToken split forces us to hand out both tokens with
-// non-overlapping borrows. We reuse the trick from the earlier
-// loopback experiment: the RX buffer lives in a `static mut` so the
-// RxToken holds an immutable slice unrelated to `&mut self`, while
-// the TxToken holds the `&mut self` reference for tx_scratch access.
+// non-overlapping borrows. The RX buffer lives in a `static mut` so
+// the RxToken holds an immutable slice unrelated to `&mut self`; the
+// TxToken holds a `&mut DpdkDevice` for its scratch buffer.
 // =====================================================================
 
 const MTU: usize = 1514;
 
 // Ethernet frame staging buffer for RX. Only one DpdkDevice instance
-// exists at a time (`osv_app_main` is single-threaded), so a single
-// static slot is enough.
+// exists at a time (`osv_app_main` is single-threaded), so one static
+// slot suffices.
 static mut RX_STAGING: [u8; MTU] = [0u8; MTU];
 static mut RX_STAGING_LEN: usize = 0;
 
@@ -506,11 +486,13 @@ fn dhcp_acquire(
 }
 
 // ---------------------------------------------------------------------
-// RDRAND-backed CryptoRng. `rustls-rustcrypto` needs a `CryptoRng` for
-// ClientHello.random and the ephemeral keys; every c5.large / c7i.large
-// CPU has RDRAND, so we don't need to plumb entropy through the shim.
+// RDRAND-backed getrandom. Every RustCrypto dependency below rustls
+// calls `getrandom::getrandom()` for ClientHello.random, ephemeral
+// keys, and IVs. Its default backend is the Linux `getrandom(2)`
+// syscall, which OSv doesn't provide. The `custom` cargo feature swaps
+// that out for the callback registered below, and we back it with
+// RDRAND — always present on the c5/c7 CPUs we deploy to.
 // ---------------------------------------------------------------------
-struct RdRandRng;
 
 fn rdrand64() -> Option<u64> {
     #[cfg(target_arch = "x86_64")]
@@ -538,56 +520,18 @@ fn rdrand64() -> Option<u64> {
     }
 }
 
-impl rand_core::RngCore for RdRandRng {
-    fn next_u32(&mut self) -> u32 {
-        rdrand64().expect("rdrand unavailable") as u32
-    }
-    fn next_u64(&mut self) -> u64 {
-        rdrand64().expect("rdrand unavailable")
-    }
-    fn fill_bytes(&mut self, dest: &mut [u8]) {
-        let mut i = 0;
-        while i + 8 <= dest.len() {
-            let v = rdrand64().expect("rdrand unavailable");
-            dest[i..i + 8].copy_from_slice(&v.to_ne_bytes());
-            i += 8;
-        }
-        let remaining = dest.len() - i;
-        if remaining > 0 {
-            let v = rdrand64().expect("rdrand unavailable");
-            let tail = v.to_ne_bytes();
-            dest[i..].copy_from_slice(&tail[..remaining]);
-        }
-    }
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
-        self.fill_bytes(dest);
-        Ok(())
-    }
-}
-
-impl rand_core::CryptoRng for RdRandRng {}
-
-// Route the `getrandom` crate through RDRAND too. Every RustCrypto
-// dependency below rustls calls `getrandom::getrandom()` at some point;
-// on our target, its default backend is the Linux `getrandom(2)`
-// syscall, which OSv doesn't provide. With the `custom` feature turned
-// on in Cargo.toml, this macro replaces the backend with our own.
 fn osv_getrandom(dest: &mut [u8]) -> Result<(), getrandom::Error> {
+    let err = || getrandom::Error::from(core::num::NonZeroU32::new(1).unwrap());
     let mut i = 0;
     while i + 8 <= dest.len() {
-        let v = rdrand64().ok_or_else(|| {
-            getrandom::Error::from(core::num::NonZeroU32::new(1).unwrap())
-        })?;
+        let v = rdrand64().ok_or_else(err)?;
         dest[i..i + 8].copy_from_slice(&v.to_ne_bytes());
         i += 8;
     }
     let remaining = dest.len() - i;
     if remaining > 0 {
-        let v = rdrand64().ok_or_else(|| {
-            getrandom::Error::from(core::num::NonZeroU32::new(1).unwrap())
-        })?;
-        let tail = v.to_ne_bytes();
-        dest[i..].copy_from_slice(&tail[..remaining]);
+        let v = rdrand64().ok_or_else(err)?;
+        dest[i..].copy_from_slice(&v.to_ne_bytes()[..remaining]);
     }
     Ok(())
 }
@@ -595,15 +539,17 @@ fn osv_getrandom(dest: &mut [u8]) -> Result<(), getrandom::Error> {
 getrandom::register_custom_getrandom!(osv_getrandom);
 
 // ---------------------------------------------------------------------
-// TLS pump. Drives a rustls `ClientConnection` on top of the same
-// smoltcp TCP socket as before:
+// TLS pump. Drives a rustls `UnbufferedClientConnection` state machine
+// on top of the smoltcp TCP socket:
 //
-//   1. Drain rustls.wants_write() into the TCP tx buffer.
-//   2. Copy TCP rx bytes into rustls via read_tls / process_new_packets.
-//   3. Once handshake is done, write plaintext HTTP request into rustls
-//      (which encrypts and hands us record bytes back on the next tx
-//      pump), and read plaintext response out.
-//   4. On peer close: send close_notify, wait for socket close.
+//   1. Drain any queued outgoing ciphertext into the TCP tx buffer.
+//   2. Copy TCP rx bytes into `incoming` for rustls to consume.
+//   3. Loop through `process_tls_records`: it hands us `EncodeTlsData`
+//      (encode a handshake fragment), `TransmitTlsData` (nothing to
+//      do — we already appended it), `WriteTraffic` (safe to write
+//      plaintext request), `ReadTraffic` (records ready to decrypt),
+//      or `BlockedHandshake` (need more incoming — wait a poll).
+//   4. Exit when the peer sends FIN (CloseWait) and outgoing is empty.
 //
 // Everything shares the fake-ms clock we already use for smoltcp; the
 // same ITER_BUDGET/STATS cadence applies.
@@ -688,12 +634,11 @@ fn https_get(
     let mut incoming: Vec<u8> = Vec::with_capacity(TLS_BUF_CAP);
     let mut outgoing: Vec<u8> = Vec::with_capacity(TLS_BUF_CAP);
     let mut request_queued = false;
+    let mut handshake_done = false;
     let mut bytes_received: usize = 0;
     let mut clock_ms: i64 = 0;
     let mut iter: u64 = 0;
     let mut last_tcp_state: tcp::State = tcp::State::Closed;
-    let mut handshake_done = false;
-    let mut close_notify_sent = false;
 
     loop {
         iface.poll(Instant::from_millis(clock_ms), dev, sockets);
@@ -740,15 +685,12 @@ fn https_get(
             };
             match st {
                 ConnectionState::ReadTraffic(mut rt) => {
+                    // Just tally byte counts; the response body would
+                    // otherwise scroll the shim offload summary off
+                    // the AWS console tail on completion.
                     while let Some(rec) = rt.next_record() {
                         match rec {
-                            Ok(rec) => {
-                                bytes_received += rec.payload.len();
-                                // Suppress the body dump — the offload
-                                // diagnostic below needs the last ~500 B
-                                // of console space. Print the first
-                                // record's HTTP status line only.
-                            }
+                            Ok(rec) => bytes_received += rec.payload.len(),
                             Err(e) => {
                                 println!("FAIL: tls record: {:?}", e);
                                 return;
@@ -792,7 +734,6 @@ fn https_get(
                         println!("OK: tls handshake complete");
                         handshake_done = true;
                     }
-
                     if !request_queued {
                         let head = outgoing.len();
                         outgoing.resize(head + REQUEST.len() + 128, 0);
@@ -811,18 +752,12 @@ fn https_get(
                         );
                         request_queued = true;
                         progress = true;
-                    } else if !close_notify_sent && !s.can_send() {
-                        // Reserved slot to enqueue close_notify once
-                        // we've received the response and want to end.
                     }
                 }
                 ConnectionState::PeerClosed | ConnectionState::Closed => {
-                    if !close_notify_sent {
-                        // Best-effort close_notify path is via WriteTraffic;
-                        // by the time we're here we've already seen peer
-                        // close, so just log and let TCP finish.
-                        close_notify_sent = true;
-                    }
+                    // Peer sent close_notify; nothing to send back — we
+                    // wait for the TCP layer to see the FIN and exit
+                    // via the end-condition check below.
                 }
                 _ => {}
             }
@@ -896,40 +831,25 @@ fn run_net(mac: [u8; 6], mut dev: DpdkDevice) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn osv_app_main() {
-    let mut pool: Option<PktPool> = None;
-    let mut mac_opt: Option<[u8; 6]> = None;
-    let mut port_id_used: u16 = 0;
-
-    for i in 0u16..64 {
-        println!("Probing port {}...", i);
-        match probe_and_open(i, &mut pool) {
-            Ok(mac) => {
-                mac_opt = Some(mac);
-                port_id_used = i;
-                break;
-            }
-            Err(_) => {
-                // Drop any half-built pool before trying the next port.
-                pool = None;
-            }
-        }
-    }
-
-    match (mac_opt, pool.as_ref()) {
-        (Some(mac), Some(pool_ref)) => {
+    let mut ran = false;
+    for port_id in 0u16..64 {
+        println!("Probing port {}...", port_id);
+        if let Some((pool, mac)) = probe_and_open(port_id) {
             let dev = DpdkDevice {
-                port_id: port_id_used,
-                pool: pool_ref.0,
+                port_id,
+                pool: pool.0,
                 tx_scratch: [0u8; MTU],
             };
             run_net(mac, dev);
-            unsafe { shim_dev_stop(port_id_used) };
-        }
-        _ => {
-            println!("FAIL: no usable NIC found");
+            unsafe { shim_dev_stop(port_id) };
+            // `pool` drops here, releasing the mempool back to OSv.
+            ran = true;
+            break;
         }
     }
-
+    if !ran {
+        println!("FAIL: no usable NIC found");
+    }
     loop {
         core::hint::spin_loop();
     }

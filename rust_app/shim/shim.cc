@@ -1,11 +1,12 @@
-// rust_app/shim/shim.cpp
-//
-// Implementation of the extern "C" bridge declared in shim.h. See that
+// Implementation of the extern "C" bridge declared in shim.hh. See that
 // file for the rationale: every real DPDK/minidpdk struct is built and
 // read here, so only integers and opaque pointers ever cross into Rust.
 
 #include "shim.hh"
 
+#include <cerrno>
+#include <cstdarg>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
@@ -51,10 +52,6 @@ struct rx_verdict_counters {
     uint64_t total = 0;
 };
 rx_verdict_counters g_rx_verdict;
-
-}  // namespace
-
-namespace {
 
 // eth_os::get_eth_for_port() is the only way to reach the C++
 // rte_eth_dev object (and its virtual get_dev_info/get_stats/stop
@@ -359,10 +356,6 @@ void *shim_realloc(void *ptr, uint64_t size) {
 // callsite (SYS_getrandom, buf, len) specially by filling from RDRAND;
 // anything else returns -1/ENOSYS so failures are diagnosable rather
 // than silent memory corruption.
-#include <cerrno>
-#include <cstdarg>
-#include <cstdint>
-
 namespace {
 inline bool rdrand64_or_stall(uint64_t &out) {
     for (int i = 0; i < 10; ++i) {
