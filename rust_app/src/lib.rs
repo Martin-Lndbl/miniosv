@@ -1,6 +1,11 @@
 #![no_std]
 #![allow(non_camel_case_types, dead_code)]
 
+extern crate alloc;
+
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::alloc::{GlobalAlloc, Layout};
 use core::ffi::c_int;
 use core::fmt::{self, Write};
 use core::panic::PanicInfo;
@@ -10,6 +15,86 @@ use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::{dhcpv4, tcp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address};
+
+use rustls::client::{ClientConfig, UnbufferedClientConnection};
+use rustls::pki_types::{ServerName, UnixTime};
+use rustls::time_provider::TimeProvider;
+use rustls::unbuffered::{ConnectionState, UnbufferedStatus};
+use rustls::RootCertStore;
+
+// =====================================================================
+// Global allocator — Rust's alloc crate calls into OSv's C malloc/free
+// via the shim. rustls, its rustcrypto provider, webpki, and Arc<T> all
+// need a heap; wiring one up before main() is the cheapest way to give
+// them one.
+// =====================================================================
+
+extern "C" {
+    fn shim_malloc(size: u64) -> *mut u8;
+    fn shim_free(ptr: *mut u8);
+    fn shim_realloc(ptr: *mut u8, size: u64) -> *mut u8;
+    fn shim_time_seconds() -> u64;
+}
+
+struct ShimAllocator;
+
+// Layouts alloc/dealloc pairs never carry alignment through the FFI —
+// malloc gives 16-byte alignment on the OSv heap, which is enough for
+// everything the TLS stack asks for (up to __m128 alignment). If a
+// layout requires more, over-align: allocate `size + align - 1`, bump
+// the returned pointer, stash the original for dealloc.
+unsafe impl GlobalAlloc for ShimAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if layout.align() <= 16 {
+            unsafe { shim_malloc(layout.size() as u64) }
+        } else {
+            // Over-align by allocating extra headroom and storing the
+            // original malloc'd pointer just before the aligned slot.
+            let extra = layout.align() + core::mem::size_of::<*mut u8>();
+            let raw = unsafe { shim_malloc((layout.size() + extra) as u64) };
+            if raw.is_null() {
+                return raw;
+            }
+            let raw_addr = raw as usize + core::mem::size_of::<*mut u8>();
+            let aligned = (raw_addr + layout.align() - 1) & !(layout.align() - 1);
+            unsafe {
+                let slot = (aligned - core::mem::size_of::<*mut u8>()) as *mut *mut u8;
+                *slot = raw;
+            }
+            aligned as *mut u8
+        }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        if layout.align() <= 16 {
+            unsafe { shim_free(ptr) };
+        } else {
+            unsafe {
+                let slot = (ptr as usize - core::mem::size_of::<*mut u8>()) as *mut *mut u8;
+                shim_free(*slot);
+            }
+        }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        if layout.align() <= 16 {
+            unsafe { shim_realloc(ptr, new_size as u64) }
+        } else {
+            // Fall back to alloc/copy/dealloc when we've been over-aligning.
+            let new_layout = Layout::from_size_align_unchecked(new_size, layout.align());
+            let new_ptr = unsafe { self.alloc(new_layout) };
+            if !new_ptr.is_null() {
+                let copy = core::cmp::min(layout.size(), new_size);
+                unsafe { core::ptr::copy_nonoverlapping(ptr, new_ptr, copy) };
+                unsafe { self.dealloc(ptr, layout) };
+            }
+            new_ptr
+        }
+    }
+}
+
+#[global_allocator]
+static GLOBAL: ShimAllocator = ShimAllocator;
 
 // =====================================================================
 // Minimal console output (no std::cout in no_std).
@@ -308,22 +393,22 @@ impl Device for DpdkDevice {
 }
 
 // =====================================================================
-// DHCP + HTTP GET against the AWS instance metadata service.
+// DHCP + HTTPS GET to Cloudflare's DNS-over-HTTPS front-end.
 //
-// The IP/gateway/subnet we get from AWS's DHCP server. The target is
-// 169.254.169.254:80 (IMDSv1), which is a well-known link-local IP
-// reachable from every VPC instance without any security-group
-// changes. We ask for /latest/meta-data/instance-id — a short
-// plaintext body that proves TCP-connect → HTTP request → response →
-// close all worked end to end.
+// The IP/gateway/subnet we get from AWS's DHCP server. The HTTPS
+// target is 1.1.1.1:443, whose cert covers `one.one.one.one`. Fixed
+// public IP → no DNS needed. GET / returns a small HTML body which is
+// enough to prove: TCP connect → TLS handshake → HTTP request/reply
+// over TLS → close_notify → TCP close.
 // =====================================================================
 
-const TARGET_IP: Ipv4Address = Ipv4Address::new(169, 254, 169, 254);
-const TARGET_PORT: u16 = 80;
+const TARGET_IP: Ipv4Address = Ipv4Address::new(1, 1, 1, 1);
+const TARGET_PORT: u16 = 443;
+const TARGET_SNI: &str = "one.one.one.one";
 const LOCAL_PORT: u16 = 49152;
 
-const REQUEST: &[u8] = b"GET /latest/meta-data/instance-id HTTP/1.0\r\n\
-                         Host: 169.254.169.254\r\n\
+const REQUEST: &[u8] = b"GET / HTTP/1.0\r\n\
+                         Host: one.one.one.one\r\n\
                          User-Agent: minidpdk-smoltcp/0.1\r\n\
                          Connection: close\r\n\
                          \r\n";
@@ -413,13 +498,152 @@ fn dhcp_acquire(
     }
 }
 
-fn http_get(
+// ---------------------------------------------------------------------
+// RDRAND-backed CryptoRng. `rustls-rustcrypto` needs a `CryptoRng` for
+// ClientHello.random and the ephemeral keys; every c5.large / c7i.large
+// CPU has RDRAND, so we don't need to plumb entropy through the shim.
+// ---------------------------------------------------------------------
+struct RdRandRng;
+
+fn rdrand64() -> Option<u64> {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let mut out: u64 = 0;
+        // Intel SDM: retry up to 10 times before treating RDRAND as unavailable.
+        for _ in 0..10 {
+            let ok: u8;
+            core::arch::asm!(
+                "rdrand {r}",
+                "setc {ok}",
+                r = out(reg) out,
+                ok = out(reg_byte) ok,
+                options(nostack, nomem)
+            );
+            if ok != 0 {
+                return Some(out);
+            }
+        }
+        None
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        None
+    }
+}
+
+impl rand_core::RngCore for RdRandRng {
+    fn next_u32(&mut self) -> u32 {
+        rdrand64().expect("rdrand unavailable") as u32
+    }
+    fn next_u64(&mut self) -> u64 {
+        rdrand64().expect("rdrand unavailable")
+    }
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        let mut i = 0;
+        while i + 8 <= dest.len() {
+            let v = rdrand64().expect("rdrand unavailable");
+            dest[i..i + 8].copy_from_slice(&v.to_ne_bytes());
+            i += 8;
+        }
+        let remaining = dest.len() - i;
+        if remaining > 0 {
+            let v = rdrand64().expect("rdrand unavailable");
+            let tail = v.to_ne_bytes();
+            dest[i..].copy_from_slice(&tail[..remaining]);
+        }
+    }
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
+        self.fill_bytes(dest);
+        Ok(())
+    }
+}
+
+impl rand_core::CryptoRng for RdRandRng {}
+
+// Route the `getrandom` crate through RDRAND too. Every RustCrypto
+// dependency below rustls calls `getrandom::getrandom()` at some point;
+// on our target, its default backend is the Linux `getrandom(2)`
+// syscall, which OSv doesn't provide. With the `custom` feature turned
+// on in Cargo.toml, this macro replaces the backend with our own.
+fn osv_getrandom(dest: &mut [u8]) -> Result<(), getrandom::Error> {
+    let mut i = 0;
+    while i + 8 <= dest.len() {
+        let v = rdrand64().ok_or_else(|| {
+            getrandom::Error::from(core::num::NonZeroU32::new(1).unwrap())
+        })?;
+        dest[i..i + 8].copy_from_slice(&v.to_ne_bytes());
+        i += 8;
+    }
+    let remaining = dest.len() - i;
+    if remaining > 0 {
+        let v = rdrand64().ok_or_else(|| {
+            getrandom::Error::from(core::num::NonZeroU32::new(1).unwrap())
+        })?;
+        let tail = v.to_ne_bytes();
+        dest[i..].copy_from_slice(&tail[..remaining]);
+    }
+    Ok(())
+}
+
+getrandom::register_custom_getrandom!(osv_getrandom);
+
+// ---------------------------------------------------------------------
+// TLS pump. Drives a rustls `ClientConnection` on top of the same
+// smoltcp TCP socket as before:
+//
+//   1. Drain rustls.wants_write() into the TCP tx buffer.
+//   2. Copy TCP rx bytes into rustls via read_tls / process_new_packets.
+//   3. Once handshake is done, write plaintext HTTP request into rustls
+//      (which encrypts and hands us record bytes back on the next tx
+//      pump), and read plaintext response out.
+//   4. On peer close: send close_notify, wait for socket close.
+//
+// Everything shares the fake-ms clock we already use for smoltcp; the
+// same ITER_BUDGET/STATS cadence applies.
+// ---------------------------------------------------------------------
+
+// Wall-clock provider for cert-validity checks. rustls needs `Sync +
+// Send + Debug`; our impl is a ZST so it's trivially all three.
+#[derive(Debug)]
+struct ShimTimeProvider;
+
+impl TimeProvider for ShimTimeProvider {
+    fn current_time(&self) -> Option<UnixTime> {
+        Some(UnixTime::since_unix_epoch(core::time::Duration::from_secs(unsafe {
+            shim_time_seconds()
+        })))
+    }
+}
+
+fn make_client_config() -> Arc<ClientConfig> {
+    let mut roots = RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let provider = rustls_rustcrypto::provider();
+    let cfg = ClientConfig::builder_with_details(
+        Arc::new(provider),
+        Arc::new(ShimTimeProvider),
+    )
+    .with_safe_default_protocol_versions()
+    .expect("rustls: default protocol versions")
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    Arc::new(cfg)
+}
+
+// Scratch buffers for the unbuffered pump. rustls records max out at
+// 16 KB + overhead. incoming grows with pipelined records; outgoing
+// grows with handshake bursts. 24 KB each is enough headroom for a
+// full TLS 1.3 handshake plus one HTTP round trip.
+const TLS_BUF_CAP: usize = 24 * 1024;
+
+fn https_get(
     iface: &mut Interface,
     dev: &mut DpdkDevice,
     sockets: &mut SocketSet<'_>,
     tcp_handle: smoltcp::iface::SocketHandle,
     port_id: u16,
 ) {
+    // --- TCP connect --------------------------------------------------
     {
         let s = sockets.get_mut::<tcp::Socket>(tcp_handle);
         if let Err(_) = s.connect(iface.context(), (TARGET_IP, TARGET_PORT), LOCAL_PORT) {
@@ -429,55 +653,180 @@ fn http_get(
     }
     let o = TARGET_IP.octets();
     println!(
-        "connecting to {}.{}.{}.{}:{} ...",
-        o[0], o[1], o[2], o[3], TARGET_PORT
+        "connecting to {}.{}.{}.{}:{} (SNI {}) ...",
+        o[0], o[1], o[2], o[3], TARGET_PORT, TARGET_SNI
     );
 
-    let mut request_sent = false;
+    // --- rustls unbuffered client -------------------------------------
+    let server_name = match ServerName::try_from(TARGET_SNI) {
+        Ok(n) => n.to_owned(),
+        Err(_) => {
+            println!("FAIL: tls invalid ServerName");
+            return;
+        }
+    };
+    let cfg = make_client_config();
+    let mut conn = match UnbufferedClientConnection::new(cfg, server_name) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("FAIL: tls UnbufferedClientConnection::new: {:?}", e);
+            return;
+        }
+    };
+
+    // Unbuffered-API buffers: `incoming` accumulates ciphertext read
+    // from TCP until rustls can decode complete records; `outgoing`
+    // holds ciphertext rustls asked us to send until TCP tx queue
+    // drains it.
+    let mut incoming: Vec<u8> = Vec::with_capacity(TLS_BUF_CAP);
+    let mut outgoing: Vec<u8> = Vec::with_capacity(TLS_BUF_CAP);
+    let mut request_queued = false;
     let mut bytes_received: usize = 0;
     let mut clock_ms: i64 = 0;
     let mut iter: u64 = 0;
-    let mut last_state: tcp::State = tcp::State::Closed;
+    let mut last_tcp_state: tcp::State = tcp::State::Closed;
+    let mut handshake_done = false;
+    let mut close_notify_sent = false;
 
     loop {
         iface.poll(Instant::from_millis(clock_ms), dev, sockets);
         let s = sockets.get_mut::<tcp::Socket>(tcp_handle);
 
         let state = s.state();
-        if state != last_state {
+        if state != last_tcp_state {
             println!("tcp state: {:?}", state);
-            last_state = state;
+            last_tcp_state = state;
         }
 
-        if !request_sent && s.can_send() {
-            match s.send_slice(REQUEST) {
-                Ok(n) if n == REQUEST.len() => {
-                    println!("OK: sent {} bytes of HTTP request", n);
-                    request_sent = true;
+        // 1) Drain any queued outgoing ciphertext into the TCP tx buffer.
+        if !outgoing.is_empty() && s.can_send() {
+            match s.send_slice(&outgoing) {
+                Ok(n) if n > 0 => {
+                    outgoing.drain(..n);
                 }
-                Ok(n) => println!("PARTIAL: queued {}/{} bytes", n, REQUEST.len()),
-                Err(_) => {
-                    println!("FAIL: send_slice error");
-                    return;
-                }
+                _ => {}
             }
         }
 
+        // 2) Pull ciphertext from TCP into `incoming` for rustls.
         if s.can_recv() {
             let _ = s.recv(|buf| {
-                bytes_received += buf.len();
-                match core::str::from_utf8(buf) {
-                    Ok(txt) => print!("{}", txt),
-                    Err(_) => print!("<{} non-utf8 bytes>", buf.len()),
-                }
+                incoming.extend_from_slice(buf);
                 (buf.len(), ())
             });
         }
 
-        if request_sent && !s.is_active() {
+        // 3) Advance rustls's state machine.
+        //    We keep looping through process_tls_records until either
+        //    it asks for more incoming (BlockedHandshake) or we hit a
+        //    terminal state.
+        let mut progress = true;
+        while progress {
+            progress = false;
+            let UnbufferedStatus { discard, state } = conn.process_tls_records(&mut incoming);
+            let st = match state {
+                Ok(st) => st,
+                Err(e) => {
+                    println!("FAIL: tls process_tls_records: {:?}", e);
+                    return;
+                }
+            };
+            match st {
+                ConnectionState::ReadTraffic(mut rt) => {
+                    while let Some(rec) = rt.next_record() {
+                        match rec {
+                            Ok(rec) => {
+                                bytes_received += rec.payload.len();
+                                match core::str::from_utf8(rec.payload) {
+                                    Ok(txt) => print!("{}", txt),
+                                    Err(_) => print!("<{} non-utf8 bytes>", rec.payload.len()),
+                                }
+                            }
+                            Err(e) => {
+                                println!("FAIL: tls record: {:?}", e);
+                                return;
+                            }
+                        }
+                    }
+                    progress = true;
+                }
+                ConnectionState::ReadEarlyData(_) => {
+                    // We never sent 0-RTT data, so this shouldn't fire.
+                    // Ignore.
+                }
+                ConnectionState::EncodeTlsData(mut et) => {
+                    // rustls wants us to emit a handshake fragment.
+                    // Grow outgoing to fit; encode straight into it.
+                    let head = outgoing.len();
+                    outgoing.resize(TLS_BUF_CAP, 0);
+                    let n = match et.encode(&mut outgoing[head..]) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            println!("FAIL: tls encode: {:?}", e);
+                            return;
+                        }
+                    };
+                    outgoing.truncate(head + n);
+                    progress = true;
+                }
+                ConnectionState::TransmitTlsData(tt) => {
+                    // rustls signals: "the bytes I asked you to encode
+                    // are ready to go on the wire". We already appended
+                    // them into `outgoing`; nothing to do beyond ACKing.
+                    tt.done();
+                    progress = true;
+                }
+                ConnectionState::BlockedHandshake => {
+                    // Need more incoming; wait for the TCP layer to
+                    // deliver more bytes on the next iface.poll().
+                }
+                ConnectionState::WriteTraffic(mut wt) => {
+                    if !handshake_done {
+                        println!("OK: tls handshake complete");
+                        handshake_done = true;
+                    }
+
+                    if !request_queued {
+                        let head = outgoing.len();
+                        outgoing.resize(head + REQUEST.len() + 128, 0);
+                        let n = match wt.encrypt(REQUEST, &mut outgoing[head..]) {
+                            Ok(n) => n,
+                            Err(e) => {
+                                println!("FAIL: tls encrypt request: {:?}", e);
+                                return;
+                            }
+                        };
+                        outgoing.truncate(head + n);
+                        println!(
+                            "OK: encrypted {} bytes of HTTP request into {} bytes of ciphertext",
+                            REQUEST.len(),
+                            n
+                        );
+                        request_queued = true;
+                        progress = true;
+                    } else if !close_notify_sent && !s.can_send() {
+                        // Reserved slot to enqueue close_notify once
+                        // we've received the response and want to end.
+                    }
+                }
+                ConnectionState::PeerClosed | ConnectionState::Closed => {
+                    if !close_notify_sent {
+                        // Best-effort close_notify path is via WriteTraffic;
+                        // by the time we're here we've already seen peer
+                        // close, so just log and let TCP finish.
+                        close_notify_sent = true;
+                    }
+                }
+                _ => {}
+            }
+            incoming.drain(..discard);
+        }
+
+        // 4) End condition: peer closed the TLS session and TCP is done.
+        if handshake_done && request_queued && !s.is_active() && outgoing.is_empty() {
             println!();
             println!(
-                "OK: HTTP exchange complete ({} bytes received)",
+                "OK: HTTPS exchange complete ({} bytes plaintext received)",
                 bytes_received
             );
             return;
@@ -518,7 +867,7 @@ fn run_net(mac: [u8; 6], mut dev: DpdkDevice) {
         return;
     }
 
-    http_get(&mut iface, &mut dev, &mut sockets, tcp_handle, port_id);
+    https_get(&mut iface, &mut dev, &mut sockets, tcp_handle, port_id);
 }
 
 // =====================================================================

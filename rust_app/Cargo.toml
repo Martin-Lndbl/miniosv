@@ -22,3 +22,38 @@ features = [
     "socket-tcp",
     "socket-dhcpv4",
 ]
+
+# --- TLS stack -----------------------------------------------------------
+# rustls in no_std mode: no `std` feature, no default logging (we don't
+# have `log`), only tls12 for a smaller footprint.
+[dependencies.rustls]
+version = "0.23"
+default-features = false
+features = ["tls12"]
+
+# Pure-Rust crypto provider so the build doesn't need ring/aws-lc-rs'
+# C+asm build environment. `alloc` enables the Box/Arc code paths.
+[dependencies.rustls-rustcrypto]
+version = "0.0.2-alpha"
+default-features = false
+features = ["alloc", "tls12"]
+
+# Compiled-in Mozilla root CA bundle for cert-chain verification.
+[dependencies.webpki-roots]
+version = "0.26"
+
+# Minimal RngCore/CryptoRng traits so we can hand rustls-rustcrypto a
+# hardware-backed RNG.
+[dependencies.rand_core]
+version = "0.6"
+default-features = false
+
+# getrandom is pulled in transitively by the RustCrypto stack. On Linux
+# targets it default-links to syscall(SYS_getrandom, ...) which OSv
+# doesn't expose. The `custom` feature turns that off and lets us
+# register a shim (see `register_custom_getrandom!` in src/lib.rs) that
+# feeds bytes from RDRAND.
+[dependencies.getrandom]
+version = "0.2"
+default-features = false
+features = ["custom"]

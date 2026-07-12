@@ -6,7 +6,9 @@
 
 #include "shim.hh"
 
+#include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <minidpdk/dev.hh>
 
 namespace {
@@ -159,6 +161,76 @@ int shim_rx_packet(uint16_t port_id, uint16_t queue_id, uint8_t *buf,
   std::memcpy(buf, rte_pktmbuf_mtod(m, uint8_t *), len);
   rte_pktmbuf_free(m);
   return static_cast<int>(len);
+}
+
+uint64_t shim_time_seconds(void) {
+  return static_cast<uint64_t>(std::time(nullptr));
+}
+
+void *shim_malloc(uint64_t size) {
+  return std::malloc(static_cast<size_t>(size));
+}
+
+void shim_free(void *ptr) { std::free(ptr); }
+
+void *shim_realloc(void *ptr, uint64_t size) {
+  return std::realloc(ptr, static_cast<size_t>(size));
+}
+
+// Stub for libc's variadic `syscall` used by `getrandom` (SYS_getrandom).
+// OSv doesn't implement the Linux syscall trampoline, and no other Rust
+// code path in this app should call syscall(). We treat the intended
+// callsite (SYS_getrandom, buf, len) specially by filling from RDRAND;
+// anything else returns -1/ENOSYS so failures are diagnosable rather
+// than silent memory corruption.
+#include <cerrno>
+#include <cstdarg>
+#include <cstdint>
+
+namespace {
+inline bool rdrand64_or_stall(uint64_t &out) {
+    for (int i = 0; i < 10; ++i) {
+        unsigned char ok;
+        asm volatile("rdrand %0; setc %1" : "=r"(out), "=r"(ok));
+        if (ok) return true;
+    }
+    return false;
+}
+}  // namespace
+
+extern "C" long syscall(long number, ...) {
+    constexpr long SYS_getrandom = 318;  // x86_64 Linux syscall number
+    if (number != SYS_getrandom) {
+        errno = ENOSYS;
+        return -1;
+    }
+    va_list ap;
+    va_start(ap, number);
+    void *buf = va_arg(ap, void *);
+    size_t len = va_arg(ap, size_t);
+    (void)va_arg(ap, unsigned int);  // flags — ignored
+    va_end(ap);
+
+    auto *out = static_cast<uint8_t *>(buf);
+    size_t i = 0;
+    while (i + 8 <= len) {
+        uint64_t v;
+        if (!rdrand64_or_stall(v)) {
+            errno = EIO;
+            return -1;
+        }
+        std::memcpy(out + i, &v, 8);
+        i += 8;
+    }
+    if (i < len) {
+        uint64_t v;
+        if (!rdrand64_or_stall(v)) {
+            errno = EIO;
+            return -1;
+        }
+        std::memcpy(out + i, &v, len - i);
+    }
+    return static_cast<long>(len);
 }
 
 }  // extern "C"

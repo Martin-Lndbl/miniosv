@@ -70,4 +70,18 @@ int shim_tx_packet(uint16_t port_id, uint16_t queue_id, void *pool,
 int shim_rx_packet(uint16_t port_id, uint16_t queue_id, uint8_t *buf,
                     uint16_t max_len);
 
+// --- Non-networking runtime hooks needed by rustls -----------------------
+
+// Wall-clock seconds since the Unix epoch. Used only for TLS certificate
+// validity checks; the accuracy just has to be within a cert's ~30 day
+// slack, so time(NULL) at boot is fine.
+uint64_t shim_time_seconds(void);
+
+// Global allocator FFI. Rust's core+alloc stack needs a heap; we back it
+// with OSv's C++ new/delete via malloc/free so we don't ship a second
+// heap inside the Rust static library.
+void *shim_malloc(uint64_t size);
+void  shim_free(void *ptr);
+void *shim_realloc(void *ptr, uint64_t size);
+
 }  // extern "C"
