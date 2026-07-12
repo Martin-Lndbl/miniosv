@@ -23,6 +23,9 @@
 #if CONF_drivers_acpi
 #include "drivers/acpi.hh"
 #endif
+#if CONF_drivers_ena
+#include "drivers/ena.hh"
+#endif
 
 // Physical pointer to the hand-off structure filled by the UEFI stub; stored
 // by start64 in boot.S.
@@ -246,9 +249,12 @@ void arch_init_drivers()
         boot_time.event("pci enumerated");
     }
 #endif
-
     // Initialize all drivers
     hw::driver_manager* drvman = hw::driver_manager::instance();
+
+#if CONF_drivers_ena
+    drvman->register_driver(aws::ena::probe);
+#endif
     boot_time.event("drivers probe");
     drvman->load_all();
     drvman->list_drivers();

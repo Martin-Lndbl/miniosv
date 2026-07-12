@@ -1,0 +1,138 @@
+/* SPDX-License-Identifier: BSD-3-Clause
+ * Copyright(c) 2010-2016 Intel Corporation.
+ * Copyright 2014-2016 6WIND S.A.
+ */
+#ifndef BYPASS_DEFS_H
+#define BYPASS_DEFS_H
+ 
+#define RTE_PTYPE_UNKNOWN                   0x00000000
+#define RTE_PTYPE_L2_ETHER                  0x00000001
+#define RTE_PTYPE_L2_ETHER_TIMESYNC         0x00000002
+#define RTE_PTYPE_L2_ETHER_ARP              0x00000003
+#define RTE_PTYPE_L2_ETHER_LLDP             0x00000004
+#define RTE_PTYPE_L2_ETHER_NSH              0x00000005
+#define RTE_PTYPE_L2_ETHER_VLAN             0x00000006
+#define RTE_PTYPE_L2_ETHER_QINQ             0x00000007
+#define RTE_PTYPE_L2_ETHER_PPPOE            0x00000008
+#define RTE_PTYPE_L2_ETHER_FCOE             0x00000009
+#define RTE_PTYPE_L2_ETHER_MPLS             0x0000000a
+#define RTE_PTYPE_L2_MASK                   0x0000000f
+#define RTE_PTYPE_L3_IPV4                   0x00000010
+#define RTE_PTYPE_L3_IPV4_EXT               0x00000030
+#define RTE_PTYPE_L3_IPV6                   0x00000040
+#define RTE_PTYPE_L3_IPV4_EXT_UNKNOWN       0x00000090
+#define RTE_PTYPE_L3_IPV6_EXT               0x000000c0
+#define RTE_PTYPE_L3_IPV6_EXT_UNKNOWN       0x000000e0
+#define RTE_PTYPE_L3_MASK                   0x000000f0
+#define RTE_PTYPE_L4_TCP                    0x00000100
+#define RTE_PTYPE_L4_UDP                    0x00000200
+#define RTE_PTYPE_L4_FRAG                   0x00000300
+#define RTE_PTYPE_L4_SCTP                   0x00000400
+#define RTE_PTYPE_L4_ICMP                   0x00000500
+#define RTE_PTYPE_L4_NONFRAG                0x00000600
+#define RTE_PTYPE_L4_IGMP                   0x00000700
+#define RTE_PTYPE_L4_ESP                    0x00000800
+#define RTE_PTYPE_L4_MASK                   0x00000f00
+#define RTE_PTYPE_TUNNEL_IP                 0x00001000
+#define RTE_PTYPE_TUNNEL_GRE                0x00002000
+#define RTE_PTYPE_TUNNEL_VXLAN              0x00003000
+#define RTE_PTYPE_TUNNEL_NVGRE              0x00004000
+#define RTE_PTYPE_TUNNEL_GENEVE             0x00005000
+#define RTE_PTYPE_TUNNEL_GRENAT             0x00006000
+#define RTE_PTYPE_TUNNEL_GTPC               0x00007000
+#define RTE_PTYPE_TUNNEL_GTPU               0x00008000
+#define RTE_PTYPE_TUNNEL_ESP                0x00009000
+#define RTE_PTYPE_TUNNEL_L2TP               0x0000a000
+#define RTE_PTYPE_TUNNEL_VXLAN_GPE          0x0000b000
+#define RTE_PTYPE_TUNNEL_MPLS_IN_GRE       0x0000c000
+#define RTE_PTYPE_TUNNEL_MPLS_IN_UDP      0x0000d000
+#define RTE_PTYPE_TUNNEL_MASK               0x0000f000
+#define RTE_PTYPE_INNER_L2_ETHER            0x00010000
+#define RTE_PTYPE_INNER_L2_ETHER_VLAN       0x00020000
+#define RTE_PTYPE_INNER_L2_ETHER_QINQ       0x00030000
+#define RTE_PTYPE_INNER_L2_MASK             0x000f0000
+#define RTE_PTYPE_INNER_L3_IPV4             0x00100000
+#define RTE_PTYPE_INNER_L3_IPV4_EXT         0x00200000
+#define RTE_PTYPE_INNER_L3_IPV6             0x00300000
+#define RTE_PTYPE_INNER_L3_IPV4_EXT_UNKNOWN 0x00400000
+#define RTE_PTYPE_INNER_L3_IPV6_EXT         0x00500000
+#define RTE_PTYPE_INNER_L3_IPV6_EXT_UNKNOWN 0x00600000
+#define RTE_PTYPE_INNER_L3_MASK             0x00f00000
+#define RTE_PTYPE_INNER_L4_TCP              0x01000000
+#define RTE_PTYPE_INNER_L4_UDP              0x02000000
+#define RTE_PTYPE_INNER_L4_FRAG             0x03000000
+#define RTE_PTYPE_INNER_L4_SCTP             0x04000000
+#define RTE_PTYPE_INNER_L4_ICMP             0x05000000
+#define RTE_PTYPE_INNER_L4_NONFRAG          0x06000000
+#define RTE_PTYPE_INNER_L4_ESP              0x08000000
+#define RTE_PTYPE_INNER_L4_MASK             0x0f000000
+#define RTE_PTYPE_ALL_MASK                  0x0fffffff
+ 
+#define  RTE_ETH_IS_IPV4_HDR(ptype) ((ptype) & RTE_PTYPE_L3_IPV4)
+ 
+#define  RTE_ETH_IS_IPV6_HDR(ptype) ((ptype) & RTE_PTYPE_L3_IPV6)
+ 
+/* Check if it is a tunneling packet */
+#define RTE_ETH_IS_TUNNEL_PKT(ptype) ((ptype) &             \
+    (RTE_PTYPE_TUNNEL_MASK |                    \
+        RTE_PTYPE_INNER_L2_MASK |               \
+        RTE_PTYPE_INNER_L3_MASK |               \
+        RTE_PTYPE_INNER_L4_MASK))
+
+
+#define RTE_ETH_RX_OFFLOAD_VLAN_STRIP       RTE_BIT64(0)
+#define RTE_ETH_RX_OFFLOAD_IPV4_CKSUM       RTE_BIT64(1)
+#define RTE_ETH_RX_OFFLOAD_UDP_CKSUM        RTE_BIT64(2)
+#define RTE_ETH_RX_OFFLOAD_TCP_CKSUM        RTE_BIT64(3)
+#define RTE_ETH_RX_OFFLOAD_TCP_LRO          RTE_BIT64(4)
+#define RTE_ETH_RX_OFFLOAD_QINQ_STRIP       RTE_BIT64(5)
+#define RTE_ETH_RX_OFFLOAD_OUTER_IPV4_CKSUM RTE_BIT64(6)
+#define RTE_ETH_RX_OFFLOAD_MACSEC_STRIP     RTE_BIT64(7)
+#define RTE_ETH_RX_OFFLOAD_VLAN_FILTER      RTE_BIT64(9)
+#define RTE_ETH_RX_OFFLOAD_VLAN_EXTEND      RTE_BIT64(10)
+#define RTE_ETH_RX_OFFLOAD_SCATTER          RTE_BIT64(13)
+#define RTE_ETH_RX_OFFLOAD_TIMESTAMP        RTE_BIT64(14)
+#define RTE_ETH_RX_OFFLOAD_SECURITY         RTE_BIT64(15)
+#define RTE_ETH_RX_OFFLOAD_KEEP_CRC         RTE_BIT64(16)
+#define RTE_ETH_RX_OFFLOAD_SCTP_CKSUM       RTE_BIT64(17)
+#define RTE_ETH_RX_OFFLOAD_OUTER_UDP_CKSUM  RTE_BIT64(18)
+#define RTE_ETH_RX_OFFLOAD_RSS_HASH         RTE_BIT64(19)
+#define RTE_ETH_RX_OFFLOAD_BUFFER_SPLIT     RTE_BIT64(20)
+ 
+#define RTE_ETH_RX_OFFLOAD_CHECKSUM (RTE_ETH_RX_OFFLOAD_IPV4_CKSUM | \
+                 RTE_ETH_RX_OFFLOAD_UDP_CKSUM | \
+                 RTE_ETH_RX_OFFLOAD_TCP_CKSUM)
+#define RTE_ETH_RX_OFFLOAD_VLAN (RTE_ETH_RX_OFFLOAD_VLAN_STRIP | \
+                 RTE_ETH_RX_OFFLOAD_VLAN_FILTER | \
+                 RTE_ETH_RX_OFFLOAD_VLAN_EXTEND | \
+                 RTE_ETH_RX_OFFLOAD_QINQ_STRIP)
+ 
+/*
+ * If new Rx offload capabilities are defined, they also must be
+ * mentioned in rte_rx_offload_names in rte_ethdev.c file.
+ */
+ 
+#define RTE_ETH_TX_OFFLOAD_VLAN_INSERT      RTE_BIT64(0)
+#define RTE_ETH_TX_OFFLOAD_IPV4_CKSUM       RTE_BIT64(1)
+#define RTE_ETH_TX_OFFLOAD_UDP_CKSUM        RTE_BIT64(2)
+#define RTE_ETH_TX_OFFLOAD_TCP_CKSUM        RTE_BIT64(3)
+#define RTE_ETH_TX_OFFLOAD_SCTP_CKSUM       RTE_BIT64(4)
+#define RTE_ETH_TX_OFFLOAD_TCP_TSO          RTE_BIT64(5)
+#define RTE_ETH_TX_OFFLOAD_UDP_TSO          RTE_BIT64(6)
+#define RTE_ETH_TX_OFFLOAD_OUTER_IPV4_CKSUM RTE_BIT64(7)  
+#define RTE_ETH_TX_OFFLOAD_QINQ_INSERT      RTE_BIT64(8)
+#define RTE_ETH_TX_OFFLOAD_VXLAN_TNL_TSO    RTE_BIT64(9)  
+#define RTE_ETH_TX_OFFLOAD_GRE_TNL_TSO      RTE_BIT64(10) 
+#define RTE_ETH_TX_OFFLOAD_IPIP_TNL_TSO     RTE_BIT64(11) 
+#define RTE_ETH_TX_OFFLOAD_GENEVE_TNL_TSO   RTE_BIT64(12) 
+#define RTE_ETH_TX_OFFLOAD_MACSEC_INSERT    RTE_BIT64(13)
+#define RTE_ETH_TX_OFFLOAD_MT_LOCKFREE      RTE_BIT64(14)
+#define RTE_ETH_TX_OFFLOAD_MULTI_SEGS       RTE_BIT64(15)
+#define RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE   RTE_BIT64(16)
+#define RTE_ETH_TX_OFFLOAD_SECURITY         RTE_BIT64(17)
+#define RTE_ETH_TX_OFFLOAD_UDP_TNL_TSO      RTE_BIT64(18)
+#define RTE_ETH_TX_OFFLOAD_IP_TNL_TSO       RTE_BIT64(19)
+#define RTE_ETH_TX_OFFLOAD_OUTER_UDP_CKSUM  RTE_BIT64(20)
+#define RTE_ETH_TX_OFFLOAD_SEND_ON_TIMESTAMP RTE_BIT64(21)
+
+#endif // !BYPASS_DEFS_H

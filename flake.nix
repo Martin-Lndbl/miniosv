@@ -63,7 +63,6 @@
         ];
 
         ovmf_prefix = if system == "x86_64-linux" then "OVMF" else "AAVMF";
-
       in
       {
         devShells = rec {
@@ -110,9 +109,7 @@
           rust = cli.overrideAttrs (cli: {
             nativeBuildInputs = [ pkgs.cargo ] ++ cli.nativeBuildInputs;
           });
-
         };
-
       }
     );
 }
