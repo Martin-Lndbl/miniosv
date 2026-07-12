@@ -1,6 +1,5 @@
 {
   description = "miniosv — slim unikernel OS";
-
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     flake-utils.url = "github:numtide/flake-utils";
@@ -56,30 +55,62 @@
           binutils
           cmake
           ninja
-          (python3.withPackages (ps: [ ps.pyyaml ]))
           git
           ctags
+          mtools
+          gptfdisk
+          (python3.withPackages (ps: [ ps.pyyaml ]))
         ];
+
+        ovmf_prefix = if system == "x86_64-linux" then "OVMF" else "AAVMF";
 
       in
       {
-        devShells.default = pkgs.mkShell {
-          nativeBuildInputs =
-            buildDeps
-            ++ (with pkgs; [
-              qemu
-              gdb
-            ]);
-        };
+        devShells = rec {
+          default = pkgs.mkShell {
+            nativeBuildInputs = buildDeps ++ [
+              pkgs.qemu
+              pkgs.gdb
+            ];
 
-        devShells.rust = pkgs.mkShell {
-          nativeBuildInputs =
-            buildDeps
-            ++ (with pkgs; [
-              cargo
-              gdb
-              qemu
-            ]);
+            # UEFI boot requires OVMF installation
+            "${ovmf_prefix}_CODE" = "${pkgs.OVMF.fd}/FV/${ovmf_prefix}_CODE.fd";
+            "${ovmf_prefix}_VARS" = "${pkgs.OVMF.fd}/FV/${ovmf_prefix}_VARS.fd";
+          };
+
+          aws = default.overrideAttrs (default: {
+            nativeBuildInputs = [
+              pkgs.awscli2
+              (pkgs.python3.withPackages (
+                ps: with ps; [
+                  awscrt
+                  boto3
+                  botocore
+                  # We need to redeclare every python
+                  # dependency from the default shell
+                  pyyaml
+                ]
+              ))
+            ]
+            ++ default.nativeBuildInputs;
+          });
+
+          cli = aws.overrideattrs (aws: {
+            nativebuildinputs =
+              with pkgs;
+              [
+                bear
+                black
+                clang-tools
+                pyright
+              ]
+              ++ aws.nativebuildinputs;
+          });
+
+          rust = cli.overrideattrs (cli: {
+            nativebuildinputs = [ pkgs.cargo ] ++ cli.nativebuildinputs;
+          });
+
         };
 
       }

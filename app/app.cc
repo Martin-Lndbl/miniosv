@@ -9,11 +9,18 @@
 // the machine off so a run exits cleanly. The conformance and stress suites
 // that used to live here now build with `make app=tests` (see test/).
 
-#include <cstdio>
+#include <cstdint>
 #include <osv/power.hh>
+#include <osv/perf.hh>
 
 extern "C" void osv_app_main()
 {
     printf("Hello, world from OSv!\n");
-    osv::poweroff();
+    // Do not power off: keep the machine running so the boot output stays
+    // visible on the (cloud) serial console instead of the instance stopping
+    // the moment it finishes booting. The empty asm keeps the compiler from
+    // optimizing this infinite loop away.
+    while (true) {
+        asm volatile("" ::: "memory");
+    }
 }
