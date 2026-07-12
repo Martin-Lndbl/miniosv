@@ -95,8 +95,8 @@
             ++ default.nativeBuildInputs;
           });
 
-          cli = aws.overrideattrs (aws: {
-            nativebuildinputs =
+          cli = aws.overrideAttrs (aws: {
+            nativeBuildInputs =
               with pkgs;
               [
                 bear
@@ -104,11 +104,11 @@
                 clang-tools
                 pyright
               ]
-              ++ aws.nativebuildinputs;
+              ++ aws.nativeBuildInputs;
           });
 
-          rust = cli.overrideattrs (cli: {
-            nativebuildinputs = [ pkgs.cargo ] ++ cli.nativebuildinputs;
+          rust = cli.overrideAttrs (cli: {
+            nativeBuildInputs = [ pkgs.cargo ] ++ cli.nativeBuildInputs;
           });
 
         };
