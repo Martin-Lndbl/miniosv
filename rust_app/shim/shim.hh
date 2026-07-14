@@ -55,6 +55,13 @@ void shim_mbuf_free(void *handle);
 int shim_mbuf_rx_burst(uint16_t port_id, uint16_t queue_id, void **out_handle,
                         const uint8_t **out_data, uint16_t *out_len);
 
+// Batched RX: pulls up to `max` mbufs in one rte_eth_rx_burst call and
+// writes them into the three parallel arrays. Returns the number of
+// entries written (>= 0, <= max). Bad-cksum mbufs are freed inline.
+uint16_t shim_mbuf_rx_burst_n(uint16_t port_id, uint16_t queue_id,
+                               void **out_handles, const uint8_t **out_data,
+                               uint16_t *out_lens, uint16_t max);
+
 // OSv threading: pin `fn(arg)` to `cpu_id` (>=0), or leave unpinned if <0.
 void *shim_thread_spawn(void (*fn)(void *), void *arg, int cpu_id);
 void shim_thread_join(void *handle);

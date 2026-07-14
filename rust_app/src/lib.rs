@@ -174,6 +174,14 @@ extern "C" {
         out_data: *mut *const u8,
         out_len: *mut u16,
     ) -> c_int;
+    fn shim_mbuf_rx_burst_n(
+        port_id: u16,
+        queue_id: u16,
+        out_handles: *mut *mut c_void,
+        out_data: *mut *const u8,
+        out_lens: *mut u16,
+        max: u16,
+    ) -> u16;
 }
 
 struct PktPool(*mut rte_pktmbuf_pool);
@@ -278,7 +286,17 @@ struct DpdkDevice {
     // (used by the DHCP/ARP path in learn_network).
     port_slab_start: u16,
     port_slab_len: u16,
+    // Prefetch buffer: rte_eth_rx_burst is cheap in bulk but expensive
+    // per call, so we drain up to RX_BURST mbufs at once and hand them
+    // to smoltcp one at a time out of these arrays.
+    rx_pref_handles: [*mut c_void; RX_BURST],
+    rx_pref_data:    [*const u8;   RX_BURST],
+    rx_pref_lens:    [u16;         RX_BURST],
+    rx_pref_pos: u16,
+    rx_pref_len: u16,
 }
+
+const RX_BURST: usize = 32;
 
 enum DpdkRxToken {
     Mbuf { handle: *mut c_void, data: *const u8, len: usize },
@@ -340,14 +358,26 @@ impl Device for DpdkDevice {
             return Some((DpdkRxToken::Synth(buf), DpdkTxToken { dev: self }));
         }
         loop {
-            let mut handle: *mut c_void = ptr::null_mut();
-            let mut data: *const u8 = ptr::null();
-            let mut len: u16 = 0;
-            let rc =
-                unsafe { shim_mbuf_rx_burst(0, self.queue_id, &mut handle, &mut data, &mut len) };
-            if rc != 1 || handle.is_null() {
-                return None;
+            // Refill the prefetch buffer if empty.
+            if self.rx_pref_pos == self.rx_pref_len {
+                let got = unsafe {
+                    shim_mbuf_rx_burst_n(
+                        0, self.queue_id,
+                        self.rx_pref_handles.as_mut_ptr(),
+                        self.rx_pref_data.as_mut_ptr(),
+                        self.rx_pref_lens.as_mut_ptr(),
+                        RX_BURST as u16,
+                    )
+                };
+                if got == 0 { return None; }
+                self.rx_pref_pos = 0;
+                self.rx_pref_len = got;
             }
+            let i = self.rx_pref_pos as usize;
+            self.rx_pref_pos += 1;
+            let handle = self.rx_pref_handles[i];
+            let data   = self.rx_pref_data[i];
+            let len    = self.rx_pref_lens[i];
             // Ethernet(14) + IPv4(20 min) + TCP(20 min) = 54; anything
             // shorter can't be a TCP flow we care about — pass it up.
             let ok = if (len as usize) < 54 {
@@ -365,8 +395,6 @@ impl Device for DpdkDevice {
                         true
                     } else {
                         let dst_port = ((bytes[l4 + 2] as u16) << 8) | (bytes[l4 + 3] as u16);
-                        // len==0 disables filtering (learn_network path).
-                        // Wrapping-sub handles slabs that straddle 65535.
                         self.port_slab_len == 0
                             || dst_port.wrapping_sub(self.port_slab_start) < self.port_slab_len
                     }
@@ -378,8 +406,6 @@ impl Device for DpdkDevice {
                     DpdkTxToken { dev: self },
                 ));
             }
-            // Not ours — free the mbuf and pull the next one so we
-            // don't return None (which would break the poll cadence).
             unsafe { shim_mbuf_free(handle) };
         }
     }
@@ -730,6 +756,11 @@ extern "C" fn worker_thread(arg: *mut c_void) {
         pending_synth: Some(build_arp_reply(ctx.gateway_mac, gw.octets(), ctx.mac, ip.octets())),
         port_slab_start: ctx.local_port,
         port_slab_len: ctx.port_slab,
+        rx_pref_handles: [ptr::null_mut(); RX_BURST],
+        rx_pref_data:    [ptr::null();     RX_BURST],
+        rx_pref_lens:    [0;               RX_BURST],
+        rx_pref_pos: 0,
+        rx_pref_len: 0,
     };
     let config = Config::new(EthernetAddress(ctx.mac).into());
     let mut iface = Interface::new(config, &mut dev, Instant::from_millis(clk.elapsed_ms()));
@@ -841,6 +872,11 @@ fn learn_network(
         let mut dev = DpdkDevice {
             queue_id: 0, pool, pending_synth: None,
             port_slab_start: 0, port_slab_len: 0,
+            rx_pref_handles: [ptr::null_mut(); RX_BURST],
+            rx_pref_data:    [ptr::null();     RX_BURST],
+            rx_pref_lens:    [0;               RX_BURST],
+            rx_pref_pos: 0,
+            rx_pref_len: 0,
         };
         let config = Config::new(EthernetAddress(mac).into());
         let mut iface = Interface::new(config, &mut dev, Instant::from_millis(clk.elapsed_ms()));
@@ -898,7 +934,7 @@ fn learn_network(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn osv_app_main() {
-    const N: u16 = 4;
+    const N: u16 = 1;
     const FILE_SIZE: u64 = 10 * 1024 * 1024 * 1024; // 10 GiB
 
     let (pools, mac) = probe_and_open(N).unwrap_or_else(|| {

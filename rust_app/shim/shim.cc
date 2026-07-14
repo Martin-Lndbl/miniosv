@@ -225,6 +225,36 @@ int shim_mbuf_rx_burst(uint16_t port_id, uint16_t queue_id, void **out_handle,
   return 1;
 }
 
+// Batched RX: pulls up to `max` mbufs from the NIC in one call.
+// The three output arrays are parallel; entries [0..returned) are
+// filled with (mbuf handle, data pointer, data length). Bad-cksum
+// packets are freed and skipped, so returned <= drained.
+uint16_t shim_mbuf_rx_burst_n(uint16_t port_id, uint16_t queue_id,
+                               void **out_handles, const uint8_t **out_data,
+                               uint16_t *out_lens, uint16_t max) {
+  rte_mbuf *bufs[32];
+  if (max > 32) max = 32;
+  const uint16_t got = rte_eth_rx_burst(port_id, queue_id, bufs, max);
+  uint16_t n = 0;
+  for (uint16_t i = 0; i < got; i++) {
+    rte_mbuf *m = bufs[i];
+    const uint64_t ol = m->ol_flags;
+    const bool ip_bad =
+        (ol & RTE_MBUF_F_RX_IP_CKSUM_MASK) == RTE_MBUF_F_RX_IP_CKSUM_BAD;
+    const bool l4_bad =
+        (ol & RTE_MBUF_F_RX_L4_CKSUM_MASK) == RTE_MBUF_F_RX_L4_CKSUM_BAD;
+    if (ip_bad || l4_bad) {
+      rte_pktmbuf_free(m);
+      continue;
+    }
+    out_handles[n] = m;
+    out_data[n]    = rte_pktmbuf_mtod(m, const uint8_t *);
+    out_lens[n]    = m->data_len;
+    n++;
+  }
+  return n;
+}
+
 uint64_t shim_time_seconds(void) {
   return static_cast<uint64_t>(std::time(nullptr));
 }
