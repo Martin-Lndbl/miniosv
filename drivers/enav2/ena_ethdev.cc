@@ -59,22 +59,90 @@
  */
 #define ENA_CLEANUP_BUF_THRESH 256
 
+struct ena_stats {
+  char name[ETH_GSTRING_LEN];
+  int stat_offset;
+};
+
+#define ENA_STAT_ENTRY(stat, stat_type)                                        \
+  {.name = #stat, .stat_offset = offsetof(struct ena_stats_##stat_type, stat)}
+
+#define ENA_STAT_RX_ENTRY(stat) ENA_STAT_ENTRY(stat, rx)
+
+#define ENA_STAT_TX_ENTRY(stat) ENA_STAT_ENTRY(stat, tx)
+
+#define ENA_STAT_METRICS_ENTRY(stat) ENA_STAT_ENTRY(stat, metrics)
+
+#define ENA_STAT_GLOBAL_ENTRY(stat) ENA_STAT_ENTRY(stat, dev)
+
+#define ENA_STAT_ENA_SRD_ENTRY(stat) ENA_STAT_ENTRY(stat, srd)
 /*
  * Each rte_memzone should have unique name.
  * To satisfy it, count number of allocation and add it to name.
  */
 rte_atomic64_t ena_alloc_cnt;
 
+static const struct ena_stats ena_stats_global_strings[]
+    __attribute__((unused)) = {
+        ENA_STAT_GLOBAL_ENTRY(wd_expired),
+        ENA_STAT_GLOBAL_ENTRY(dev_start),
+        ENA_STAT_GLOBAL_ENTRY(dev_stop),
+        ENA_STAT_GLOBAL_ENTRY(tx_drops),
+};
+
 /*
- * xstats string tables were removed with the DPDK xstats API; only the entry
- * counts remain, used to size the ENA device debug area.
+ * The legacy metrics (also known as eni stats) consisted of 5 stats, while the
+ * reworked metrics (also known as customer metrics) support an additional stat.
  */
-#define ENA_STATS_ARRAY_GLOBAL 4          /* fields of struct ena_stats_dev */
-#define ENA_STATS_ARRAY_METRICS 6         /* fields of struct ena_stats_metrics */
-#define ENA_STATS_ARRAY_METRICS_LEGACY 5  /* metrics without conntrack_available */
-#define ENA_STATS_ARRAY_ENA_SRD 5         /* fields of struct ena_stats_srd */
-#define ENA_STATS_ARRAY_TX 8              /* fields of struct ena_stats_tx */
-#define ENA_STATS_ARRAY_RX 11             /* fields of struct ena_stats_rx */
+static struct ena_stats ena_stats_metrics_strings[] __attribute__((unused)) = {
+    ENA_STAT_METRICS_ENTRY(bw_in_allowance_exceeded),
+    ENA_STAT_METRICS_ENTRY(bw_out_allowance_exceeded),
+    ENA_STAT_METRICS_ENTRY(pps_allowance_exceeded),
+    ENA_STAT_METRICS_ENTRY(conntrack_allowance_exceeded),
+    ENA_STAT_METRICS_ENTRY(linklocal_allowance_exceeded),
+    ENA_STAT_METRICS_ENTRY(conntrack_allowance_available),
+};
+
+static const struct ena_stats ena_stats_srd_strings[]
+    __attribute__((unused)) = {
+        ENA_STAT_ENA_SRD_ENTRY(ena_srd_mode),
+        ENA_STAT_ENA_SRD_ENTRY(ena_srd_tx_pkts),
+        ENA_STAT_ENA_SRD_ENTRY(ena_srd_eligible_tx_pkts),
+        ENA_STAT_ENA_SRD_ENTRY(ena_srd_rx_pkts),
+        ENA_STAT_ENA_SRD_ENTRY(ena_srd_resource_utilization),
+};
+
+static const struct ena_stats ena_stats_tx_strings[] __attribute__((unused)) = {
+    ENA_STAT_TX_ENTRY(cnt),
+    ENA_STAT_TX_ENTRY(bytes),
+    ENA_STAT_TX_ENTRY(prepare_ctx_err),
+    ENA_STAT_TX_ENTRY(tx_poll),
+    ENA_STAT_TX_ENTRY(doorbells),
+    ENA_STAT_TX_ENTRY(bad_req_id),
+    ENA_STAT_TX_ENTRY(available_desc),
+    ENA_STAT_TX_ENTRY(missed_tx),
+};
+
+static const struct ena_stats ena_stats_rx_strings[] __attribute__((unused)) = {
+    ENA_STAT_RX_ENTRY(cnt),
+    ENA_STAT_RX_ENTRY(bytes),
+    ENA_STAT_RX_ENTRY(refill_partial),
+    ENA_STAT_RX_ENTRY(l3_csum_bad),
+    ENA_STAT_RX_ENTRY(l4_csum_bad),
+    ENA_STAT_RX_ENTRY(l4_csum_good),
+    ENA_STAT_RX_ENTRY(mbuf_alloc_fail),
+    ENA_STAT_RX_ENTRY(bad_desc_num),
+    ENA_STAT_RX_ENTRY(bad_req_id),
+    ENA_STAT_RX_ENTRY(bad_desc),
+    ENA_STAT_RX_ENTRY(unknown_error),
+};
+
+#define ENA_STATS_ARRAY_GLOBAL ARRAY_SIZE(ena_stats_global_strings)
+#define ENA_STATS_ARRAY_METRICS ARRAY_SIZE(ena_stats_metrics_strings)
+#define ENA_STATS_ARRAY_METRICS_LEGACY (ENA_STATS_ARRAY_METRICS - 1)
+#define ENA_STATS_ARRAY_ENA_SRD ARRAY_SIZE(ena_stats_srd_strings)
+#define ENA_STATS_ARRAY_TX ARRAY_SIZE(ena_stats_tx_strings)
+#define ENA_STATS_ARRAY_RX ARRAY_SIZE(ena_stats_rx_strings)
 
 #define QUEUE_OFFLOADS                                                         \
   (RTE_ETH_TX_OFFLOAD_TCP_CKSUM | RTE_ETH_TX_OFFLOAD_UDP_CKSUM |               \
@@ -175,8 +243,14 @@ static uint64_t ena_get_tx_queue_offloads(struct ena_adapter *adapter);
 static int ena_infos_get(struct rte_eth_dev *dev,
                          struct rte_eth_dev_info *dev_info);
 
+static void ena_timer_wd_callback(void *arg);
+
 static void ena_update_hints(struct ena_adapter *adapter,
                              struct ena_admin_ena_hw_hints *hints);
+
+[[maybe_unused]] static void
+ena_copy_customer_metrics(struct ena_adapter *adapter, uint64_t *buf,
+                          size_t buf_size);
 
 static bool ena_use_large_llq_hdr(struct ena_adapter *adapter,
                                   uint8_t recommended_entry_size);
@@ -214,6 +288,8 @@ static void ena_keep_alive(void *data,
   uint64_t rx_drops;
   uint64_t tx_drops;
   uint64_t rx_overruns;
+
+  adapter->timestamp_wd = rte_get_timer_cycles();
 
   desc = (struct ena_admin_aenq_keep_alive_desc *)aenq_e;
   rx_drops = ((uint64_t)desc->rx_drops_high << 32) | desc->rx_drops_low;
@@ -900,6 +976,10 @@ static int ena_queue_start(struct rte_eth_dev *dev, ena_ring *ring) {
     return ENA_COM_FAULT;
   }
 
+  /* Flush per-core RX buffers pools cache as they can be used on other
+   * cores as well.
+   */
+  // rte_mempool_cache_flush(NULL, ring->mb_pool);
   return 0;
 }
 
@@ -1079,6 +1159,122 @@ err_mmio_read_less:
   ena_com_mmio_reg_read_request_destroy(ena_dev);
 
   return rc;
+}
+
+static void check_for_missing_keep_alive(struct ena_adapter *adapter) {
+  if (!(adapter->active_aenq_groups & BIT(ENA_ADMIN_KEEP_ALIVE)))
+    return;
+
+  if (adapter->keep_alive_timeout == ENA_HW_HINTS_NO_TIMEOUT)
+    return;
+
+  if (unlikely((rte_get_timer_cycles() - adapter->timestamp_wd) >=
+               adapter->keep_alive_timeout)) {
+    ena_log_raw(ERR, "Keep alive timeout");
+    ena_trigger_reset(adapter, ENA_REGS_RESET_KEEP_ALIVE_TO);
+    ++adapter->dev_stats.wd_expired;
+  }
+}
+
+/* Check if admin queue is enabled */
+static void check_for_admin_com_state(struct ena_adapter *adapter) {
+  if (unlikely(!ena_com_get_admin_running_state(&adapter->ena_dev))) {
+    ena_log_raw(ERR, "ENA admin queue is not in running state");
+    ena_trigger_reset(adapter, ENA_REGS_RESET_ADMIN_TO);
+  }
+}
+
+static int check_for_tx_completion_in_queue(struct ena_adapter *adapter,
+                                            struct ena_ring *tx_ring) {
+  ena_tx_buffer *tx_buf;
+  uint64_t timestamp;
+  uint64_t completion_delay;
+  uint32_t missed_tx = 0;
+  unsigned int i;
+  int rc = 0;
+
+  for (i = 0; i < tx_ring->ring_size; ++i) {
+    tx_buf = &tx_ring->tx_buffer_info[i];
+    timestamp = tx_buf->timestamp;
+
+    if (timestamp == 0)
+      continue;
+    completion_delay = rte_get_timer_cycles() - timestamp;
+    if (completion_delay > adapter->missing_tx_completion_to) {
+      if (unlikely(!tx_buf->print_once)) {
+        ena_log_raw(
+            WARN,
+            "Found a Tx that wasn't completed on time, qid %d, index %d. "
+            "Missing Tx outstanding for %" PRIu64 " msecs.",
+            tx_ring->id, i, completion_delay / rte_get_timer_hz() * 1000);
+        tx_buf->print_once = true;
+      }
+      ++missed_tx;
+    }
+  }
+
+  if (unlikely(missed_tx > tx_ring->missing_tx_completion_threshold)) {
+    ena_log_raw(
+        ERR,
+        "The number of lost Tx completions is above the threshold (%d > %d). "
+        "Trigger the device reset.",
+        missed_tx, tx_ring->missing_tx_completion_threshold);
+    adapter->reset_reason = ENA_REGS_RESET_MISS_TX_CMPL;
+    adapter->trigger_reset = true;
+    rc = -EIO;
+  }
+
+  tx_ring->tx_stats.missed_tx += missed_tx;
+
+  return rc;
+}
+
+static void check_for_tx_completions(ena_adapter *adapter) {
+  struct ena_ring *tx_ring;
+  uint64_t tx_cleanup_delay;
+  size_t qid;
+  int budget;
+  auto &edev_data = adapter->edev->data;
+  uint16_t nb_tx_queues = edev_data.nb_tx_queues;
+
+  if (adapter->missing_tx_completion_to == ENA_HW_HINTS_NO_TIMEOUT)
+    return;
+
+  nb_tx_queues = edev_data.nb_tx_queues;
+  budget = adapter->missing_tx_completion_budget;
+
+  qid = adapter->last_tx_comp_qid;
+  while (budget-- > 0) {
+    tx_ring = &adapter->tx_ring[qid];
+
+    /* Tx cleanup is called only by the burst function and can be
+     * called dynamically by the application. Also cleanup is
+     * limited by the threshold. To avoid false detection of the
+     * missing HW Tx completion, get the delay since last cleanup
+     * function was called.
+     */
+    tx_cleanup_delay = rte_get_timer_cycles() - tx_ring->last_cleanup_ticks;
+    if (tx_cleanup_delay < adapter->tx_cleanup_stall_delay)
+      check_for_tx_completion_in_queue(adapter, tx_ring);
+    qid = (qid + 1) % nb_tx_queues;
+  }
+  adapter->last_tx_comp_qid = qid;
+}
+
+[[maybe_unused]] static void ena_timer_wd_callback(void *arg) {
+  rte_eth_dev *dev = static_cast<rte_eth_dev *>(arg);
+  ena_adapter *adapter = dev->get<ena_adapter>();
+
+  if (unlikely(adapter->trigger_reset))
+    return;
+  check_for_missing_keep_alive(adapter);
+  check_for_admin_com_state(adapter);
+  check_for_tx_completions(adapter);
+  if (unlikely(adapter->trigger_reset)) {
+    ena_log_raw(ERR, "Trigger reset is on");
+  }
+  rte_timer_reset(&adapter->timer_wd, rte_get_timer_hz(), ena_timer_wd_callback,
+                  arg);
 }
 
 static inline void
@@ -1458,6 +1654,14 @@ static void ena_update_hints(struct ena_adapter *adapter,
     /* convert to usec */
     adapter->ena_dev.mmio_read.reg_read_to = hints->mmio_read_timeout * 1000;
 
+  if (hints->driver_watchdog_timeout) {
+    if (hints->driver_watchdog_timeout == ENA_HW_HINTS_NO_TIMEOUT)
+      adapter->keep_alive_timeout = ENA_HW_HINTS_NO_TIMEOUT;
+    else
+      // Convert msecs to ticks
+      adapter->keep_alive_timeout =
+          (hints->driver_watchdog_timeout * rte_get_timer_hz()) / 1000;
+  }
 }
 
 static void ena_tx_map_mbuf(ena_ring *tx_ring, ena_tx_buffer *tx_info,
@@ -1584,6 +1788,7 @@ static int ena_xmit_mbuf(ena_ring *tx_ring, rte_mbuf *mbuf) {
   }
 
   tx_info->tx_descs = nb_hw_desc;
+  tx_info->timestamp = rte_get_timer_cycles();
 
   tx_ring->tx_stats.cnt++;
   tx_ring->tx_stats.bytes += mbuf->pkt_len;
@@ -1626,6 +1831,7 @@ static int ena_tx_cleanup(void *txp, uint32_t free_pkt_cnt) {
 
     /* Get Tx info & store how many descs were processed  */
     tx_info = &tx_ring->tx_buffer_info[req_id];
+    tx_info->timestamp = 0;
 
     mbuf = tx_info->mbuf;
     if (fast_free) {
@@ -1659,6 +1865,10 @@ static int ena_tx_cleanup(void *txp, uint32_t free_pkt_cnt) {
   if (mbuf_cnt != 0)
     rte_pktmbuf_free_bulk(pkts_to_clean, pkt_cnt);
 
+  /* Notify completion handler that full cleanup was performed */
+  if (free_pkt_cnt == 0 || total_tx_pkts < cleanup_budget)
+    tx_ring->last_cleanup_ticks = rte_get_timer_cycles();
+
   return total_tx_pkts;
 }
 
@@ -1684,6 +1894,7 @@ int ena_eth_dev::mtu_set(uint16_t mtu) {
 
 int ena_eth_dev::start() {
   ena_adapter *adapter = get<ena_adapter>();
+  uint64_t ticks __attribute__((unused));
   int rc = 0;
   uint16_t i;
 
@@ -1702,6 +1913,14 @@ int ena_eth_dev::start() {
   }
 
   ena_stats_restart(this);
+
+  adapter->timestamp_wd = rte_get_timer_cycles();
+  adapter->keep_alive_timeout = ENA_DEVICE_KALIVE_TIMEOUT;
+
+  ticks = rte_get_timer_hz();
+
+  // disable for now
+  // rte_timer_reset(&adapter->timer_wd, ticks, ena_timer_wd_callback, this);
 
   ++adapter->dev_stats.dev_start;
   adapter->state = ENA_ADAPTER_STATE_RUNNING;
@@ -1724,6 +1943,7 @@ int ena_eth_dev::stop() {
   ena_com_dev *ena_dev = &adapter->ena_dev;
   uint16_t i;
   int rc;
+  // rte_timer_stop_sync(&adapter->timer_wd);
   ena_collect_intr_threads(adapter);
   ena_queue_stop_all(this, ENA_RING_TYPE_TX);
   ena_queue_stop_all(this, ENA_RING_TYPE_RX);
@@ -1782,6 +2002,7 @@ int ena_eth_dev::tx_queue_setup(uint16_t queue_idx, uint16_t nb_desc,
   txq->size_mask = nb_desc - 1;
   txq->numa_socket_id = socket_id;
   txq->pkts_without_db = false;
+  txq->last_cleanup_ticks = 0;
 
   int size = sizeof(struct ena_tx_buffer) * txq->ring_size;
   txq->tx_buffer_info =
@@ -1822,6 +2043,9 @@ int ena_eth_dev::tx_queue_setup(uint16_t queue_idx, uint16_t nb_desc,
     txq->tx_free_thresh =
         RTE_MAX(dyn_thresh, txq->ring_size - ENA_REFILL_THRESH_PACKET);
   }
+
+  txq->missing_tx_completion_threshold =
+      RTE_MIN(txq->ring_size / 2, ENA_DEFAULT_MISSING_COMP);
 
   /* Store pointer to this queue in upper layer */
   txq->configured = 1;
@@ -2070,6 +2294,47 @@ uint16_t ena_rx_burst(rte_eth_dev *dev, uint16_t qid, rte_mbuf **rx_pkts,
   return completed;
 }
 
+/*
+ * stats
+ */
+
+static void ena_copy_customer_metrics(struct ena_adapter *adapter,
+                                      uint64_t *buf, size_t num_metrics) {
+  struct ena_com_dev *ena_dev = &adapter->ena_dev;
+  int rc;
+
+  if (ena_com_get_cap(ena_dev, ENA_ADMIN_CUSTOMER_METRICS)) {
+    if (num_metrics != ENA_STATS_ARRAY_METRICS) {
+      ena_log_raw(ERR,
+                  "Detected discrepancy in the number of customer metrics");
+      return;
+    }
+    rte_spinlock_lock(&adapter->admin_lock);
+    rc = ena_com_get_customer_metrics(&adapter->ena_dev, (char *)buf,
+                                      num_metrics * sizeof(uint64_t));
+    rte_spinlock_unlock(&adapter->admin_lock);
+    if (rc != 0) {
+      ena_log_raw(WARN, "Failed to get customer metrics, rc: %d", rc);
+      return;
+    }
+
+  } else if (ena_com_get_cap(ena_dev, ENA_ADMIN_ENI_STATS)) {
+    if (num_metrics != ENA_STATS_ARRAY_METRICS_LEGACY) {
+      ena_log_raw(ERR, "Detected discrepancy in the number of legacy metrics");
+      return;
+    }
+
+    rte_spinlock_lock(&adapter->admin_lock);
+    rc = ena_com_get_eni_stats(&adapter->ena_dev,
+                               (struct ena_admin_eni_stats *)buf);
+    rte_spinlock_unlock(&adapter->admin_lock);
+    if (rc != 0) {
+      ena_log_raw(WARN, "Failed to get ENI metrics, rc: %d", rc);
+      return;
+    }
+  }
+}
+
 /*********************************************************************
  *  platform functions implementations
  *********************************************************************/
@@ -2137,6 +2402,7 @@ int ena_attach(pci::device *dev, ena_adapter **_adapter) {
   edev = static_cast<ena_eth_dev *>(calloc(1, sizeof(ena_eth_dev)));
   adapter->edev = edev;
   new (adapter->edev) ena_eth_dev(adapter);
+  // rte_timer_init(&adapter->timer_wd);
 
   eth_os::register_port(adapter->edev);
   const char *queue_type_str;
@@ -2162,6 +2428,7 @@ int ena_attach(pci::device *dev, ena_adapter **_adapter) {
   snprintf(adapter->name, ENA_NAME_MAX_LEN, "ena_%d", adapter->id_number);
 
   /* Assign default devargs values */
+  adapter->missing_tx_completion_to = ENA_TX_TIMEOUT;
   adapter->llq_header_policy = ENA_LLQ_POLICY_DISABLED;
 
   rc = ena_com_allocate_customer_metrics_buffer(ena_dev);
@@ -2296,6 +2563,8 @@ int ena_detach(ena_adapter *adapter) {
   if (adapter->state == ENA_ADAPTER_STATE_RUNNING)
     ret = adapter->edev->stop();
   adapter->state = ENA_ADAPTER_STATE_CLOSED;
+  /* Stop timer service */
+  // rte_timer_stop_sync(&adapter->timer_wd);
 
   ena_rx_queue_release_all(adapter->edev);
   ena_tx_queue_release_all(adapter->edev);
@@ -2568,7 +2837,12 @@ static bool ena_use_large_llq_hdr(struct ena_adapter *adapter,
 }
 
 int ena_dev_configure(rte_eth_dev *dev) {
-  (void)dev;
+  auto *adapter = dev->get<ena_adapter>();
+  adapter->last_tx_comp_qid = 0;
+
+  adapter->missing_tx_completion_budget =
+      RTE_MIN(ENA_MONITORED_TX_QUEUES, dev->data.nb_tx_queues);
+  adapter->tx_cleanup_stall_delay = adapter->missing_tx_completion_to / 2;
   return 0;
 }
 

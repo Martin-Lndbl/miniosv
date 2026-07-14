@@ -30,6 +30,13 @@ public:
 
     static hw_driver* probe(hw_device* dev);
 
+    /**
+     * Fill the if_data buffer with data from our iface including those that
+     * we have gathered by ourselvs (e.g. FP queue stats).
+     * @param out_data output buffer
+     */
+    void fill_stats(struct if_data* out_data) const;
+
 private:
     pci::device& _dev;
     ena_adapter *_adapter;

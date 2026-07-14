@@ -5,6 +5,7 @@
  */
 
 #include "base/ena_plat.h"
+// #include "drivers/ena.hh"
 #include "ena_ethdev.h"
 #include "ena_if.h"
 #include <api/minidpdk/dev.hh>
@@ -37,6 +38,8 @@ enum ena_rss_hash_fields {
 
 static int ena_fill_indirect_table_default(struct ena_com_dev *ena_dev,
                                            size_t tbl_size, size_t queue_num);
+static uint64_t ena_admin_hf_to_eth_hf(enum ena_admin_flow_hash_proto proto,
+                                       uint16_t field);
 static uint16_t ena_eth_hf_to_admin_hf(enum ena_admin_flow_hash_proto proto,
                                        uint64_t rss_hf);
 static int ena_set_hash_fields(struct ena_com_dev *ena_dev, uint64_t rss_hf);
@@ -45,6 +48,7 @@ static int ena_rss_hash_set(struct ena_com_dev *ena_dev,
                             bool default_allowed);
 static void ena_reorder_rss_hash_key(uint8_t *reordered_key, uint8_t *key,
                                      size_t key_size);
+static int ena_get_rss_hash_key(struct ena_com_dev *ena_dev, uint8_t *rss_key);
 
 void ena_rss_key_fill(void *key, size_t size) {
   static bool key_generated;
@@ -117,6 +121,44 @@ int ena_rss_reta_update(rte_eth_dev *dev,
   return 0;
 }
 
+/* Query redirection table. */
+int ena_rss_reta_query(struct rte_eth_dev *dev,
+                       struct rte_eth_rss_reta_entry64 *reta_conf,
+                       uint16_t reta_size) {
+  uint32_t indirect_table[ENA_RX_RSS_TABLE_SIZE];
+  ena_adapter *adapter = dev->get<ena_adapter>();
+  int rc;
+  int i;
+  int reta_conf_idx;
+  int reta_idx;
+
+  if (reta_size == 0 || reta_conf == NULL)
+    return -EINVAL;
+
+  if (!(dev->data.dev_conf.rxmode.offloads & RTE_ETH_RX_OFFLOAD_RSS_HASH)) {
+    ena_log_raw(ERR, "RSS was not configured for the PMD");
+    return -ENOTSUP;
+  }
+
+  rte_spinlock_lock(&adapter->admin_lock);
+  rc = ena_com_indirect_table_get(&adapter->ena_dev, indirect_table);
+  rte_spinlock_unlock(&adapter->admin_lock);
+  if (unlikely(rc != 0)) {
+    ena_log_raw(ERR, "Cannot get indirection table");
+    return rc;
+  }
+
+  for (i = 0; i < reta_size; i++) {
+    reta_conf_idx = i / RTE_ETH_RETA_GROUP_SIZE;
+    reta_idx = i % RTE_ETH_RETA_GROUP_SIZE;
+    if (TEST_BIT(reta_conf[reta_conf_idx].mask, reta_idx))
+      reta_conf[reta_conf_idx].reta[reta_idx] =
+          ENA_IO_RXQ_IDX_REV(indirect_table[i]);
+  }
+
+  return 0;
+}
+
 static int ena_fill_indirect_table_default(struct ena_com_dev *ena_dev,
                                            size_t tbl_size, size_t queue_num) {
   size_t i;
@@ -135,6 +177,77 @@ static int ena_fill_indirect_table_default(struct ena_com_dev *ena_dev,
   }
 
   return 0;
+}
+
+static uint64_t ena_admin_hf_to_eth_hf(enum ena_admin_flow_hash_proto proto,
+                                       uint16_t fields) {
+  uint64_t rss_hf = 0;
+
+  /* If no fields are activated, then RSS is disabled for this proto */
+  if ((fields & ENA_HF_RSS_ALL_L2_L3_L4) == 0)
+    return 0;
+
+  /* Convert proto to ETH flag */
+  switch (proto) {
+  case ENA_ADMIN_RSS_TCP4:
+    rss_hf |= RTE_ETH_RSS_NONFRAG_IPV4_TCP;
+    break;
+  case ENA_ADMIN_RSS_UDP4:
+    rss_hf |= RTE_ETH_RSS_NONFRAG_IPV4_UDP;
+    break;
+  case ENA_ADMIN_RSS_TCP6:
+    rss_hf |= RTE_ETH_RSS_NONFRAG_IPV6_TCP;
+    break;
+  case ENA_ADMIN_RSS_UDP6:
+    rss_hf |= RTE_ETH_RSS_NONFRAG_IPV6_UDP;
+    break;
+  case ENA_ADMIN_RSS_IP4:
+    rss_hf |= RTE_ETH_RSS_IPV4;
+    break;
+  case ENA_ADMIN_RSS_IP6:
+    rss_hf |= RTE_ETH_RSS_IPV6;
+    break;
+  case ENA_ADMIN_RSS_IP4_FRAG:
+    rss_hf |= RTE_ETH_RSS_FRAG_IPV4;
+    break;
+  case ENA_ADMIN_RSS_NOT_IP:
+    rss_hf |= RTE_ETH_RSS_L2_PAYLOAD;
+    break;
+  case ENA_ADMIN_RSS_TCP6_EX:
+    rss_hf |= RTE_ETH_RSS_IPV6_TCP_EX;
+    break;
+  case ENA_ADMIN_RSS_IP6_EX:
+    rss_hf |= RTE_ETH_RSS_IPV6_EX;
+    break;
+  default:
+    break;
+  };
+
+  /* Check if only DA or SA is being used for L3. */
+  switch (fields & ENA_HF_RSS_ALL_L3) {
+  case ENA_ADMIN_RSS_L3_SA:
+    rss_hf |= RTE_ETH_RSS_L3_SRC_ONLY;
+    break;
+  case ENA_ADMIN_RSS_L3_DA:
+    rss_hf |= RTE_ETH_RSS_L3_DST_ONLY;
+    break;
+  default:
+    break;
+  };
+
+  /* Check if only DA or SA is being used for L4. */
+  switch (fields & ENA_HF_RSS_ALL_L4) {
+  case ENA_ADMIN_RSS_L4_SP:
+    rss_hf |= RTE_ETH_RSS_L4_SRC_ONLY;
+    break;
+  case ENA_ADMIN_RSS_L4_DP:
+    rss_hf |= RTE_ETH_RSS_L4_DST_ONLY;
+    break;
+  default:
+    break;
+  };
+
+  return rss_hf;
 }
 
 static uint16_t ena_eth_hf_to_admin_hf(enum ena_admin_flow_hash_proto proto,
@@ -316,6 +429,27 @@ static void ena_reorder_rss_hash_key(uint8_t *reordered_key, uint8_t *key,
     reordered_key[i] = key[rev_i];
 }
 
+static int ena_get_rss_hash_key(struct ena_com_dev *ena_dev, uint8_t *rss_key) {
+  uint8_t hw_rss_key[ENA_HASH_KEY_SIZE];
+  int rc;
+
+  /* The default RSS hash key cannot be retrieved from the HW. Unless it's
+   * explicitly set, this operation shouldn't be supported.
+   */
+  if (ena_dev->rss.hash_key == NULL) {
+    ena_log_raw(WARN, "Retrieving default RSS hash key is not supported");
+    return -ENOTSUP;
+  }
+
+  rc = ena_com_get_hash_key(ena_dev, hw_rss_key);
+  if (rc != 0)
+    return rc;
+
+  ena_reorder_rss_hash_key(rss_key, hw_rss_key, ENA_HASH_KEY_SIZE);
+
+  return 0;
+}
+
 int ena_rss_configure(struct ena_adapter *adapter) {
   struct rte_eth_rss_conf *rss_conf;
   struct ena_com_dev *ena_dev;
@@ -352,6 +486,78 @@ int ena_rss_configure(struct ena_adapter *adapter) {
 
   ena_log_raw(DBG, "RSS configured for port %d", adapter->edev->data.port_id);
 
+  return 0;
+}
+
+int ena_rss_hash_update(struct rte_eth_dev *dev,
+                        struct rte_eth_rss_conf *rss_conf) {
+  struct ena_adapter *adapter = dev->get<ena_adapter>();
+  int rc;
+
+  rte_spinlock_lock(&adapter->admin_lock);
+  rc = ena_rss_hash_set(&adapter->ena_dev, rss_conf, false);
+  rte_spinlock_unlock(&adapter->admin_lock);
+  if (unlikely(rc != 0)) {
+    ena_log_raw(ERR, "Failed to set RSS hash");
+    return rc;
+  }
+
+  return 0;
+}
+
+int ena_rss_hash_conf_get(struct rte_eth_dev *dev,
+                          struct rte_eth_rss_conf *rss_conf) {
+  struct ena_adapter *adapter = dev->get<ena_adapter>();
+  struct ena_com_dev *ena_dev = &adapter->ena_dev;
+  enum ena_admin_flow_hash_proto proto;
+  uint64_t rss_hf = 0;
+  int rc, i;
+  uint16_t admin_hf;
+  static bool warn_once;
+
+  if (!(dev->data.dev_conf.rxmode.offloads & RTE_ETH_RX_OFFLOAD_RSS_HASH)) {
+    ena_log_raw(ERR, "RSS was not configured for the PMD");
+    return -ENOTSUP;
+  }
+
+  if (rss_conf->rss_key != NULL) {
+    rc = ena_get_rss_hash_key(ena_dev, rss_conf->rss_key);
+    if (unlikely(rc != 0)) {
+      ena_log_raw(ERR, "Cannot retrieve RSS hash key, err: %d", rc);
+      return rc;
+    }
+  }
+
+  for (i = 0; i < ENA_ADMIN_RSS_PROTO_NUM; ++i) {
+    proto = (enum ena_admin_flow_hash_proto)i;
+    rte_spinlock_lock(&adapter->admin_lock);
+    rc = ena_com_get_hash_ctrl(ena_dev, proto, &admin_hf);
+    rte_spinlock_unlock(&adapter->admin_lock);
+    if (rc == ENA_COM_UNSUPPORTED) {
+      /* As some devices may support only reading rss hash
+       * key and not the hash ctrl, we want to notify the
+       * caller that this feature is only partially supported
+       * and do not return an error - the caller could be
+       * interested only in the key value.
+       */
+      if (!warn_once) {
+        ena_log_raw(WARN, "Reading hash control from the device is not "
+                          "supported. .rss_hf will contain a default value.");
+        warn_once = true;
+      }
+      rss_hf = ENA_ALL_RSS_HF;
+      break;
+    } else if (rc != 0) {
+      ena_log_raw(ERR,
+                  "Failed to retrieve hash ctrl for proto: %d with err: %d", i,
+                  rc);
+      return rc;
+    }
+
+    rss_hf |= ena_admin_hf_to_eth_hf(proto, admin_hf);
+  }
+
+  rss_conf->rss_hf = rss_hf;
   return 0;
 }
 

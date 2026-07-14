@@ -1,7 +1,6 @@
 #include "processor.hh"
 #include <api/minidpdk/time.hh>
 #include <cstdint>
-#include <osv/clock.hh>
 #include <unistd.h>
 
 uint64_t rte_get_timer_cycles() { return processor::ticks(); }

@@ -622,6 +622,7 @@ objects += core/condvar.o
 objects += core/debug.o
 objects += core/rcu.o
 objects += core/mempool.o
+objects += core/callout.o
 objects += core/time.o
 objects += core/mem.o
 objects += core/dev.o
