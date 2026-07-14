@@ -184,6 +184,9 @@ def main():
     parser.add_argument("region", help="AWS region to deploy to (e.g. us-east-1)")
     parser.add_argument("instance", help="EC2 instance type to launch (e.g. t3.micro)")
     parser.add_argument("--attach", action="store_true", help="Stream system log and terminate instance on Ctrl+C")
+    parser.add_argument("--subnet", help="VPC subnet ID to launch into (needed for buckets locked to a VPC endpoint)")
+    parser.add_argument("--security-group", action="append", default=[],
+                        help="Security group ID to attach; may be repeated. Required when --subnet is set unless the subnet's default SG is acceptable.")
     args = parser.parse_args()
 
     aws_login()
@@ -308,7 +311,7 @@ def main():
     ec2_client.get_waiter('image_available').wait(ImageIds=[ami_id])
 
     print(f"Launching {instance} instance from {ami_id}...")
-    run_response = ec2_client.run_instances(
+    run_kwargs = dict(
         ImageId=ami_id,
         InstanceType=instance,
         MinCount=1,
@@ -320,6 +323,11 @@ def main():
             }
         ],
     )
+    if args.subnet:
+        run_kwargs["SubnetId"] = args.subnet
+    if args.security_group:
+        run_kwargs["SecurityGroupIds"] = args.security_group
+    run_response = ec2_client.run_instances(**run_kwargs)
 
     instance_id = run_response["Instances"][0]["InstanceId"]
     print(f"Launched instance: {instance_id}")
