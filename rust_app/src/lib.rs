@@ -383,7 +383,7 @@ const TARGET_IP: Ipv4Address = Ipv4Address::new(3, 5, 216, 240);
 const TARGET_PORT: u16 = 443;
 const TARGET_SNI: &str = "miniosv-bench-1783870611.s3.eu-north-1.amazonaws.com";
 const TARGET_HOST: &str = "miniosv-bench-1783870611.s3.eu-north-1.amazonaws.com";
-const TARGET_PATH: &[u8] = b"/bench.bin";
+const TARGET_PATH: &[u8] = b"/bench10.bin";
 
 fn build_range_request(buf: &mut [u8], start: u64, end_inclusive: u64) -> usize {
     struct Wr<'a> { buf: &'a mut [u8], used: usize }
@@ -628,7 +628,7 @@ fn conn_step(
 // worker's slice of the file.
 // ---------------------------------------------------------------------------
 
-const CONNS_PER_WORKER: usize = 16;
+const CONNS_PER_WORKER: usize = 24;
 
 #[repr(C)]
 struct WorkerCtx {
@@ -679,7 +679,7 @@ extern "C" fn worker_thread(arg: *mut c_void) {
         let rx: &'static mut [u8] =
             Box::leak(alloc::vec![0u8; 4 * 1024 * 1024].into_boxed_slice());
         let tx: &'static mut [u8] =
-            Box::leak(alloc::vec![0u8; 64 * 1024].into_boxed_slice());
+            Box::leak(alloc::vec![0u8; 32 * 1024].into_boxed_slice());
         let mut sock = tcp::Socket::new(tcp::SocketBuffer::new(rx), tcp::SocketBuffer::new(tx));
         sock.set_ack_delay(None);
         handles.push(sockets.add(sock));
@@ -703,7 +703,11 @@ extern "C" fn worker_thread(arg: *mut c_void) {
         } else {
             start + per_conn - 1
         };
-        let src_port = ctx.local_port.wrapping_add((i as u16) * 100);
+        // Give each connection a 512-port sub-slab within the worker's
+        // slab. SYN-timeout retries bump the port by 1, so up to 511
+        // retries stay inside this sub-slab.
+        const PER_CONN_STRIDE: u16 = 8192 / (CONNS_PER_WORKER as u16);
+        let src_port = ctx.local_port.wrapping_add((i as u16) * PER_CONN_STRIDE);
         {
             let s = sockets.get_mut::<tcp::Socket>(handles[i]);
             if s.connect(iface.context(), (TARGET_IP, TARGET_PORT), src_port).is_err() {
@@ -819,8 +823,8 @@ fn learn_network(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn osv_app_main() {
-    const N: u16 = 1;
-    const FILE_SIZE: u64 = 1_073_741_824; // 1 GiB
+    const N: u16 = 2;
+    const FILE_SIZE: u64 = 10 * 1024 * 1024 * 1024; // 10 GiB
 
     let (pool, mac) = probe_and_open(N).unwrap_or_else(|| {
         println!("FAIL: no usable NIC");
@@ -840,9 +844,10 @@ pub extern "C" fn osv_app_main() {
     for i in 0..N as u64 {
         let start = i * chunk;
         let end_inclusive = if i == N as u64 - 1 { FILE_SIZE - 1 } else { start + chunk - 1 };
-        // Spread initial src_ports so it's unlikely they all hash to the
-        // same RSS queue; workers retry with local_port+1 on SYN timeout.
-        let local_port = 49152 + (i as u16) * 1000;
+        // Give each worker a disjoint 8192-port slab from the ephemeral
+        // range so its M connections (and their retries) never collide
+        // with another worker's 4-tuples.
+        let local_port = 49152 + (i as u16) * 8192;
         let ctx = Box::new(WorkerCtx {
             queue_id: i as u16,
             local_port,
