@@ -24,7 +24,7 @@
 #include "drivers/acpi.hh"
 #endif
 #if CONF_drivers_ena
-#include "drivers/ena.hh"
+#include "drivers/enav2/ena.hh"
 #endif
 
 // Physical pointer to the hand-off structure filled by the UEFI stub; stored

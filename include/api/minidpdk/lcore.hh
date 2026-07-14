@@ -18,6 +18,7 @@ struct lcore_container{
         instance.threads.front() = sched::thread::current();
     }
 };
+inline lcore_container lcore_container::instance;
 
 inline uint16_t rte_lcore_id(){
     return sched::current_cpu->id;

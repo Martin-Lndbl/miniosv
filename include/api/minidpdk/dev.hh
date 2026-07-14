@@ -22,8 +22,11 @@ struct eth_os {
       return nullptr;
     return instance.ifs[port];
   }
-  static void register_port(rte_eth_dev *dev);
+  static inline void register_port(rte_eth_dev *dev) {
+    instance.ifs.push_back(dev);
+  }
 };
+inline eth_os eth_os::instance;
 
 #define RTE_ETHER_CRC_LEN 4
 #define RTE_ETHER_HDR_LEN 14
@@ -180,7 +183,18 @@ struct rte_eth_dev {
   rx_burst_t rx_burst;
   virtual int drv_configure() = 0;
   virtual void get_stats(rte_eth_stats *stats) = 0;
-  int dev_configure(uint16_t nb_tx, uint16_t nb_rx, rte_eth_conf *conf);
+  int dev_configure(uint16_t nb_rx, uint16_t nb_tx, rte_eth_conf *conf) {
+    data.nb_rx_queues = nb_rx;
+    data.nb_tx_queues = nb_tx;
+    data.dev_conf.rxmode = conf->rxmode;
+    data.dev_conf.txmode = conf->txmode;
+    data.dev_conf.rx_adv_conf = conf->rx_adv_conf;
+    data.tx_queues.resize(nb_tx, nullptr);
+    data.rx_queues.resize(nb_rx, nullptr);
+    data.tx_queue_state.resize(nb_tx, RTE_ETH_QUEUE_STATE_STOPPED);
+    data.rx_queue_state.resize(nb_rx, RTE_ETH_QUEUE_STATE_STOPPED);
+    return drv_configure();
+  }
   virtual int get_dev_info(rte_eth_dev_info *info) = 0;
   virtual int rss_reta_update(rte_eth_rss_reta_entry64 *reta,
                               uint16_t reta_size) = 0;

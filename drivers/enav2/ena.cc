@@ -7,7 +7,7 @@
 
 #include <sys/cdefs.h>
 
-#include "drivers/ena.hh"
+#include "drivers/enav2/ena.hh"
 #include "drivers/pci-device.hh"
 
 #include <osv/aligned_new.hh>

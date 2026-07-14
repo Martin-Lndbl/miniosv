@@ -514,7 +514,7 @@ drivers += drivers/pci-bridge.o
 drivers += drivers/msi.o
 endif
 ifeq ($(conf_drivers_ena),1)
-drivers += drivers/ena.o
+drivers += drivers/enav2/ena.o
 drivers += drivers/enav2/base/ena_eth_com.o
 drivers += drivers/enav2/base/ena_com.o
 drivers += drivers/enav2/ena_ethdev.o
@@ -622,9 +622,6 @@ objects += core/condvar.o
 objects += core/debug.o
 objects += core/rcu.o
 objects += core/mempool.o
-objects += core/time.o
-objects += core/mem.o
-objects += core/dev.o
 ifeq ($(conf_memory_tracker),1)
 objects += core/alloctracker.o
 endif

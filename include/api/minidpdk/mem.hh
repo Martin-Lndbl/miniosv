@@ -157,18 +157,43 @@ using rte_pktmbuf_pool = minidpdk::mem_pool;
 using rte_mempool = rte_pktmbuf_pool;
 using rte_mbuf_ext_shared_info = minidpdk::rte_mbuf_ext_shared_info;
 
-void rte_pktmbuf_free(rte_mbuf *mbuf);
-void rte_mbuf_raw_free(rte_mbuf *mbuf);
-int rte_pktmbuf_alloc_bulk(rte_mempool* pool, rte_mbuf **pkts, uint16_t size);
-void rte_pktmbuf_free_bulk(rte_mbuf **pkts, uint16_t size);
+inline void rte_pktmbuf_free_helper(rte_mbuf *buf) {
+  if (buf->ol_flags & RTE_MBUF_F_EXTERNAL || buf->shinfo) {
+    assert(buf->shinfo->refcnt > 0);
+    if (--buf->shinfo->refcnt == 0)
+      buf->shinfo->free_cb(buf->buf_addr, buf->shinfo->fcb_opaque);
+  }
+  minidpdk::mbuf_free(buf);
+}
+inline void rte_pktmbuf_free(rte_mbuf *m) { rte_pktmbuf_free_helper(m); }
+inline void rte_mbuf_raw_free(rte_mbuf *m) { rte_pktmbuf_free_helper(m); }
+inline int rte_pktmbuf_alloc_bulk(rte_mempool *pool, rte_mbuf **pkts, uint16_t size) {
+  int ret = pool->alloc_bulk(reinterpret_cast<void **>(pkts), size);
+  if (ret < 0) return ret;
+  if (pool->init_fn) pool->init_fn(pkts, size, pool->priv);
+  return 0;
+}
+inline void rte_pktmbuf_free_bulk(rte_mbuf **pkts, uint16_t size) {
+  for (auto i = 0u; i < size; ++i) rte_pktmbuf_free_helper(pkts[i]);
+}
 __inline rte_mbuf* rte_pktmbuf_alloc(rte_mempool* pool){
     return pool->alloc_single();
 }
-const void *rte_pktmbuf_read(rte_mbuf *, uint32_t, uint32_t, uint8_t *);
-rte_mempool *rte_pktmbuf_pool_create(const char *name, unsigned n,
-                                     unsigned cache_size, uint16_t priv_size,
-                                     uint16_t data_room_size, int socket_id);
-void rte_mempool_free(rte_mempool *pool);
+inline const void *rte_pktmbuf_read(rte_mbuf *m, uint32_t off, uint32_t len,
+                                    uint8_t *buf) {
+  return m->read(off, len, buf);
+}
+inline rte_mempool *rte_pktmbuf_pool_create(const char *name, unsigned n,
+                                            unsigned cache_size,
+                                            uint16_t priv_size,
+                                            uint16_t data_room_size,
+                                            int socket_id) {
+  (void)name; (void)cache_size; (void)priv_size;
+  (void)data_room_size; (void)socket_id;
+  assert(data_room_size <= minidpdk::mem_pool::kMaxDataLen);
+  return new minidpdk::mem_pool(n);
+}
+inline void rte_mempool_free(rte_mempool *pool) { delete pool; }
 
 inline void rte_pktmbuf_attach_extbuf(rte_mbuf* m, void* buf_addr, uintptr_t iova, uint16_t buf_len, rte_mbuf_ext_shared_info* shinfo){
     m->shinfo = shinfo;
