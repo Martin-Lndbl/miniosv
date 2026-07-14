@@ -1,4 +1,5 @@
 #include "processor.hh"
+#include <osv/clock.hh>
 #include <api/minidpdk/time.hh>
 #include <cstdint>
 #include <unistd.h>

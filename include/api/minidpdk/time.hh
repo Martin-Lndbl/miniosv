@@ -2,7 +2,6 @@
 #define BYPASS_TIME_H
 
 #include <cstdint>
-#include <osv/callout.h>
 
 static constexpr uint64_t NS_PER_S = 1e9;
 static constexpr uint64_t NS_PER_US = 1e3;
@@ -16,18 +15,15 @@ void rte_delay_us_block(unsigned int us);
 
 void rte_delay_us_sleep(unsigned int us);
 
-using rte_timer = callout;
-
+// Timer/callout API stubs. The DPDK-vendored ENA driver references
+// rte_timer_* in a `[[maybe_unused]]` watchdog callback that never
+// runs (no dispatcher registered). Keep just enough type/no-op macros
+// to satisfy the compiler.
+struct rte_timer {};
 typedef void (*rte_timer_cb_t)(rte_timer *, void *);
-#define rte_timer_init(x) callout_init(x, true)
-#define rte_timer_stop_sync(x) callout_drain(x)
-#define rte_timer_reset(x, ticks, cb, arg)                                     \
-  callout_reset(x, ns2ticks(ticks), cb, arg)
-
-#define TSECOND (1000000000L)
-#define TMILISECOND (1000000L)
-#define hz (1000L)
-#define ticks2ns(ticks) (ticks * (TSECOND / hz))
-#define ns2ticks(ns) (ns / (TSECOND / hz))
+#define rte_timer_init(x)          ((void)(x))
+#define rte_timer_stop_sync(x)     ((void)(x))
+#define rte_timer_reset(x, ticks, cb, arg) \
+    ((void)(x), (void)(ticks), (void)(cb), (void)(arg))
 
 #endif // !

@@ -249,9 +249,9 @@ void arch_init_drivers()
         boot_time.event("pci enumerated");
     }
 #endif
+
     // Initialize all drivers
     hw::driver_manager* drvman = hw::driver_manager::instance();
-
 #if CONF_drivers_ena
     drvman->register_driver(aws::ena::probe);
 #endif
