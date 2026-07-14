@@ -864,15 +864,6 @@ namespace pci {
             addr_lo = val & PCI_BAR_PIO_ADDR_MASK;
         }
 
-        /* Firmware may report a BAR that is sized and typed (so `val` has
-         * the mmio/64/prefetchable bits set and `addr_size` reads back
-         * non-zero) but has never been assigned an address — the whole
-         * masked address is zero. Nitro Gen 5 platforms present PCIe root
-         * ports with such shadow BARs. Skip them instead of asserting. */
-        if (!addr_lo && !addr_hi) {
-            return nullptr;
-        }
-
         bar *pbar = new bar(this, pos, addr_lo, addr_hi, addr_size, is_mmio, is_64, is_prefetchable);
         _bars.insert(std::make_pair(idx, pbar));
 

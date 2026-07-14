@@ -10,6 +10,7 @@
 
 #include <osv/types.h>
 #include <sys/types.h>
+#include <memory>
 
 namespace randomdev {
 
@@ -17,23 +18,24 @@ class hw_rng;
 
 class random_device {
 public:
-  random_device();
-  virtual ~random_device();
 
-  // Register/unregister a hardware entropy source (e.g. virtio-rng) that the
-  // CSPRNG pulls from when reseeding.
-  static void register_source(hw_rng *hwrng);
-  static void deregister_source(hw_rng *hwrng);
+    random_device();
+    virtual ~random_device();
+
+    // Register/unregister a hardware entropy source (e.g. virtio-rng) that the
+    // CSPRNG pulls from when reseeding.
+    static void register_source(hw_rng* hwrng);
+    static void deregister_source(hw_rng* hwrng);
 };
 
 class hw_rng {
 public:
-  virtual u64 get_random_bytes(char *buf, u64 size) = 0;
+    virtual size_t get_random_bytes(char *buf, size_t size) = 0;
 };
 
 void randomdev_init();
 
-} // namespace randomdev
+}
 
 extern "C" {
 uint32_t arc4random(void);

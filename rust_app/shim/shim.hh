@@ -1,128 +1,68 @@
 // extern "C" bridge between the Rust port and the C++-only minidpdk
-// API (rte_eth_dev exposes get_dev_info/get_stats/stop as virtual
-// methods, and eth_os::get_eth_for_port() returns a C++ pointer —
-// neither has a stable C ABI Rust can call directly).
-//
-// Design choice: every real DPDK/minidpdk struct (rte_eth_dev_info,
-// rte_eth_conf, rte_eth_rxconf, rte_eth_txconf, rte_eth_stats) is
-// constructed and read *inside* this shim. Only plain integers and
-// opaque pointers cross into Rust, so Rust never needs to know their
-// layout.
+// API. Every DPDK struct is built and read inside the shim; only
+// integers and opaque pointers cross into Rust.
 #pragma once
 #include <cstdint>
 
 extern "C" {
 
-// Returns 1 if a device exists for `port_id`, else 0.
 int shim_is_valid_port(uint16_t port_id);
 
-// Fills *max_rx_queues / *max_tx_queues from rte_eth_dev_info.
-// Returns 0 on success, -1 if the port doesn't exist.
 int shim_get_dev_info(uint16_t port_id, uint16_t *max_rx_queues,
                        uint16_t *max_tx_queues);
 
-// Wraps rte_pktmbuf_pool_create(); returns nullptr on failure.
 void *shim_pktmbuf_pool_create(const char *name, uint32_t n,
                                 uint32_t cache_size, uint16_t priv_size,
                                 uint16_t data_room_size);
 void shim_mempool_free(void *pool);
 
-// Wraps rte_eth_dev_configure(). If nb_rx_q > 1, enables RSS with a
-// hash over the TCP/IPv4 4-tuple so parallel flows land on distinct
-// RX queues (one per worker thread).
+// If nb_rx_q > 1, enables RSS over the TCP/IPv4 4-tuple so parallel
+// flows land on distinct RX queues.
 int shim_eth_dev_configure(uint16_t port_id, uint16_t nb_rx_q,
                             uint16_t nb_tx_q);
 
 void shim_adjust_nb_rx_tx_desc(uint16_t port_id, uint16_t *nb_rx_desc,
                                 uint16_t *nb_tx_desc);
 
-// Wraps rte_eth_rx_queue_setup() with a zero-initialized rte_eth_rxconf.
 int shim_rx_queue_setup(uint16_t port_id, uint16_t queue_id,
                          uint16_t nb_desc, void *mempool);
-
-// Wraps rte_eth_tx_queue_setup() with a zero-initialized rte_eth_txconf.
 int shim_tx_queue_setup(uint16_t port_id, uint16_t queue_id,
                          uint16_t nb_desc);
 
 int shim_dev_start(uint16_t port_id);
-
-// Wraps rte_eth_dev(port_id)->stop(). No-op if the port doesn't exist.
 void shim_dev_stop(uint16_t port_id);
 
-// Writes 6 bytes into addr_bytes.
 void shim_macaddr_get(uint16_t port_id, uint8_t *addr_bytes);
 
-// Fills the four counters from rte_eth_stats.
-// Returns 0 on success, -1 if the port doesn't exist.
-int shim_get_stats(uint16_t port_id, uint64_t *ipackets, uint64_t *opackets,
-                    uint64_t *ibytes, uint64_t *obytes);
-
-// Zero-copy TX: allocate an mbuf from `pool`, expose its data area to
-// the caller for direct write, and return the mbuf handle. On success
-// *out_handle is set and the returned pointer is the writable start of
-// the mbuf's data buffer; *out_cap is the max number of bytes that can
-// be written there. On alloc failure returns nullptr and zeroes the
-// out params. The caller must eventually pass the handle to
-// shim_mbuf_tx() or shim_mbuf_free().
+// Zero-copy TX: allocate an mbuf from `pool`, expose its data area for
+// direct write, return the mbuf handle. On success *out_handle is set
+// and the returned pointer is the writable start; *out_cap is the max
+// bytes that can be written. Caller must eventually shim_mbuf_tx() or
+// shim_mbuf_free() the handle.
 uint8_t *shim_mbuf_alloc_tx(void *pool, void **out_handle, uint16_t *out_cap);
 
-// Hand a previously-allocated mbuf to rte_eth_tx_burst(). `len` is the
-// packet length now sitting in the mbuf's data area. This is where we
-// derive ol_flags / l2_len / l3_len from the frame contents for the NIC
-// checksum-offload path. Returns 0 on success (mbuf is consumed by the
-// NIC); returns -1 on tx failure (the mbuf is freed).
+// Enqueue a previously-allocated mbuf. Returns 0 on success (mbuf
+// consumed by the NIC), -1 on tx failure (mbuf is freed).
 int shim_mbuf_tx(uint16_t port_id, uint16_t queue_id, void *handle,
                   uint16_t len);
-
-// Release an mbuf back to its pool without transmitting. Used by the
-// RxToken drop path and by TX callers that abandon a partially-built
-// packet.
 void shim_mbuf_free(void *handle);
 
-// Zero-copy RX: poll rte_eth_rx_burst() for a single packet. On success
-// (return value == 1), sets *out_handle to an mbuf handle, *out_data
-// to the packet's readable data start, and *out_len to its length. The
-// caller must eventually free the mbuf via shim_mbuf_free().
-// Returns 0 if no packet was available OR the packet was dropped
-// because the NIC flagged a bad checksum (in the latter case the mbuf
-// is freed by the shim before return).
+// Zero-copy RX. Return 1 with (*out_handle, *out_data, *out_len) set;
+// or 0 if no packet is available OR the NIC flagged a bad checksum
+// (in which case the mbuf is freed internally).
 int shim_mbuf_rx_burst(uint16_t port_id, uint16_t queue_id, void **out_handle,
                         const uint8_t **out_data, uint16_t *out_len);
 
-// --- Checksum-offload diagnostics ----------------------------------------
-
-// Emit a one-shot summary of what checksum offloads the driver accepted
-// at configure time and the aggregate `ol_flags` verdict the NIC produced
-// across all received packets. Intended to be called once after the app
-// finishes its work, so the counters don't get scrolled off the end of
-// the 64 KB AWS console tail by response-body prints.
-void shim_offload_report(void);
-
-// --- OSv threading -------------------------------------------------------
-
-// Spawn an OSv thread pinned to `cpu_id` (0-based). `fn(arg)` runs on
-// the new thread. Returns an opaque handle for shim_thread_join.
-// `cpu_id < 0` means "don't pin".
+// OSv threading: pin `fn(arg)` to `cpu_id` (>=0), or leave unpinned if <0.
 void *shim_thread_spawn(void (*fn)(void *), void *arg, int cpu_id);
-
-// Wait for a shim_thread_spawn thread to finish and release its
-// resources.
 void shim_thread_join(void *handle);
 
-// --- Non-networking runtime hooks needed by rustls -----------------------
-
-// Wall-clock seconds since the Unix epoch. Used only for TLS certificate
-// validity checks; the accuracy just has to be within a cert's ~30 day
-// slack, so time(NULL) at boot is fine.
+// Wall-clock seconds (for TLS cert validity) and monotonic ns
+// (elapsed-time benchmarks).
 uint64_t shim_time_seconds(void);
-
-// Monotonic nanoseconds from an unspecified epoch. Used for measuring
-// elapsed time (throughput benchmarking) — only differences matter.
 uint64_t shim_time_ns(void);
 
-// Global allocator FFI. Rust's core+alloc stack needs a heap; we back it
-// with OSv's C++ new/delete via malloc/free so we don't ship a second
-// heap inside the Rust static library.
+// Rust global allocator FFI.
 void *shim_malloc(uint64_t size);
 void  shim_free(void *ptr);
 void *shim_realloc(void *ptr, uint64_t size);

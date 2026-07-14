@@ -132,8 +132,6 @@ pub struct rte_pktmbuf_pool {
 }
 
 extern "C" {
-    fn shim_is_valid_port(port_id: u16) -> c_int;
-    fn shim_get_dev_info(port_id: u16, max_rx_queues: *mut u16, max_tx_queues: *mut u16) -> c_int;
     fn shim_pktmbuf_pool_create(
         name: *const u8,
         n: u32,
@@ -153,7 +151,6 @@ extern "C" {
     fn shim_tx_queue_setup(port_id: u16, queue_id: u16, nb_desc: u16) -> c_int;
     fn shim_dev_start(port_id: u16) -> c_int;
     fn shim_dev_stop(port_id: u16);
-    fn shim_offload_report();
     fn shim_thread_spawn(
         f: extern "C" fn(*mut c_void),
         arg: *mut c_void,
@@ -188,22 +185,15 @@ impl Drop for PktPool {
     }
 }
 
-/// Configure & start the NIC with `n_queues` RX+TX queues (RSS on the
-/// TCP/IPv4 4-tuple when n_queues > 1). Returns (pool, MAC).
-fn probe_and_open(port_id: u16, n_queues: u16) -> Option<(PktPool, [u8; 6])> {
+/// Configure & start port 0 with `n_queues` RX+TX queues (RSS on the
+/// TCP/IPv4 4-tuple when n_queues > 1). Returns (pool, MAC). AWS gives
+/// the guest exactly one ENA interface so hard-coding port 0 is fine.
+fn probe_and_open(n_queues: u16) -> Option<(PktPool, [u8; 6])> {
+    const PORT: u16 = 0;
     const DATA_ROOM_SIZE: u16 = 1536;
     const DESC_NUM: u16 = 1024;
     const POOL_SIZE: u32 = 4096;
     const CACHE: u32 = 64;
-
-    if unsafe { shim_is_valid_port(port_id) } == 0 {
-        return None;
-    }
-    let (mut max_rx, mut max_tx) = (0u16, 0u16);
-    if unsafe { shim_get_dev_info(port_id, &mut max_rx, &mut max_tx) } != 0 {
-        return None;
-    }
-    println!("port {}: max rx/tx queues {}/{}", port_id, max_rx, max_tx);
 
     let raw = unsafe {
         shim_pktmbuf_pool_create(b"bench-pool\0".as_ptr(), POOL_SIZE, CACHE, 0, DATA_ROOM_SIZE)
@@ -213,27 +203,27 @@ fn probe_and_open(port_id: u16, n_queues: u16) -> Option<(PktPool, [u8; 6])> {
     }
     let pool = PktPool(raw);
 
-    if unsafe { shim_eth_dev_configure(port_id, n_queues, n_queues) } != 0 {
+    if unsafe { shim_eth_dev_configure(PORT, n_queues, n_queues) } != 0 {
         return None;
     }
     let (mut rx_desc, mut tx_desc) = (DESC_NUM, DESC_NUM);
-    unsafe { shim_adjust_nb_rx_tx_desc(port_id, &mut rx_desc, &mut tx_desc) };
+    unsafe { shim_adjust_nb_rx_tx_desc(PORT, &mut rx_desc, &mut tx_desc) };
     for q in 0..n_queues {
-        if unsafe { shim_rx_queue_setup(port_id, q, rx_desc, pool.0) } != 0 {
+        if unsafe { shim_rx_queue_setup(PORT, q, rx_desc, pool.0) } != 0 {
             return None;
         }
-        if unsafe { shim_tx_queue_setup(port_id, q, tx_desc) } != 0 {
+        if unsafe { shim_tx_queue_setup(PORT, q, tx_desc) } != 0 {
             return None;
         }
     }
-    if unsafe { shim_dev_start(port_id) } != 0 {
+    if unsafe { shim_dev_start(PORT) } != 0 {
         return None;
     }
     let mut mac = [0u8; 6];
-    unsafe { shim_macaddr_get(port_id, mac.as_mut_ptr()) };
+    unsafe { shim_macaddr_get(PORT, mac.as_mut_ptr()) };
     println!(
-        "port {}: MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ({} queues)",
-        port_id, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], n_queues
+        "port 0: MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ({} queues)",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], n_queues
     );
     Some((pool, mac))
 }
@@ -248,8 +238,8 @@ fn probe_and_open(port_id: u16, n_queues: u16) -> Option<(PktPool, [u8; 6])> {
 
 const MTU: usize = 1514;
 
+// Port is always 0 (AWS gives one ENA interface per guest).
 struct DpdkDevice {
-    port_id: u16,
     queue_id: u16,
     pool: *mut rte_pktmbuf_pool,
     pending_synth: Option<Vec<u8>>,
@@ -301,7 +291,7 @@ impl<'a> TxToken for DpdkTxToken<'a> {
         let n = core::cmp::min(len, cap as usize);
         let slice = unsafe { core::slice::from_raw_parts_mut(data, n) };
         let r = f(slice);
-        let _ = unsafe { shim_mbuf_tx(self.dev.port_id, self.dev.queue_id, handle, n as u16) };
+        let _ = unsafe { shim_mbuf_tx(0, self.dev.queue_id, handle, n as u16) };
         r
     }
 }
@@ -318,7 +308,7 @@ impl Device for DpdkDevice {
         let mut data: *const u8 = ptr::null();
         let mut len: u16 = 0;
         let rc =
-            unsafe { shim_mbuf_rx_burst(self.port_id, self.queue_id, &mut handle, &mut data, &mut len) };
+            unsafe { shim_mbuf_rx_burst(0, self.queue_id, &mut handle, &mut data, &mut len) };
         if rc != 1 || handle.is_null() {
             return None;
         }
@@ -466,44 +456,6 @@ fn dhcp_acquire(
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// RDRAND-backed getrandom for rustls's rustcrypto provider. OSv doesn't
-// expose Linux's getrandom(2), so we bypass with x86_64 RDRAND.
-// ---------------------------------------------------------------------------
-
-fn rdrand64() -> Option<u64> {
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        let mut out: u64 = 0;
-        // Intel SDM: retry up to 10 times before treating RDRAND as unavailable.
-        for _ in 0..10 {
-            let ok: u8;
-            core::arch::asm!(
-                "rdrand {r}",
-                "setc {ok}",
-                r = out(reg) out,
-                ok = out(reg_byte) ok,
-                options(nostack, nomem)
-            );
-            if ok != 0 { return Some(out); }
-        }
-        None
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    { None }
-}
-
-fn osv_getrandom(dest: &mut [u8]) -> Result<(), getrandom::Error> {
-    let err = || getrandom::Error::from(core::num::NonZeroU32::new(1).unwrap());
-    for chunk in dest.chunks_mut(8) {
-        let v = rdrand64().ok_or_else(err)?.to_ne_bytes();
-        chunk.copy_from_slice(&v[..chunk.len()]);
-    }
-    Ok(())
-}
-
-getrandom::register_custom_getrandom!(osv_getrandom);
 
 // ---------------------------------------------------------------------------
 // TLS pump on rustls's unbuffered API: drain outgoing → tcp tx, tcp rx →
@@ -677,7 +629,6 @@ fn https_get(
 
 #[repr(C)]
 struct WorkerCtx {
-    port_id: u16,
     queue_id: u16,
     local_port: u16,
     pool: *mut rte_pktmbuf_pool,
@@ -700,7 +651,6 @@ extern "C" fn worker_thread(arg: *mut c_void) {
     let ip = Ipv4Address::new(ctx.ip[0], ctx.ip[1], ctx.ip[2], ctx.ip[3]);
     let gw = Ipv4Address::new(ctx.gateway_ip[0], ctx.gateway_ip[1], ctx.gateway_ip[2], ctx.gateway_ip[3]);
     let mut dev = DpdkDevice {
-        port_id: ctx.port_id,
         queue_id: ctx.queue_id,
         pool: ctx.pool,
         // Seed the neighbor cache with the gateway MAC — a real ARP
@@ -738,16 +688,15 @@ extern "C" fn worker_thread(arg: *mut c_void) {
     ctx.elapsed_ns.store(elapsed_ns, Ordering::Relaxed);
 }
 
-/// DHCP + gateway ARP on queue 0. Workers inherit (ip, prefix, gw, gw_mac).
+/// DHCP + gateway ARP on port 0 / queue 0. Workers inherit (ip, prefix, gw, gw_mac).
 fn learn_network(
     pool: *mut rte_pktmbuf_pool,
-    port_id: u16,
     mac: [u8; 6],
 ) -> Option<(Ipv4Address, u8, Ipv4Address, EthernetAddress)> {
     let clk = MonoClock::new();
     // DHCP via smoltcp; scoped so its &mut dev is dropped before raw ARP.
     let (ip, prefix, gw) = {
-        let mut dev = DpdkDevice { port_id, queue_id: 0, pool, pending_synth: None };
+        let mut dev = DpdkDevice { queue_id: 0, pool, pending_synth: None };
         let config = Config::new(EthernetAddress(mac).into());
         let mut iface = Interface::new(config, &mut dev, Instant::from_millis(clk.elapsed_ms()));
 
@@ -771,7 +720,7 @@ fn learn_network(
         }
         let n = core::cmp::min(req.len(), cap as usize);
         core::ptr::copy_nonoverlapping(req.as_ptr(), data, n);
-        let _ = shim_mbuf_tx(port_id, 0, handle, n as u16);
+        let _ = shim_mbuf_tx(0, 0, handle, n as u16);
     }
 
     let mut iter: u64 = 0;
@@ -779,7 +728,7 @@ fn learn_network(
         let mut handle: *mut c_void = ptr::null_mut();
         let mut data: *const u8 = ptr::null();
         let mut len: u16 = 0;
-        let rc = unsafe { shim_mbuf_rx_burst(port_id, 0, &mut handle, &mut data, &mut len) };
+        let rc = unsafe { shim_mbuf_rx_burst(0, 0, &mut handle, &mut data, &mut len) };
         if rc == 1 && !handle.is_null() {
             let slice = unsafe { core::slice::from_raw_parts(data, len as usize) };
             let hw = parse_arp_reply_from(slice, gw.octets());
@@ -807,14 +756,12 @@ pub extern "C" fn osv_app_main() {
     const N: u16 = 2;
     const FILE_SIZE: u64 = 1_073_741_824; // 1 GiB
 
-    let (pool, mac, port_id) = (0u16..64)
-        .find_map(|p| probe_and_open(p, N).map(|(pool, mac)| (pool, mac, p)))
-        .unwrap_or_else(|| {
-            println!("FAIL: no usable NIC");
-            loop { core::hint::spin_loop(); }
-        });
+    let (pool, mac) = probe_and_open(N).unwrap_or_else(|| {
+        println!("FAIL: no usable NIC");
+        loop { core::hint::spin_loop(); }
+    });
 
-    let (ip, prefix_len, gw, gw_mac) = learn_network(pool.0, port_id, mac).unwrap_or_else(|| {
+    let (ip, prefix_len, gw, gw_mac) = learn_network(pool.0, mac).unwrap_or_else(|| {
         loop { core::hint::spin_loop(); }
     });
     let ip_bytes = ip.octets();
@@ -831,7 +778,6 @@ pub extern "C" fn osv_app_main() {
         // same RSS queue; workers retry with local_port+1 on SYN timeout.
         let local_port = 49152 + (i as u16) * 1000;
         let mut ctx = Box::new(WorkerCtx {
-            port_id,
             queue_id: i as u16,
             local_port,
             pool: pool.0,
@@ -873,8 +819,7 @@ pub extern "C" fn osv_app_main() {
         total_b as f64 / 1e6 / overall_s.max(1e-9),
         total_b as f64 * 8.0 / 1e9 / overall_s.max(1e-9));
 
-    unsafe { shim_offload_report() };
-    unsafe { shim_dev_stop(port_id) };
+    unsafe { shim_dev_stop(0) };
     loop { core::hint::spin_loop(); }
 }
 

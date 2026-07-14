@@ -118,12 +118,9 @@ bool check_bus(u16 bus)
 
 void pci_device_enumeration()
 {
-    /* Scan every PCI bus. Nitro Gen 5 instances (c7i, c7a, …) place the
-     * ENA VF on a bus that isn't reachable from a bridge on bus 0, so we
-     * cannot stop at the first non-empty bus. A missing bus reads back all
-     * 0xff and is skipped cheaply — 256 × 32 × 8 config reads at boot. */
     for (u16 bus = 0; bus < 256; bus++) {
-        check_bus(bus);
+        if (check_bus(bus))
+            break;
     }
 }
 
