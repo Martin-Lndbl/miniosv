@@ -27,7 +27,9 @@ void *shim_pktmbuf_pool_create(const char *name, uint32_t n,
                                 uint16_t data_room_size);
 void shim_mempool_free(void *pool);
 
-// Wraps rte_eth_dev_configure() with a zero-initialized rte_eth_conf.
+// Wraps rte_eth_dev_configure(). If nb_rx_q > 1, enables RSS with a
+// hash over the TCP/IPv4 4-tuple so parallel flows land on distinct
+// RX queues (one per worker thread).
 int shim_eth_dev_configure(uint16_t port_id, uint16_t nb_rx_q,
                             uint16_t nb_tx_q);
 
@@ -96,12 +98,27 @@ int shim_mbuf_rx_burst(uint16_t port_id, uint16_t queue_id, void **out_handle,
 // the 64 KB AWS console tail by response-body prints.
 void shim_offload_report(void);
 
+// --- OSv threading -------------------------------------------------------
+
+// Spawn an OSv thread pinned to `cpu_id` (0-based). `fn(arg)` runs on
+// the new thread. Returns an opaque handle for shim_thread_join.
+// `cpu_id < 0` means "don't pin".
+void *shim_thread_spawn(void (*fn)(void *), void *arg, int cpu_id);
+
+// Wait for a shim_thread_spawn thread to finish and release its
+// resources.
+void shim_thread_join(void *handle);
+
 // --- Non-networking runtime hooks needed by rustls -----------------------
 
 // Wall-clock seconds since the Unix epoch. Used only for TLS certificate
 // validity checks; the accuracy just has to be within a cert's ~30 day
 // slack, so time(NULL) at boot is fine.
 uint64_t shim_time_seconds(void);
+
+// Monotonic nanoseconds from an unspecified epoch. Used for measuring
+// elapsed time (throughput benchmarking) — only differences matter.
+uint64_t shim_time_ns(void);
 
 // Global allocator FFI. Rust's core+alloc stack needs a heap; we back it
 // with OSv's C++ new/delete via malloc/free so we don't ship a second

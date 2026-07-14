@@ -35,6 +35,7 @@ extern "C" {
     fn shim_free(ptr: *mut u8);
     fn shim_realloc(ptr: *mut u8, size: u64) -> *mut u8;
     fn shim_time_seconds() -> u64;
+    fn shim_time_ns() -> u64;
 }
 
 struct ShimAllocator;
@@ -166,14 +167,13 @@ extern "C" {
     fn shim_dev_start(port_id: u16) -> c_int;
     fn shim_dev_stop(port_id: u16);
     fn shim_offload_report();
+    fn shim_thread_spawn(
+        f: extern "C" fn(*mut c_void),
+        arg: *mut c_void,
+        cpu_id: c_int,
+    ) -> *mut c_void;
+    fn shim_thread_join(handle: *mut c_void);
     fn shim_macaddr_get(port_id: u16, addr_bytes: *mut u8);
-    fn shim_get_stats(
-        port_id: u16,
-        ipackets: *mut u64,
-        opackets: *mut u64,
-        ibytes: *mut u64,
-        obytes: *mut u64,
-    ) -> c_int;
 
     // Zero-copy TX: alloc → write into `data[..cap]` → shim_mbuf_tx.
     fn shim_mbuf_alloc_tx(
@@ -221,11 +221,14 @@ impl Drop for PktPool {
 // the caller can pump packets through it.
 // =====================================================================
 
-fn probe_and_open(port_id: u16) -> Option<(PktPool, [u8; 6])> {
-    const DESC_NUM: u16 = 64;
-    const MEMPOOL_CACHE_SIZE: u32 = 32;
-    const POOL_SIZE: u32 = 256;
+/// Set up the NIC with `n_queues` RX + `n_queues` TX queues (RSS on
+/// the TCP/IPv4 4-tuple when n_queues > 1), configure MTU to jumbo,
+/// and start the device. Returns the shared packet pool and MAC.
+fn probe_and_open(port_id: u16, n_queues: u16) -> Option<(PktPool, [u8; 6])> {
     const DATA_ROOM_SIZE: u16 = 1536;
+    const DESC_NUM: u16 = 1024;
+    const POOL_SIZE: u32 = 4096;
+    const MEMPOOL_CACHE_SIZE: u32 = 64;
 
     if unsafe { shim_is_valid_port(port_id) } == 0 {
         return None;
@@ -239,7 +242,7 @@ fn probe_and_open(port_id: u16) -> Option<(PktPool, [u8; 6])> {
     }
     println!("  max rx queues:{}  max tx queues:{}", max_rx, max_tx);
 
-    let name = b"http-pool\0";
+    let name = b"bench-pool\0";
     let raw = unsafe {
         shim_pktmbuf_pool_create(name.as_ptr(), POOL_SIZE, MEMPOOL_CACHE_SIZE, 0, DATA_ROOM_SIZE)
     };
@@ -247,26 +250,29 @@ fn probe_and_open(port_id: u16) -> Option<(PktPool, [u8; 6])> {
         return None;
     }
     let pool = PktPool(raw);
-    println!("OK: packet pool allocated");
+    println!("OK: packet pool ({} mbufs, {} B each) allocated", POOL_SIZE, DATA_ROOM_SIZE);
 
-    if unsafe { shim_eth_dev_configure(port_id, 1, 1) } != 0 {
+    if unsafe { shim_eth_dev_configure(port_id, n_queues, n_queues) } != 0 {
         return None;
     }
-    println!("OK: device configured (1 rx, 1 tx queue)");
+    println!("OK: device configured ({} rx, {} tx queues)", n_queues, n_queues);
 
     let mut rx_desc = DESC_NUM;
     let mut tx_desc = DESC_NUM;
     unsafe { shim_adjust_nb_rx_tx_desc(port_id, &mut rx_desc, &mut tx_desc) };
 
-    if unsafe { shim_rx_queue_setup(port_id, 0, rx_desc, pool.0) } != 0 {
-        return None;
+    for q in 0..n_queues {
+        if unsafe { shim_rx_queue_setup(port_id, q, rx_desc, pool.0) } != 0 {
+            return None;
+        }
+        if unsafe { shim_tx_queue_setup(port_id, q, tx_desc) } != 0 {
+            return None;
+        }
     }
-    println!("OK: rx queue set up ({} descriptors)", rx_desc);
-
-    if unsafe { shim_tx_queue_setup(port_id, 0, tx_desc) } != 0 {
-        return None;
-    }
-    println!("OK: tx queue set up ({} descriptors)", tx_desc);
+    println!(
+        "OK: rx+tx queues set up ({} descriptors each)",
+        rx_desc
+    );
 
     if unsafe { shim_dev_start(port_id) } != 0 {
         return None;
@@ -292,21 +298,32 @@ fn probe_and_open(port_id: u16) -> Option<(PktPool, [u8; 6])> {
 // as consume() returns.
 // =====================================================================
 
+// smoltcp's view of the max Ethernet frame size, including L2 header.
 const MTU: usize = 1514;
 
 struct DpdkDevice {
     port_id: u16,
+    queue_id: u16,
     pool: *mut rte_pktmbuf_pool,
+    // A one-shot synthetic Ethernet frame (typically an ARP reply
+    // fabricated from a gateway MAC learned on another queue) returned
+    // on the next `receive()` call before we poll the real NIC. Used
+    // to seed smoltcp's neighbor cache on worker queues without doing
+    // an ARP exchange that RSS would misroute.
+    pending_synth: Option<Vec<u8>>,
 }
 
-/// Holds an owned mbuf handle from `shim_mbuf_rx_burst`. `consume()`
-/// hands the mbuf's data slice to smoltcp/rustls and then frees.
-/// `Drop` covers the "smoltcp drops the token without consuming"
-/// path, so we never leak an mbuf regardless of upstream behaviour.
-struct DpdkRxToken {
-    handle: *mut c_void,
-    data: *const u8,
-    len: usize,
+/// Holds either an owned mbuf handle from `shim_mbuf_rx_burst`, or a
+/// synthetic frame owned by an inline `Vec`. `consume()` hands the
+/// packet's bytes to smoltcp/rustls; `Drop` covers the "smoltcp drops
+/// the token without consuming" path so we never leak.
+enum DpdkRxToken {
+    Mbuf {
+        handle: *mut c_void,
+        data: *const u8,
+        len: usize,
+    },
+    Synth(Vec<u8>),
 }
 
 struct DpdkTxToken<'a> {
@@ -318,19 +335,25 @@ impl RxToken for DpdkRxToken {
     where
         F: FnOnce(&[u8]) -> R,
     {
-        // Take ownership of the handle so Drop is a no-op — otherwise
-        // we'd double-free after the explicit shim_mbuf_free below.
-        let this = core::mem::ManuallyDrop::new(self);
-        let slice = unsafe { core::slice::from_raw_parts(this.data, this.len) };
-        let r = f(slice);
-        unsafe { shim_mbuf_free(this.handle) };
-        r
+        // Suppress Drop so the mbuf/free below isn't run a second time.
+        let mut this = core::mem::ManuallyDrop::new(self);
+        match &mut *this {
+            DpdkRxToken::Mbuf { handle, data, len } => {
+                let slice = unsafe { core::slice::from_raw_parts(*data, *len) };
+                let r = f(slice);
+                unsafe { shim_mbuf_free(*handle) };
+                r
+            }
+            DpdkRxToken::Synth(buf) => f(&buf[..]),
+        }
     }
 }
 
 impl Drop for DpdkRxToken {
     fn drop(&mut self) {
-        unsafe { shim_mbuf_free(self.handle) };
+        if let DpdkRxToken::Mbuf { handle, .. } = *self {
+            unsafe { shim_mbuf_free(handle) };
+        }
     }
 }
 
@@ -356,7 +379,7 @@ impl<'a> TxToken for DpdkTxToken<'a> {
         // shim_mbuf_tx consumes the mbuf on success and frees it on
         // tx_burst failure. Either way, `handle` must not be touched
         // after this call.
-        let _ = unsafe { shim_mbuf_tx(self.dev.port_id, 0, handle, n as u16) };
+        let _ = unsafe { shim_mbuf_tx(self.dev.port_id, self.dev.queue_id, handle, n as u16) };
         r
     }
 }
@@ -372,16 +395,19 @@ impl Device for DpdkDevice {
         Self: 'a;
 
     fn receive(&mut self, _t: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        if let Some(buf) = self.pending_synth.take() {
+            return Some((DpdkRxToken::Synth(buf), DpdkTxToken { dev: self }));
+        }
         let mut handle: *mut c_void = ptr::null_mut();
         let mut data: *const u8 = ptr::null();
         let mut len: u16 = 0;
         let rc = unsafe {
-            shim_mbuf_rx_burst(self.port_id, 0, &mut handle, &mut data, &mut len)
+            shim_mbuf_rx_burst(self.port_id, self.queue_id, &mut handle, &mut data, &mut len)
         };
         if rc != 1 || handle.is_null() {
             return None;
         }
-        let rx = DpdkRxToken {
+        let rx = DpdkRxToken::Mbuf {
             handle,
             data,
             len: len as usize,
@@ -407,57 +433,138 @@ impl Device for DpdkDevice {
     }
 }
 
+// Build a 42-byte ARP request frame asking who-has(target_ip). Sender is
+// (our_mac, our_ip); target_hw is zeroed. Broadcast destination.
+fn build_arp_request(our_mac: [u8; 6], our_ip: [u8; 4], target_ip: [u8; 4]) -> [u8; 42] {
+    let mut f = [0u8; 42];
+    // Ethernet header: dst=broadcast, src=our_mac, ethertype=0x0806 (ARP).
+    f[0..6].fill(0xff);
+    f[6..12].copy_from_slice(&our_mac);
+    f[12..14].copy_from_slice(&[0x08, 0x06]);
+    // ARP payload: HTYPE=1, PTYPE=0x0800, HLEN=6, PLEN=4, OPER=1 (request).
+    f[14..16].copy_from_slice(&[0x00, 0x01]);
+    f[16..18].copy_from_slice(&[0x08, 0x00]);
+    f[18] = 6;
+    f[19] = 4;
+    f[20..22].copy_from_slice(&[0x00, 0x01]);
+    f[22..28].copy_from_slice(&our_mac);
+    f[28..32].copy_from_slice(&our_ip);
+    // target_hw stays zero (that's what we want to learn).
+    f[38..42].copy_from_slice(&target_ip);
+    f
+}
+
+// Build the ARP-reply we'd expect if `sender_ip` answered our request.
+// Ethernet dst = us, ethertype ARP, opcode 2.
+fn build_arp_reply(
+    sender_mac: [u8; 6],
+    sender_ip: [u8; 4],
+    target_mac: [u8; 6],
+    target_ip: [u8; 4],
+) -> Vec<u8> {
+    let mut f = alloc::vec![0u8; 42];
+    f[0..6].copy_from_slice(&target_mac);
+    f[6..12].copy_from_slice(&sender_mac);
+    f[12..14].copy_from_slice(&[0x08, 0x06]);
+    f[14..16].copy_from_slice(&[0x00, 0x01]);
+    f[16..18].copy_from_slice(&[0x08, 0x00]);
+    f[18] = 6;
+    f[19] = 4;
+    f[20..22].copy_from_slice(&[0x00, 0x02]); // reply
+    f[22..28].copy_from_slice(&sender_mac);
+    f[28..32].copy_from_slice(&sender_ip);
+    f[32..38].copy_from_slice(&target_mac);
+    f[38..42].copy_from_slice(&target_ip);
+    f
+}
+
+// If `frame` is an ARP reply announcing `expected_ip`, return the
+// sender's MAC.
+fn parse_arp_reply_from(frame: &[u8], expected_ip: [u8; 4]) -> Option<[u8; 6]> {
+    if frame.len() < 42 || &frame[12..14] != &[0x08, 0x06] {
+        return None;
+    }
+    if &frame[20..22] != &[0x00, 0x02] {
+        return None;
+    }
+    if &frame[28..32] != &expected_ip[..] {
+        return None;
+    }
+    let mut mac = [0u8; 6];
+    mac.copy_from_slice(&frame[22..28]);
+    Some(mac)
+}
+
 // =====================================================================
-// DHCP + HTTPS GET to Cloudflare's DNS-over-HTTPS front-end.
-//
-// The IP/gateway/subnet we get from AWS's DHCP server. The HTTPS
-// target is 1.1.1.1:443, whose cert covers `one.one.one.one`. Fixed
-// public IP → no DNS needed. GET / returns a small HTML body which is
-// enough to prove: TCP connect → TLS handshake → HTTP request/reply
-// over TLS → close_notify → TCP close.
+// DHCP + HTTPS GET to an S3 bucket in eu-north-1 hosting a 1 GiB
+// bench.bin. Same-region S3 traffic goes over AWS's internal network
+// (no inter-region hops, no internet egress cost), so this doubles as
+// a receive-throughput benchmark: we time the download and report
+// MB/s + Gbps at the end.
 // =====================================================================
 
-const TARGET_IP: Ipv4Address = Ipv4Address::new(1, 1, 1, 1);
+const TARGET_IP: Ipv4Address = Ipv4Address::new(3, 5, 216, 240);
 const TARGET_PORT: u16 = 443;
-const TARGET_SNI: &str = "one.one.one.one";
-const LOCAL_PORT: u16 = 49152;
+const TARGET_SNI: &str = "miniosv-bench-1783870611.s3.eu-north-1.amazonaws.com";
 
-const REQUEST: &[u8] = b"GET / HTTP/1.0\r\n\
-                         Host: one.one.one.one\r\n\
-                         User-Agent: minidpdk-smoltcp/0.1\r\n\
-                         Connection: close\r\n\
-                         \r\n";
+// The URI + Host header hostname. Kept in the WorkerCtx-built request
+// alongside the per-worker Range header.
+const TARGET_HOST: &str = "miniosv-bench-1783870611.s3.eu-north-1.amazonaws.com";
+const TARGET_PATH: &[u8] = b"/bench.bin";
 
-// smoltcp fake-clock stride: one "ms" every CLOCK_STRIDE poll iterations.
-// STATS_STRIDE tunes how often we dump NIC counters. ITER_BUDGET is a
-// safety net so a hung run doesn't spin forever.
-const CLOCK_STRIDE: u64 = 5_000;
-const STATS_STRIDE: u64 = 500_000;
-const ITER_BUDGET: u64 = 5_000_000_000;
-
-fn tick_clock(clock_ms: &mut i64, iter: &mut u64) {
-    *iter = iter.wrapping_add(1);
-    if iter.is_multiple_of(CLOCK_STRIDE) {
-        *clock_ms = clock_ms.wrapping_add(1);
+/// Build a `GET /bench.bin HTTP/1.1 ... Range: bytes=A-B` request into
+/// the caller-provided buffer, returning the number of bytes written.
+/// Every worker splits the same file across a Range, so both workers
+/// hit S3 for one file rather than duplicating the download.
+fn build_range_request(buf: &mut [u8], start: u64, end_inclusive: u64) -> usize {
+    use core::fmt::Write as _;
+    struct Wr<'a> {
+        buf: &'a mut [u8],
+        used: usize,
     }
-}
-
-fn dump_stats(port_id: u16, iter: u64, clock_ms: i64) {
-    let (mut i_pkts, mut o_pkts, mut i_bytes, mut o_bytes) = (0u64, 0u64, 0u64, 0u64);
-    unsafe {
-        shim_get_stats(
-            port_id,
-            &mut i_pkts,
-            &mut o_pkts,
-            &mut i_bytes,
-            &mut o_bytes,
-        );
+    impl<'a> core::fmt::Write for Wr<'a> {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let n = core::cmp::min(s.len(), self.buf.len() - self.used);
+            self.buf[self.used..self.used + n].copy_from_slice(&s.as_bytes()[..n]);
+            self.used += n;
+            Ok(())
+        }
     }
-    println!(
-        "stats: iter={} clock={}ms rx={} pkts/{} B  tx={} pkts/{} B",
-        iter, clock_ms, i_pkts, i_bytes, o_pkts, o_bytes
+    let mut w = Wr { buf, used: 0 };
+    let _ = write!(
+        &mut w,
+        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: minidpdk-smoltcp/0.1\r\nRange: bytes={}-{}\r\nConnection: close\r\n\r\n",
+        core::str::from_utf8(TARGET_PATH).unwrap_or("/"),
+        TARGET_HOST,
+        start,
+        end_inclusive,
     );
+    w.used
 }
+
+// Real monotonic clock: for smoltcp's poll timestamp we use elapsed ms
+// since app start. Under a fake-tick clock (1 fake-ms per N iters) the
+// interface's retransmit/backoff timers drift and stall at high
+// throughput; a real clock keeps them accurate.
+struct MonoClock {
+    epoch_ns: u64,
+}
+impl MonoClock {
+    fn new() -> Self {
+        Self {
+            epoch_ns: unsafe { shim_time_ns() },
+        }
+    }
+    fn elapsed_ns(&self) -> u64 {
+        unsafe { shim_time_ns() }.saturating_sub(self.epoch_ns)
+    }
+    fn elapsed_ms(&self) -> i64 {
+        (self.elapsed_ns() / 1_000_000) as i64
+    }
+}
+
+// ITER_BUDGET is a safety net so a hung run doesn't spin forever.
+const ITER_BUDGET: u64 = 20_000_000_000;
 
 /// Runs a DHCPv4 exchange until the server hands us an address, then
 /// installs it (with default route + subnet mask) on the interface.
@@ -467,13 +574,13 @@ fn dhcp_acquire(
     dev: &mut DpdkDevice,
     sockets: &mut SocketSet<'_>,
     dhcp_handle: smoltcp::iface::SocketHandle,
-    port_id: u16,
+    clk: &MonoClock,
 ) -> Option<(smoltcp::wire::Ipv4Cidr, Ipv4Address)> {
-    let mut clock_ms: i64 = 0;
     let mut iter: u64 = 0;
     println!("DHCP: requesting lease...");
     loop {
-        iface.poll(Instant::from_millis(clock_ms), dev, sockets);
+        let now_ms = clk.elapsed_ms();
+        iface.poll(Instant::from_millis(now_ms), dev, sockets);
 
         let s = sockets.get_mut::<dhcpv4::Socket>(dhcp_handle);
         match s.poll() {
@@ -501,13 +608,9 @@ fn dhcp_acquire(
             None => {}
         }
 
-        tick_clock(&mut clock_ms, &mut iter);
-        if iter.is_multiple_of(STATS_STRIDE) {
-            dump_stats(port_id, iter, clock_ms);
-        }
-        // DHCP is fast on AWS; a fraction of ITER_BUDGET is more than enough.
+        iter = iter.wrapping_add(1);
         if iter > ITER_BUDGET / 10 {
-            println!("DHCP: timeout ({} iters, {} fake-ms)", iter, clock_ms);
+            println!("DHCP: timeout ({} iters, {} ms)", iter, now_ms);
             return None;
         }
     }
@@ -612,24 +715,25 @@ fn make_client_config() -> Arc<ClientConfig> {
 }
 
 // Scratch buffers for the unbuffered pump. rustls records max out at
-// 16 KB + overhead. incoming grows with pipelined records; outgoing
-// grows with handshake bursts. 24 KB each is enough headroom for a
-// full TLS 1.3 handshake plus one HTTP round trip.
-const TLS_BUF_CAP: usize = 24 * 1024;
+// 16 KB + overhead. Sized to hold many pipelined records so `incoming`
+// doesn't reallocate on every socket recv during the bulk download.
+const TLS_BUF_CAP: usize = 256 * 1024;
 
 fn https_get(
     iface: &mut Interface,
     dev: &mut DpdkDevice,
     sockets: &mut SocketSet<'_>,
     tcp_handle: smoltcp::iface::SocketHandle,
-    port_id: u16,
-) {
+    clk: &MonoClock,
+    local_port: u16,
+    request: &[u8],
+) -> (usize, u64) {
     // --- TCP connect --------------------------------------------------
     {
         let s = sockets.get_mut::<tcp::Socket>(tcp_handle);
-        if let Err(_) = s.connect(iface.context(), (TARGET_IP, TARGET_PORT), LOCAL_PORT) {
+        if let Err(_) = s.connect(iface.context(), (TARGET_IP, TARGET_PORT), local_port) {
             println!("FAIL: tcp connect() rejected");
-            return;
+            return (0, 0);
         }
     }
     let o = TARGET_IP.octets();
@@ -643,7 +747,7 @@ fn https_get(
         Ok(n) => n.to_owned(),
         Err(_) => {
             println!("FAIL: tls invalid ServerName");
-            return;
+            return (0, 0);
         }
     };
     let cfg = make_client_config();
@@ -651,7 +755,7 @@ fn https_get(
         Ok(c) => c,
         Err(e) => {
             println!("FAIL: tls UnbufferedClientConnection::new: {:?}", e);
-            return;
+            return (0, 0);
         }
     };
 
@@ -664,18 +768,27 @@ fn https_get(
     let mut request_queued = false;
     let mut handshake_done = false;
     let mut bytes_received: usize = 0;
-    let mut clock_ms: i64 = 0;
     let mut iter: u64 = 0;
     let mut last_tcp_state: tcp::State = tcp::State::Closed;
+    let mut t_request_sent_ns: u64 = 0;
+    let connect_start_ms = clk.elapsed_ms();
 
     loop {
-        iface.poll(Instant::from_millis(clock_ms), dev, sockets);
+        let now_ms = clk.elapsed_ms();
+        iface.poll(Instant::from_millis(now_ms), dev, sockets);
         let s = sockets.get_mut::<tcp::Socket>(tcp_handle);
 
         let state = s.state();
         if state != last_tcp_state {
             println!("tcp state: {:?}", state);
             last_tcp_state = state;
+        }
+        // If the SYN never gets its ACK, the response is landing on
+        // another worker's RSS queue. Bail so the caller can retry with
+        // a different source port.
+        if state == tcp::State::SynSent && now_ms - connect_start_ms > 3000 {
+            s.abort();
+            return (0, 0);
         }
 
         // 1) Drain any queued outgoing ciphertext into the TCP tx buffer.
@@ -708,7 +821,7 @@ fn https_get(
                 Ok(st) => st,
                 Err(e) => {
                     println!("FAIL: tls process_tls_records: {:?}", e);
-                    return;
+                    return (bytes_received, 0);
                 }
             };
             match st {
@@ -721,7 +834,7 @@ fn https_get(
                             Ok(rec) => bytes_received += rec.payload.len(),
                             Err(e) => {
                                 println!("FAIL: tls record: {:?}", e);
-                                return;
+                                return (bytes_received, 0);
                             }
                         }
                     }
@@ -740,7 +853,7 @@ fn https_get(
                         Ok(n) => n,
                         Err(e) => {
                             println!("FAIL: tls encode: {:?}", e);
-                            return;
+                            return (bytes_received, 0);
                         }
                     };
                     outgoing.truncate(head + n);
@@ -764,21 +877,22 @@ fn https_get(
                     }
                     if !request_queued {
                         let head = outgoing.len();
-                        outgoing.resize(head + REQUEST.len() + 128, 0);
-                        let n = match wt.encrypt(REQUEST, &mut outgoing[head..]) {
+                        outgoing.resize(head + request.len() + 128, 0);
+                        let n = match wt.encrypt(request, &mut outgoing[head..]) {
                             Ok(n) => n,
                             Err(e) => {
                                 println!("FAIL: tls encrypt request: {:?}", e);
-                                return;
+                                return (bytes_received, 0);
                             }
                         };
                         outgoing.truncate(head + n);
                         println!(
                             "OK: encrypted {} bytes of HTTP request into {} bytes of ciphertext",
-                            REQUEST.len(),
+                            request.len(),
                             n
                         );
                         request_queued = true;
+                        t_request_sent_ns = clk.elapsed_ns();
                         progress = true;
                     }
                 }
@@ -799,84 +913,351 @@ fn https_get(
             tcp::State::Closed | tcp::State::CloseWait | tcp::State::TimeWait
         );
         if handshake_done && request_queued && ended && outgoing.is_empty() {
-            println!();
+            let elapsed_ns = clk.elapsed_ns().saturating_sub(t_request_sent_ns);
+            let elapsed_s = elapsed_ns as f64 / 1e9;
             println!(
-                "OK: HTTPS exchange complete ({} bytes plaintext received)",
-                bytes_received
+                "worker@q{}: HTTPS complete — {} B in {:.3} s",
+                dev.queue_id, bytes_received, elapsed_s
             );
-            return;
+            return (bytes_received, elapsed_ns);
         }
 
-        tick_clock(&mut clock_ms, &mut iter);
-        if iter.is_multiple_of(STATS_STRIDE) {
-            dump_stats(port_id, iter, clock_ms);
-        }
+        iter = iter.wrapping_add(1);
         if iter > ITER_BUDGET {
             println!(
-                "TIMEOUT after {} iters (fake clock {} ms, received {} bytes)",
-                iter, clock_ms, bytes_received
+                "worker@q{}: TIMEOUT after {} iters ({} ms, {} bytes)",
+                dev.queue_id, iter, now_ms, bytes_received
             );
-            return;
+            return (bytes_received, clk.elapsed_ns().saturating_sub(t_request_sent_ns));
         }
     }
 }
 
-fn run_net(mac: [u8; 6], mut dev: DpdkDevice) {
-    let config = Config::new(EthernetAddress(mac).into());
-    let mut iface = Interface::new(config, &mut dev, Instant::from_millis(0));
+/// Per-thread state. `net` is the pre-learned network config (DHCP
+/// happens once on the main thread; workers inherit it). Everything
+/// else — Interface, sockets, rustls session — is thread-local inside
+/// `worker_thread`.
+#[repr(C)]
+struct WorkerCtx {
+    port_id: u16,
+    queue_id: u16,
+    local_port: u16,
+    pool: *mut rte_pktmbuf_pool,
+    mac: [u8; 6],
+    ip: [u8; 4],
+    prefix_len: u8,
+    gateway_ip: [u8; 4],
+    gateway_mac: [u8; 6],
+    // Preformatted HTTP GET (with a `Range:` header) for this worker's
+    // half of the file. `request_len` is the number of valid bytes.
+    request: [u8; 384],
+    request_len: u16,
+    bytes_received: core::sync::atomic::AtomicU64,
+    elapsed_ns: core::sync::atomic::AtomicU64,
+}
+unsafe impl Send for WorkerCtx {}
+unsafe impl Sync for WorkerCtx {}
 
-    static mut TCP_RX: [u8; 8192] = [0u8; 8192];
-    static mut TCP_TX: [u8; 4096] = [0u8; 4096];
-    let tcp_sock = tcp::Socket::new(
-        tcp::SocketBuffer::new(unsafe { &mut TCP_RX[..] }),
-        tcp::SocketBuffer::new(unsafe { &mut TCP_TX[..] }),
+extern "C" fn worker_thread(arg: *mut c_void) {
+    let ctx: &WorkerCtx = unsafe { &*(arg as *const WorkerCtx) };
+    let clk = MonoClock::new();
+    let ip = Ipv4Address::new(ctx.ip[0], ctx.ip[1], ctx.ip[2], ctx.ip[3]);
+    let gw = Ipv4Address::new(
+        ctx.gateway_ip[0],
+        ctx.gateway_ip[1],
+        ctx.gateway_ip[2],
+        ctx.gateway_ip[3],
     );
+    let mut dev = DpdkDevice {
+        port_id: ctx.port_id,
+        queue_id: ctx.queue_id,
+        pool: ctx.pool,
+        // Seed smoltcp's neighbor cache with the gateway MAC by handing
+        // it a fabricated ARP reply on the first poll. This avoids each
+        // worker doing its own ARP exchange, which RSS would misroute
+        // (ARP replies land on queue 0).
+        pending_synth: Some(build_arp_reply(
+            ctx.gateway_mac,
+            gw.octets(),
+            ctx.mac,
+            ip.octets(),
+        )),
+    };
+    let config = Config::new(EthernetAddress(ctx.mac).into());
+    let mut iface = Interface::new(config, &mut dev, Instant::from_millis(clk.elapsed_ms()));
 
-    static mut STORAGE: [SocketStorage; 2] = [SocketStorage::EMPTY; 2];
-    let mut sockets = unsafe { SocketSet::new(&mut STORAGE[..]) };
-    let tcp_handle = sockets.add(tcp_sock);
-    let dhcp_handle = sockets.add(dhcpv4::Socket::new());
+    // Install the pre-learned IP + default route.
+    iface.update_ip_addrs(|addrs| {
+        let _ = addrs.push(IpCidr::new(ip.into(), ctx.prefix_len));
+    });
+    let _ = iface.routes_mut().add_default_ipv4_route(gw);
 
-    let port_id = dev.port_id;
-    if dhcp_acquire(&mut iface, &mut dev, &mut sockets, dhcp_handle, port_id).is_none() {
-        return;
+    // Per-thread TCP buffers (heap-allocated to keep the thread stack sane).
+    let mut tcp_rx: Vec<u8> = alloc::vec![0u8; 4 * 1024 * 1024];
+    let mut tcp_tx: Vec<u8> = alloc::vec![0u8; 16 * 1024];
+
+    // Retry loop: RSS routes each 4-tuple to a specific queue by hashing
+    // the return-flow tuple with a driver-picked key we can't observe. If
+    // the SYN never gets an ACK, our port hashed to another worker's
+    // queue; bump it and try again until we land on our own.
+    let mut src_port = ctx.local_port;
+    let mut bytes: usize = 0;
+    let mut elapsed_ns: u64 = 0;
+    for _attempt in 0..32u32 {
+        let tcp_sock = tcp::Socket::new(
+            tcp::SocketBuffer::new(&mut tcp_rx[..]),
+            tcp::SocketBuffer::new(&mut tcp_tx[..]),
+        );
+        let mut storage: [SocketStorage<'_>; 1] = [SocketStorage::EMPTY];
+        let mut sockets = SocketSet::new(&mut storage[..]);
+        let tcp_handle = sockets.add(tcp_sock);
+        let (b, e) = https_get(
+            &mut iface,
+            &mut dev,
+            &mut sockets,
+            tcp_handle,
+            &clk,
+            src_port,
+            &ctx.request[..ctx.request_len as usize],
+        );
+        if b > 0 {
+            bytes = b;
+            elapsed_ns = e;
+            break;
+        }
+        println!(
+            "worker {}: SYN timed out on src_port {}, retrying",
+            ctx.queue_id, src_port
+        );
+        src_port = src_port.wrapping_add(1);
+    }
+    ctx.bytes_received
+        .store(bytes as u64, core::sync::atomic::Ordering::Relaxed);
+    ctx.elapsed_ns
+        .store(elapsed_ns, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Run on the main thread once, before spawning workers. Does DHCP on
+/// queue 0 and then triggers an ARP for the gateway so we can extract
+/// its MAC and hand it to the workers.
+fn learn_network(
+    pool: *mut rte_pktmbuf_pool,
+    port_id: u16,
+    mac: [u8; 6],
+) -> Option<(Ipv4Address, u8, Ipv4Address, EthernetAddress)> {
+    let clk = MonoClock::new();
+    // Scope the smoltcp iface to the DHCP phase — after DHCP we use raw
+    // shim RX/TX to do the gateway ARP, so we don't need to keep smoltcp
+    // holding a mut ref to `dev`.
+    let (ip, prefix, gw) = {
+        let mut dev = DpdkDevice {
+            port_id,
+            queue_id: 0,
+            pool,
+            pending_synth: None,
+        };
+        let config = Config::new(EthernetAddress(mac).into());
+        let mut iface =
+            Interface::new(config, &mut dev, Instant::from_millis(clk.elapsed_ms()));
+
+        static mut STORAGE: [SocketStorage; 1] = [SocketStorage::EMPTY];
+        let mut sockets = unsafe { SocketSet::new(&mut STORAGE[..]) };
+        let dhcp_handle = sockets.add(dhcpv4::Socket::new());
+
+        let (cidr, gw) =
+            dhcp_acquire(&mut iface, &mut dev, &mut sockets, dhcp_handle, &clk)?;
+        (cidr.address(), cidr.prefix_len(), gw)
+    };
+
+    // Raw ARP request for the gateway on queue 0. smoltcp normally handles
+    // this via its neighbor cache, but per-worker ifaces (on non-0 queues)
+    // can't reach the reply via RSS, so we resolve it once here and hand
+    // the MAC out to workers, who prime their own caches with a synthetic
+    // ARP reply (see `build_arp_reply` + `pending_synth`).
+    let req = build_arp_request(mac, ip.octets(), gw.octets());
+    unsafe {
+        let mut handle: *mut c_void = ptr::null_mut();
+        let mut cap: u16 = 0;
+        let data = shim_mbuf_alloc_tx(pool, &mut handle, &mut cap);
+        if data.is_null() || handle.is_null() {
+            println!("FAIL: no mbuf for ARP request");
+            return None;
+        }
+        let n = core::cmp::min(req.len(), cap as usize);
+        core::ptr::copy_nonoverlapping(req.as_ptr(), data, n);
+        let _ = shim_mbuf_tx(port_id, 0, handle, n as u16);
     }
 
-    https_get(&mut iface, &mut dev, &mut sockets, tcp_handle, port_id);
-
-    // With no more traffic in flight, print the NIC-offload summary while
-    // the console tail still has room. If the driver accepted TX offloads,
-    // the HTTPS exchange above is proof they worked — smoltcp emits
-    // packets with the checksum bytes at zero (ChecksumCapabilities is
-    // `ignored()`), so a successful handshake means the NIC filled them.
-    // The RX-verdict counter proves the same on the receive side.
-    unsafe { shim_offload_report() };
+    let mut iter: u64 = 0;
+    loop {
+        let mut handle: *mut c_void = ptr::null_mut();
+        let mut data: *const u8 = ptr::null();
+        let mut len: u16 = 0;
+        let rc =
+            unsafe { shim_mbuf_rx_burst(port_id, 0, &mut handle, &mut data, &mut len) };
+        if rc == 1 && !handle.is_null() {
+            let slice = unsafe { core::slice::from_raw_parts(data, len as usize) };
+            let hw = parse_arp_reply_from(slice, gw.octets());
+            unsafe { shim_mbuf_free(handle) };
+            if let Some(hw) = hw {
+                println!(
+                    "gateway MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                    hw[0], hw[1], hw[2], hw[3], hw[4], hw[5]
+                );
+                return Some((ip, prefix, gw, EthernetAddress(hw)));
+            }
+        }
+        iter = iter.wrapping_add(1);
+        if iter > ITER_BUDGET / 20 {
+            println!("FAIL: gateway ARP timed out");
+            return None;
+        }
+    }
 }
 
 // =====================================================================
 // Entry point
 // =====================================================================
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 #[unsafe(no_mangle)]
 pub extern "C" fn osv_app_main() {
-    let mut ran = false;
+    const N: u16 = 2;
+    const N_QUEUES: u16 = N;
+    let mut opened: Option<(PktPool, [u8; 6], u16)> = None;
     for port_id in 0u16..64 {
         println!("Probing port {}...", port_id);
-        if let Some((pool, mac)) = probe_and_open(port_id) {
-            let dev = DpdkDevice {
-                port_id,
-                pool: pool.0,
-            };
-            run_net(mac, dev);
-            unsafe { shim_dev_stop(port_id) };
-            // `pool` drops here, releasing the mempool back to OSv.
-            ran = true;
+        if let Some((pool, mac)) = probe_and_open(port_id, N_QUEUES) {
+            opened = Some((pool, mac, port_id));
             break;
         }
     }
-    if !ran {
-        println!("FAIL: no usable NIC found");
+    let (pool, mac, port_id) = match opened {
+        Some(x) => x,
+        None => {
+            println!("FAIL: no usable NIC found");
+            loop {
+                core::hint::spin_loop();
+            }
+        }
+    };
+
+    // Main-thread network setup: DHCP + gateway ARP on queue 0. Workers
+    // inherit the resulting (ip, prefix, gateway_ip, gateway_mac) so
+    // they never have to do their own DHCP or ARP (both of which would
+    // race against RSS routing).
+    let (ip, prefix_len, gw, gw_mac) = match learn_network(pool.0, port_id, mac) {
+        Some(x) => x,
+        None => loop {
+            core::hint::spin_loop();
+        },
+    };
+    let ip_bytes = ip.octets();
+    let gw_bytes = gw.octets();
+
+    // Split the file across N workers via HTTP Range. Each worker
+    // fetches a distinct byte range from bench.bin, so total download
+    // bytes = FILE_SIZE (not N * FILE_SIZE). Adjust FILE_SIZE if you
+    // upload a different bench.bin.
+    const FILE_SIZE: u64 = 1_073_741_824; // 1 GiB
+    let chunk = FILE_SIZE / (N as u64);
+
+    fn build_ctx(
+        port_id: u16,
+        queue_id: u16,
+        local_port: u16,
+        pool: *mut rte_pktmbuf_pool,
+        mac: [u8; 6],
+        ip: [u8; 4],
+        prefix_len: u8,
+        gateway_ip: [u8; 4],
+        gateway_mac: [u8; 6],
+        start: u64,
+        end_inclusive: u64,
+    ) -> alloc::boxed::Box<WorkerCtx> {
+        let mut ctx = alloc::boxed::Box::new(WorkerCtx {
+            port_id,
+            queue_id,
+            local_port,
+            pool,
+            mac,
+            ip,
+            prefix_len,
+            gateway_ip,
+            gateway_mac,
+            request: [0u8; 384],
+            request_len: 0,
+            bytes_received: AtomicU64::new(0),
+            elapsed_ns: AtomicU64::new(0),
+        });
+        let n = build_range_request(&mut ctx.request, start, end_inclusive);
+        ctx.request_len = n as u16;
+        ctx
     }
+
+    // Each worker starts probing from a well-spread source port so it's
+    // very unlikely all initial ports hash to the same RSS queue. If a
+    // worker's return flow lands on someone else's queue the connect
+    // stalls in SynSent; the worker then retries with local_port+N.
+    let mut ctxs: alloc::vec::Vec<alloc::boxed::Box<WorkerCtx>> = alloc::vec::Vec::new();
+    for i in 0..N as u64 {
+        let start = i * chunk;
+        let end_inclusive = if i == (N as u64) - 1 { FILE_SIZE - 1 } else { start + chunk - 1 };
+        let local_port = 49152 + (i as u16) * 1000;
+        println!("worker {}: queue {} src_port {} bytes {}..{}", i, i, local_port, start, end_inclusive);
+        ctxs.push(build_ctx(
+            port_id,
+            i as u16,
+            local_port,
+            pool.0, mac, ip_bytes, prefix_len, gw_bytes, gw_mac.0,
+            start, end_inclusive,
+        ));
+    }
+
+    let overall_clk = MonoClock::new();
+    println!("spawning {} workers...", N);
+    let mut handles: alloc::vec::Vec<*mut c_void> = alloc::vec::Vec::new();
+    for (i, ctx) in ctxs.iter().enumerate() {
+        let h = unsafe {
+            shim_thread_spawn(
+                worker_thread,
+                (&**ctx as *const WorkerCtx) as *mut c_void,
+                i as c_int,
+            )
+        };
+        handles.push(h);
+    }
+
+    for h in handles {
+        unsafe { shim_thread_join(h) };
+    }
+    let overall_ns = overall_clk.elapsed_ns();
+
+    let mut total_b: u64 = 0;
+    for (i, ctx) in ctxs.iter().enumerate() {
+        let b = ctx.bytes_received.load(Ordering::Relaxed);
+        let e = ctx.elapsed_ns.load(Ordering::Relaxed) as f64 / 1e9;
+        total_b += b;
+        println!(
+            "worker {} (q{}): {} B / {:.3} s  ({:.1} MB/s)",
+            i, i, b, e,
+            (b as f64 / 1e6) / e.max(1e-9)
+        );
+    }
+    let overall_s = overall_ns as f64 / 1e9;
+    let mib = total_b as f64 / (1024.0 * 1024.0);
+    let mbps = total_b as f64 / 1e6 / overall_s.max(1e-9);
+    let gbps = total_b as f64 * 8.0 / 1e9 / overall_s.max(1e-9);
+
+    println!();
+    println!(
+        "AGGREGATE: {:.1} MiB in {:.3} s => {:.1} MB/s, {:.3} Gbps",
+        mib, overall_s, mbps, gbps
+    );
+
+    unsafe { shim_offload_report() };
+    unsafe { shim_dev_stop(port_id) };
     loop {
         core::hint::spin_loop();
     }

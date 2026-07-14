@@ -10,9 +10,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <time.h>
 #include <minidpdk/dev.hh>
 #include <minidpdk/defs.hh>
 #include <minidpdk/net.hh>
+#include <minidpdk/rss.hh>
+#include <osv/sched.hh>
 
 namespace {
 
@@ -119,6 +122,15 @@ int shim_eth_dev_configure(uint16_t port_id, uint16_t nb_rx_q,
   std::memset(&conf, 0, sizeof(conf));
   conf.txmode.offloads = g_tx_offloads;
   conf.rxmode.offloads = g_rx_offloads;
+  // Multi-queue: enable RSS so the NIC spreads incoming TCP flows across
+  // RX queues by hashing the 4-tuple. Without this, all packets land on
+  // queue 0 and only worker 0 sees traffic. Key/reta stay at driver
+  // defaults; workers pick source ports that put their return flow on
+  // their own queue.
+  if (nb_rx_q > 1) {
+    conf.rxmode.mq_mode = RTE_ETH_MQ_RX_RSS;
+    conf.rx_adv_conf.rss_conf.rss_hf = RTE_ETH_RSS_NONFRAG_IPV4_TCP;
+  }
   return rte_eth_dev_configure(port_id, nb_rx_q, nb_tx_q, &conf);
 }
 
@@ -349,6 +361,30 @@ void shim_offload_report(void) {
 
 uint64_t shim_time_seconds(void) {
   return static_cast<uint64_t>(std::time(nullptr));
+}
+
+uint64_t shim_time_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull +
+         static_cast<uint64_t>(ts.tv_nsec);
+}
+
+void *shim_thread_spawn(void (*fn)(void *), void *arg, int cpu_id) {
+  sched::thread::attr attrs;
+  if (cpu_id >= 0 && static_cast<size_t>(cpu_id) < sched::cpus.size()) {
+    attrs.pin(sched::cpus[cpu_id]);
+  }
+  sched::thread *t =
+      sched::thread::make([fn, arg]() { fn(arg); }, attrs);
+  t->start();
+  return static_cast<void *>(t);
+}
+
+void shim_thread_join(void *handle) {
+  sched::thread *t = static_cast<sched::thread *>(handle);
+  t->join();
+  sched::thread::dispose(t);
 }
 
 void *shim_malloc(uint64_t size) {
