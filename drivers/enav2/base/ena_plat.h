@@ -183,15 +183,14 @@ extern int ena_log_level;
   ena_log_unused((dev), level, fmt, ##args)
 #endif
 
-#define ena_trace(ctx, level, fmt, args...)                                    \
-  do {                                                                         \
-    RTE_SET_USED(ctx);                                                         \
-  } while (0)
-
-#define ena_trc_dbg(ctx, format, arg...) ena_trace(ctx, DBG, format, ##arg)
-#define ena_trc_info(ctx, format, arg...) ena_trace(ctx, INFO, format, ##arg)
-#define ena_trc_warn(ctx, format, arg...) ena_trace(ctx, WARN, format, ##arg)
-#define ena_trc_err(ctx, format, arg...) ena_trace(ctx, ERR, format, ##arg)
+/* Only surface WARN + ERR from ena_com. DBG/INFO stay silent so the fast
+ * path (per-packet doorbell trace) doesn't tank throughput. */
+#define ena_trace_print(fmt, args...) do { printf(fmt, ##args); printf("\n"); } while (0)
+#define ena_trc_dbg(ctx, format, arg...) do { (void)(ctx); } while (0)
+#define ena_trc_info(ctx, format, arg...) do { (void)(ctx); } while (0)
+#define ena_trc_warn(ctx, format, arg...) do { (void)(ctx); ena_trace_print("ena[WARN] " format, ##arg); } while (0)
+#define ena_trc_err(ctx, format, arg...) do { (void)(ctx); ena_trace_print("ena[ERR] " format, ##arg); } while (0)
+#define ena_trace(ctx, level, format, arg...) ena_trc_##level(ctx, format, ##arg)
 
 #define ena_log_nm(dev, level, fmt, args...)                                   \
   ena_log((dev), level, "[nm] " fmt, ##args)

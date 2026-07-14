@@ -19,37 +19,7 @@ namespace aws {
 
 #define ena_tag "ena"
 #define ena_d(...)   tprintf_d(ena_tag, __VA_ARGS__)
-#define ena_i(...)   tprintf_i(ena_tag, __VA_ARGS__)
-#define ena_w(...)   tprintf_w(ena_tag, __VA_ARGS__)
 #define ena_e(...)   tprintf_e(ena_tag, __VA_ARGS__)
-
-/* TODO - figure out how and if needed to integrate it - ENA code has it own logic to track statistics
-static void if_getinfo(struct ifnet* ifp, struct if_data* out_data)
-{
-    ena* _ena = (ena*)ifp->if_softc;
-
-    // First - take the ifnet data
-    memcpy(out_data, &ifp->if_data, sizeof(*out_data));
-
-    // then fill the internal statistics we've gathered
-    _ena->fill_stats(out_data);
-}*/
-
-void ena::fill_stats(struct if_data* out_data) const
-{
-    // assert(!out_data->ifi_oerrors && !out_data->ifi_obytes && !out_data->ifi_opackets);
-    /* TODO - figure out how and if needed to integrate it - ENA code has it own logic to track statistics
-    out_data->ifi_ipackets += _rxq[0].stats.rx_packets;
-    out_data->ifi_ibytes   += _rxq[0].stats.rx_bytes;
-    out_data->ifi_iqdrops  += _rxq[0].stats.rx_drops;
-    out_data->ifi_ierrors  += _rxq[0].stats.rx_csum_err;
-    out_data->ifi_opackets += _txq[0].stats.tx_packets;
-    out_data->ifi_obytes   += _txq[0].stats.tx_bytes;
-    out_data->ifi_oerrors  += _txq[0].stats.tx_err + _txq[0].stats.tx_drops;
-
-    out_data->ifi_iwakeup_stats = _rxq[0].stats.rx_wakeup_stats;
-    out_data->ifi_owakeup_stats = _txq[0].stats.tx_wakeup_stats;*/
-}
 
 ena::ena(pci::device &dev)
     : _dev(dev)
@@ -59,8 +29,6 @@ ena::ena(pci::device &dev)
     if (ret || !_adapter) {
        throw std::runtime_error("Failed to attach ena device");
     }
-
-    //TODO _ifn->if_getinfo = if_getinfo;
 }
 
 ena::~ena()

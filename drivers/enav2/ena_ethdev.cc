@@ -387,7 +387,8 @@ static inline void ena_rx_mbuf_prepare(struct ena_ring *rx_ring, rte_mbuf *mbuf,
   }
 
   /* L4 csum is relevant only for TCP/UDP packets */
-  if ((packet_type & (RTE_PTYPE_L4_UDP)) && !ena_rx_ctx->frag) {
+  if ((packet_type & (RTE_PTYPE_L4_UDP | RTE_PTYPE_L4_TCP)) &&
+      !ena_rx_ctx->frag) {
     if (ena_rx_ctx->l4_csum_checked) {
       if (likely(!ena_rx_ctx->l4_csum_err)) {
         ++rx_stats->l4_csum_good;
@@ -438,9 +439,14 @@ static inline void ena_tx_mbuf_prepare(rte_mbuf *mbuf,
         ena_tx_ctx->df = 1;
     }
 
-    if (((mbuf->ol_flags & RTE_MBUF_F_TX_L4_MASK) == RTE_MBUF_F_TX_UDP_CKSUM) &&
+    const uint64_t l4 = mbuf->ol_flags & RTE_MBUF_F_TX_L4_MASK;
+    if (l4 == RTE_MBUF_F_TX_UDP_CKSUM &&
         (queue_offloads & RTE_ETH_TX_OFFLOAD_UDP_CKSUM)) {
       ena_tx_ctx->l4_proto = ENA_ETH_IO_L4_PROTO_UDP;
+      ena_tx_ctx->l4_csum_enable = true;
+    } else if (l4 == RTE_MBUF_F_TX_TCP_CKSUM &&
+               (queue_offloads & RTE_ETH_TX_OFFLOAD_TCP_CKSUM)) {
+      ena_tx_ctx->l4_proto = ENA_ETH_IO_L4_PROTO_TCP;
       ena_tx_ctx->l4_csum_enable = true;
     } else {
       ena_tx_ctx->l4_proto = ENA_ETH_IO_L4_PROTO_UNKNOWN;
@@ -2344,6 +2350,14 @@ int ena_dma_alloc(rte_eth_dev_data *dmadev, bus_size_t size,
     dma->paddr = 0;
     return ENA_COM_NO_MEM;
   }
+
+  /* Match dma_alloc_coherent() semantics on Linux/FreeBSD: hand back
+   * zeroed memory. ena_com's admin CQ polls the phase bit of each entry
+   * and treats a match as a real completion — uninitialised bytes trip
+   * that and the first bogus completion flips the queue to
+   * running_state=false, after which every admin command returns
+   * -ENODEV. */
+  memset(dma->vaddr, 0, size);
 
   dma->paddr = mmu::virt_to_phys(dma->vaddr);
 
