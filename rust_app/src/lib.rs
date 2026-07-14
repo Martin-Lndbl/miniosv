@@ -161,6 +161,7 @@ extern "C" {
 
     fn shim_mbuf_alloc_tx(
         pool: *mut rte_pktmbuf_pool,
+        queue_id: u16,
         out_handle: *mut *mut c_void,
         out_cap: *mut u16,
     ) -> *mut u8;
@@ -186,22 +187,34 @@ impl Drop for PktPool {
 }
 
 /// Configure & start port 0 with `n_queues` RX+TX queues (RSS on the
-/// TCP/IPv4 4-tuple when n_queues > 1). Returns (pool, MAC). AWS gives
-/// the guest exactly one ENA interface so hard-coding port 0 is fine.
-fn probe_and_open(n_queues: u16) -> Option<(PktPool, [u8; 6])> {
+/// TCP/IPv4 4-tuple when n_queues > 1). Returns one mempool per queue
+/// plus the MAC. AWS gives the guest exactly one ENA interface so
+/// hard-coding port 0 is fine.
+///
+/// Per-queue mempools eliminate cross-worker contention on the pool
+/// spinlock, which choked throughput badly at N=8 and made it unstable
+/// at N=4 under the shared-pool design.
+fn probe_and_open(n_queues: u16) -> Option<(Vec<PktPool>, [u8; 6])> {
     const PORT: u16 = 0;
     const DATA_ROOM_SIZE: u16 = 1536;
     const DESC_NUM: u16 = 1024;
-    const POOL_SIZE: u32 = 4096;
     const CACHE: u32 = 64;
+    // Each queue's RX ring pins DESC_NUM-1 mbufs; one ring's worth of
+    // slack covers TX and in-flight app buffers.
+    let per_queue_size: u32 = (DESC_NUM as u32) * 2;
 
-    let raw = unsafe {
-        shim_pktmbuf_pool_create(b"bench-pool\0".as_ptr(), POOL_SIZE, CACHE, 0, DATA_ROOM_SIZE)
-    };
-    if raw.is_null() {
-        return None;
+    let mut pools: Vec<PktPool> = Vec::with_capacity(n_queues as usize);
+    for q in 0..n_queues {
+        let mut name = [0u8; 32];
+        let _ = write!(&mut PoolName(&mut name), "bench-pool-{}\0", q);
+        let raw = unsafe {
+            shim_pktmbuf_pool_create(name.as_ptr(), per_queue_size, CACHE, 0, DATA_ROOM_SIZE)
+        };
+        if raw.is_null() {
+            return None;
+        }
+        pools.push(PktPool(raw));
     }
-    let pool = PktPool(raw);
 
     if unsafe { shim_eth_dev_configure(PORT, n_queues, n_queues) } != 0 {
         return None;
@@ -209,7 +222,7 @@ fn probe_and_open(n_queues: u16) -> Option<(PktPool, [u8; 6])> {
     let (mut rx_desc, mut tx_desc) = (DESC_NUM, DESC_NUM);
     unsafe { shim_adjust_nb_rx_tx_desc(PORT, &mut rx_desc, &mut tx_desc) };
     for q in 0..n_queues {
-        if unsafe { shim_rx_queue_setup(PORT, q, rx_desc, pool.0) } != 0 {
+        if unsafe { shim_rx_queue_setup(PORT, q, rx_desc, pools[q as usize].0) } != 0 {
             return None;
         }
         if unsafe { shim_tx_queue_setup(PORT, q, tx_desc) } != 0 {
@@ -225,7 +238,19 @@ fn probe_and_open(n_queues: u16) -> Option<(PktPool, [u8; 6])> {
         "port 0: MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ({} queues)",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], n_queues
     );
-    Some((pool, mac))
+    Some((pools, mac))
+}
+
+// Tiny helper: format a null-terminated pool name into a fixed buffer
+// without pulling in `alloc::format!`.
+struct PoolName<'a>(&'a mut [u8]);
+impl core::fmt::Write for PoolName<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let n = core::cmp::min(s.len(), self.0.len());
+        self.0[..n].copy_from_slice(&s.as_bytes()[..n]);
+        self.0 = &mut core::mem::take(&mut self.0)[n..];
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -243,6 +268,16 @@ struct DpdkDevice {
     queue_id: u16,
     pool: *mut rte_pktmbuf_pool,
     pending_synth: Option<Vec<u8>>,
+    // Half-open port range [port_slab_start, port_slab_start+port_slab_len)
+    // (modulo 2^16) of dst_ports this iface owns. RSS distributes return
+    // SYN-ACKs and later packets by a hash the guest can't predict, so
+    // some packets destined for a sibling worker's connection land on
+    // this queue instead. If we let smoltcp see them, it demux-misses
+    // and sends a RST — killing the sibling's handshake. Drop them
+    // here silently. `port_slab_len = 0` means "accept all ports"
+    // (used by the DHCP/ARP path in learn_network).
+    port_slab_start: u16,
+    port_slab_len: u16,
 }
 
 enum DpdkRxToken {
@@ -281,7 +316,7 @@ impl<'a> TxToken for DpdkTxToken<'a> {
     fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
         let mut handle: *mut c_void = ptr::null_mut();
         let mut cap: u16 = 0;
-        let data = unsafe { shim_mbuf_alloc_tx(self.dev.pool, &mut handle, &mut cap) };
+        let data = unsafe { shim_mbuf_alloc_tx(self.dev.pool, self.dev.queue_id, &mut handle, &mut cap) };
         if data.is_null() || handle.is_null() {
             // Pool exhausted; smoltcp still wants `f` called — discard.
             let mut scratch = [0u8; MTU];
@@ -304,18 +339,49 @@ impl Device for DpdkDevice {
         if let Some(buf) = self.pending_synth.take() {
             return Some((DpdkRxToken::Synth(buf), DpdkTxToken { dev: self }));
         }
-        let mut handle: *mut c_void = ptr::null_mut();
-        let mut data: *const u8 = ptr::null();
-        let mut len: u16 = 0;
-        let rc =
-            unsafe { shim_mbuf_rx_burst(0, self.queue_id, &mut handle, &mut data, &mut len) };
-        if rc != 1 || handle.is_null() {
-            return None;
+        loop {
+            let mut handle: *mut c_void = ptr::null_mut();
+            let mut data: *const u8 = ptr::null();
+            let mut len: u16 = 0;
+            let rc =
+                unsafe { shim_mbuf_rx_burst(0, self.queue_id, &mut handle, &mut data, &mut len) };
+            if rc != 1 || handle.is_null() {
+                return None;
+            }
+            // Ethernet(14) + IPv4(20 min) + TCP(20 min) = 54; anything
+            // shorter can't be a TCP flow we care about — pass it up.
+            let ok = if (len as usize) < 54 {
+                true
+            } else {
+                let bytes = unsafe { core::slice::from_raw_parts(data, len as usize) };
+                let is_ipv4 = bytes[12] == 0x08 && bytes[13] == 0x00;
+                if !is_ipv4 {
+                    true
+                } else {
+                    let ihl = (bytes[14] & 0x0f) as usize * 4;
+                    let proto = bytes[23];
+                    let l4 = 14 + ihl;
+                    if proto != 6 /* TCP */ || l4 + 4 > len as usize {
+                        true
+                    } else {
+                        let dst_port = ((bytes[l4 + 2] as u16) << 8) | (bytes[l4 + 3] as u16);
+                        // len==0 disables filtering (learn_network path).
+                        // Wrapping-sub handles slabs that straddle 65535.
+                        self.port_slab_len == 0
+                            || dst_port.wrapping_sub(self.port_slab_start) < self.port_slab_len
+                    }
+                }
+            };
+            if ok {
+                return Some((
+                    DpdkRxToken::Mbuf { handle, data, len: len as usize },
+                    DpdkTxToken { dev: self },
+                ));
+            }
+            // Not ours — free the mbuf and pull the next one so we
+            // don't return None (which would break the poll cadence).
+            unsafe { shim_mbuf_free(handle) };
         }
-        Some((
-            DpdkRxToken::Mbuf { handle, data, len: len as usize },
-            DpdkTxToken { dev: self },
-        ))
     }
 
     fn transmit(&mut self, _t: Instant) -> Option<Self::TxToken<'_>> {
@@ -527,7 +593,11 @@ fn conn_step(
     let s = sockets.get_mut::<tcp::Socket>(conn.handle);
     let state = s.state();
     let now_ms = clk.elapsed_ms();
-    if state == tcp::State::SynSent && now_ms - conn.connect_start_ms > 1000 {
+    // Short SYN-timeout: with N queues, only 1/N of return SYN-ACKs
+    // land on our queue, so a failed try means "wrong port hash" not
+    // "network issue". Server RTT is < 1 ms in-region, so 200 ms is
+    // still 100× the round-trip.
+    if state == tcp::State::SynSent && now_ms - conn.connect_start_ms > 200 {
         s.abort();
         if conn.retries_left == 0 {
             conn.done = true;
@@ -634,6 +704,7 @@ const CONNS_PER_WORKER: usize = 24;
 struct WorkerCtx {
     queue_id: u16,
     local_port: u16,
+    port_slab: u16,
     pool: *mut rte_pktmbuf_pool,
     mac: [u8; 6],
     ip: [u8; 4],
@@ -657,6 +728,8 @@ extern "C" fn worker_thread(arg: *mut c_void) {
         queue_id: ctx.queue_id,
         pool: ctx.pool,
         pending_synth: Some(build_arp_reply(ctx.gateway_mac, gw.octets(), ctx.mac, ip.octets())),
+        port_slab_start: ctx.local_port,
+        port_slab_len: ctx.port_slab,
     };
     let config = Config::new(EthernetAddress(ctx.mac).into());
     let mut iface = Interface::new(config, &mut dev, Instant::from_millis(clk.elapsed_ms()));
@@ -703,11 +776,10 @@ extern "C" fn worker_thread(arg: *mut c_void) {
         } else {
             start + per_conn - 1
         };
-        // Give each connection a 512-port sub-slab within the worker's
-        // slab. SYN-timeout retries bump the port by 1, so up to 511
-        // retries stay inside this sub-slab.
-        const PER_CONN_STRIDE: u16 = 8192 / (CONNS_PER_WORKER as u16);
-        let src_port = ctx.local_port.wrapping_add((i as u16) * PER_CONN_STRIDE);
+        // Give each connection a sub-slab within the worker's slab.
+        // SYN-timeout retries bump the port by 1 and stay inside it.
+        let per_conn_stride: u16 = ctx.port_slab / (CONNS_PER_WORKER as u16);
+        let src_port = ctx.local_port.wrapping_add((i as u16) * per_conn_stride);
         {
             let s = sockets.get_mut::<tcp::Socket>(handles[i]);
             if s.connect(iface.context(), (TARGET_IP, TARGET_PORT), src_port).is_err() {
@@ -737,7 +809,6 @@ extern "C" fn worker_thread(arg: *mut c_void) {
             src_port_next: src_port.wrapping_add(1),
             retries_left: 32,
         });
-        println!("q{}[{}]: src_port {} bytes {}..{}", ctx.queue_id, i, src_port, start, end);
     }
 
     let start_ns = clk.elapsed_ns();
@@ -766,7 +837,11 @@ fn learn_network(
     let clk = MonoClock::new();
     // DHCP via smoltcp; scoped so its &mut dev is dropped before raw ARP.
     let (ip, prefix, gw) = {
-        let mut dev = DpdkDevice { queue_id: 0, pool, pending_synth: None };
+        // DHCP / gateway-ARP path: accept every packet (len=0 disables).
+        let mut dev = DpdkDevice {
+            queue_id: 0, pool, pending_synth: None,
+            port_slab_start: 0, port_slab_len: 0,
+        };
         let config = Config::new(EthernetAddress(mac).into());
         let mut iface = Interface::new(config, &mut dev, Instant::from_millis(clk.elapsed_ms()));
 
@@ -783,7 +858,7 @@ fn learn_network(
     unsafe {
         let mut handle: *mut c_void = ptr::null_mut();
         let mut cap: u16 = 0;
-        let data = shim_mbuf_alloc_tx(pool, &mut handle, &mut cap);
+        let data = shim_mbuf_alloc_tx(pool, 0, &mut handle, &mut cap);
         if data.is_null() || handle.is_null() {
             println!("FAIL: no mbuf for ARP");
             return None;
@@ -823,15 +898,15 @@ fn learn_network(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn osv_app_main() {
-    const N: u16 = 2;
+    const N: u16 = 4;
     const FILE_SIZE: u64 = 10 * 1024 * 1024 * 1024; // 10 GiB
 
-    let (pool, mac) = probe_and_open(N).unwrap_or_else(|| {
+    let (pools, mac) = probe_and_open(N).unwrap_or_else(|| {
         println!("FAIL: no usable NIC");
         loop { core::hint::spin_loop(); }
     });
 
-    let (ip, prefix_len, gw, gw_mac) = learn_network(pool.0, mac).unwrap_or_else(|| {
+    let (ip, prefix_len, gw, gw_mac) = learn_network(pools[0].0, mac).unwrap_or_else(|| {
         loop { core::hint::spin_loop(); }
     });
     let ip_bytes = ip.octets();
@@ -844,14 +919,16 @@ pub extern "C" fn osv_app_main() {
     for i in 0..N as u64 {
         let start = i * chunk;
         let end_inclusive = if i == N as u64 - 1 { FILE_SIZE - 1 } else { start + chunk - 1 };
-        // Give each worker a disjoint 8192-port slab from the ephemeral
-        // range so its M connections (and their retries) never collide
-        // with another worker's 4-tuples.
-        let local_port = 49152 + (i as u16) * 8192;
+        // Split the ephemeral range 49152..65536 into N disjoint slabs
+        // so each worker's M connections (and their retries) can never
+        // collide with another worker's 4-tuples.
+        let port_slab: u16 = 16384 / N;
+        let local_port = 49152 + (i as u16) * port_slab;
         let ctx = Box::new(WorkerCtx {
             queue_id: i as u16,
             local_port,
-            pool: pool.0,
+            port_slab,
+            pool: pools[i as usize].0,
             mac,
             ip: ip_bytes,
             prefix_len,
@@ -862,7 +939,6 @@ pub extern "C" fn osv_app_main() {
             bytes_received: AtomicU64::new(0),
             elapsed_ns: AtomicU64::new(0),
         });
-        println!("worker {}: queue {} src_port {} bytes {}..{}", i, i, local_port, start, end_inclusive);
         ctxs.push(ctx);
     }
 

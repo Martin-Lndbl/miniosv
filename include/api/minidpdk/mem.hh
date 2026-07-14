@@ -5,6 +5,7 @@
 #include <minidpdk/time.hh>
 #include <minidpdk/util.hh>
 #include <cassert>
+#include <cerrno>
 #include <cstdint>
 #include <osv/types.h>
 
@@ -168,8 +169,16 @@ inline void rte_pktmbuf_free_helper(rte_mbuf *buf) {
 inline void rte_pktmbuf_free(rte_mbuf *m) { rte_pktmbuf_free_helper(m); }
 inline void rte_mbuf_raw_free(rte_mbuf *m) { rte_pktmbuf_free_helper(m); }
 inline int rte_pktmbuf_alloc_bulk(rte_mempool *pool, rte_mbuf **pkts, uint16_t size) {
+  // mem_pool::alloc_bulk is all-or-nothing: it returns `size` on success
+  // and 0 when the pool has fewer than `size` free mbufs (in which case
+  // `pkts` is left untouched — full of stale pointers from the caller's
+  // last successful bulk-alloc). If we don't surface that as an error,
+  // the ENA driver's rx_refill silently reuses stale mbufs — which are
+  // still installed in another descriptor or held by the app — and
+  // hands the same DMA buffer to two consumers. That corrupts random
+  // in-flight packets. Match real DPDK: return -ENOENT on shortfall.
   int ret = pool->alloc_bulk(reinterpret_cast<void **>(pkts), size);
-  if (ret < 0) return ret;
+  if (ret != size) return -ENOENT;
   if (pool->init_fn) pool->init_fn(pkts, size, pool->priv);
   return 0;
 }

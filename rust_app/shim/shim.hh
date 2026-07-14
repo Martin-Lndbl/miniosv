@@ -37,9 +37,11 @@ void shim_macaddr_get(uint16_t port_id, uint8_t *addr_bytes);
 // Zero-copy TX: allocate an mbuf from `pool`, expose its data area for
 // direct write, return the mbuf handle. On success *out_handle is set
 // and the returned pointer is the writable start; *out_cap is the max
-// bytes that can be written. Caller must eventually shim_mbuf_tx() or
+// bytes that can be written. `queue_id` is used only for per-queue
+// alloc-fail stats. Caller must eventually shim_mbuf_tx() or
 // shim_mbuf_free() the handle.
-uint8_t *shim_mbuf_alloc_tx(void *pool, void **out_handle, uint16_t *out_cap);
+uint8_t *shim_mbuf_alloc_tx(void *pool, uint16_t queue_id, void **out_handle,
+                             uint16_t *out_cap);
 
 // Enqueue a previously-allocated mbuf. Returns 0 on success (mbuf
 // consumed by the NIC), -1 on tx failure (mbuf is freed).

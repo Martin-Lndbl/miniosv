@@ -169,7 +169,9 @@ static void ena_tx_offload_prepare(rte_mbuf *m, uint8_t *buf, uint16_t len) {
   }
 }
 
-uint8_t *shim_mbuf_alloc_tx(void *pool, void **out_handle, uint16_t *out_cap) {
+uint8_t *shim_mbuf_alloc_tx(void *pool, uint16_t queue_id, void **out_handle,
+                             uint16_t *out_cap) {
+  (void)queue_id;
   rte_mbuf *m = rte_pktmbuf_alloc(static_cast<rte_mempool *>(pool));
   if (m == nullptr) {
     *out_handle = nullptr;
