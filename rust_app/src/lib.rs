@@ -490,142 +490,145 @@ fn make_client_config() -> Arc<ClientConfig> {
 // Sized to hold pipelined records without reallocating during the download.
 const TLS_BUF_CAP: usize = 256 * 1024;
 
-fn https_get(
+// Per-connection state driven by one shared iface.poll loop. Each
+// connection carries its own TLS session, its own preformatted GET (with
+// its own Range: header), and its own byte-tally. The main loop rotates
+// through all `Conn`s each iteration until every one hits FIN.
+struct Conn {
+    handle: smoltcp::iface::SocketHandle,
+    tls: UnbufferedClientConnection,
+    tls_cfg: Arc<ClientConfig>,
+    tls_server_name: ServerName<'static>,
+    incoming: Vec<u8>,
+    outgoing: Vec<u8>,
+    request: Vec<u8>,
+    request_queued: bool,
+    handshake_done: bool,
+    bytes_received: usize,
+    done: bool,
+    connect_start_ms: i64,
+    // Reconnect scratch — when the SYN never gets ACKed the return
+    // flow hashed to another worker's RSS queue. Bump the source port
+    // and try again until the mapping happens to land on our queue.
+    src_port_next: u16,
+    retries_left: u8,
+}
+
+// Drive one connection forward by one step (RX drain, TX push, TLS state
+// machine). Returns `true` if the connection has terminated for any
+// reason (clean FIN, SYN timeout, TLS error).
+fn conn_step(
+    conn: &mut Conn,
     iface: &mut Interface,
-    dev: &mut DpdkDevice,
     sockets: &mut SocketSet<'_>,
-    tcp_handle: smoltcp::iface::SocketHandle,
     clk: &MonoClock,
-    local_port: u16,
-    request: &[u8],
-) -> (usize, u64) {
-    {
-        let s = sockets.get_mut::<tcp::Socket>(tcp_handle);
-        if s.connect(iface.context(), (TARGET_IP, TARGET_PORT), local_port).is_err() {
-            println!("FAIL: tcp connect() rejected");
-            return (0, 0);
+) -> bool {
+    if conn.done { return true; }
+    let s = sockets.get_mut::<tcp::Socket>(conn.handle);
+    let state = s.state();
+    let now_ms = clk.elapsed_ms();
+    if state == tcp::State::SynSent && now_ms - conn.connect_start_ms > 1000 {
+        s.abort();
+        if conn.retries_left == 0 {
+            conn.done = true;
+            return true;
+        }
+        conn.retries_left -= 1;
+        let port = conn.src_port_next;
+        conn.src_port_next = conn.src_port_next.wrapping_add(1);
+        conn.incoming.clear();
+        conn.outgoing.clear();
+        conn.request_queued = false;
+        conn.handshake_done = false;
+        conn.connect_start_ms = now_ms;
+        conn.bytes_received = 0;
+        conn.tls = match UnbufferedClientConnection::new(
+            conn.tls_cfg.clone(),
+            conn.tls_server_name.clone(),
+        ) {
+            Ok(c) => c,
+            Err(_) => { conn.done = true; return true; }
+        };
+        // The socket needs a fresh poll cycle before it will accept a
+        // new connect(); calling it here works after abort().
+        let _ = s.connect(iface.context(), (TARGET_IP, TARGET_PORT), port);
+        return false;
+    }
+    if !conn.outgoing.is_empty() && s.can_send() {
+        if let Ok(n) = s.send_slice(&conn.outgoing) {
+            if n > 0 { conn.outgoing.drain(..n); }
         }
     }
+    if s.can_recv() {
+        let _ = s.recv(|buf| { conn.incoming.extend_from_slice(buf); (buf.len(), ()) });
+    }
 
-    let server_name = match ServerName::try_from(TARGET_SNI) {
-        Ok(n) => n.to_owned(),
-        Err(_) => { println!("FAIL: invalid ServerName"); return (0, 0); }
-    };
-    let mut conn = match UnbufferedClientConnection::new(make_client_config(), server_name) {
-        Ok(c) => c,
-        Err(e) => { println!("FAIL: rustls new: {:?}", e); return (0, 0); }
-    };
-
-    let mut incoming: Vec<u8> = Vec::with_capacity(TLS_BUF_CAP);
-    let mut outgoing: Vec<u8> = Vec::with_capacity(TLS_BUF_CAP);
-    let mut request_queued = false;
-    let mut handshake_done = false;
-    let mut bytes_received: usize = 0;
-    let mut iter: u64 = 0;
-    let mut last_tcp_state = tcp::State::Closed;
-    let mut t_request_sent_ns: u64 = 0;
-    let connect_start_ms = clk.elapsed_ms();
-
-    loop {
-        let now_ms = clk.elapsed_ms();
-        iface.poll(Instant::from_millis(now_ms), dev, sockets);
-        let s = sockets.get_mut::<tcp::Socket>(tcp_handle);
-
-        let state = s.state();
-        if state != last_tcp_state {
-            println!("q{} tcp: {:?}", dev.queue_id, state);
-            last_tcp_state = state;
-        }
-        // SYN never got ACKed => return-flow hashed to another worker's
-        // queue; bail so the caller can retry with a bumped src_port.
-        if state == tcp::State::SynSent && now_ms - connect_start_ms > 3000 {
-            s.abort();
-            return (0, 0);
-        }
-
-        if !outgoing.is_empty() && s.can_send() {
-            if let Ok(n) = s.send_slice(&outgoing) {
-                if n > 0 { outgoing.drain(..n); }
+    let mut progress = true;
+    while progress {
+        progress = false;
+        let UnbufferedStatus { discard, state: tls_state } =
+            conn.tls.process_tls_records(&mut conn.incoming);
+        let st = match tls_state {
+            Ok(st) => st,
+            Err(e) => { println!("FAIL: tls: {:?}", e); conn.done = true; break; }
+        };
+        match st {
+            ConnectionState::ReadTraffic(mut rt) => {
+                while let Some(rec) = rt.next_record() {
+                    match rec {
+                        Ok(rec) => conn.bytes_received += rec.payload.len(),
+                        Err(e) => { println!("FAIL: tls record: {:?}", e); conn.done = true; break; }
+                    }
+                }
+                progress = true;
             }
-        }
-        if s.can_recv() {
-            let _ = s.recv(|buf| { incoming.extend_from_slice(buf); (buf.len(), ()) });
-        }
-
-        let mut progress = true;
-        while progress {
-            progress = false;
-            let UnbufferedStatus { discard, state } = conn.process_tls_records(&mut incoming);
-            let st = match state {
-                Ok(st) => st,
-                Err(e) => { println!("FAIL: tls: {:?}", e); return (bytes_received, 0); }
-            };
-            match st {
-                ConnectionState::ReadTraffic(mut rt) => {
-                    while let Some(rec) = rt.next_record() {
-                        match rec {
-                            Ok(rec) => bytes_received += rec.payload.len(),
-                            Err(e) => { println!("FAIL: tls record: {:?}", e); return (bytes_received, 0); }
+            ConnectionState::EncodeTlsData(mut et) => {
+                let head = conn.outgoing.len();
+                conn.outgoing.resize(TLS_BUF_CAP, 0);
+                match et.encode(&mut conn.outgoing[head..]) {
+                    Ok(n) => { conn.outgoing.truncate(head + n); progress = true; }
+                    Err(e) => { println!("FAIL: tls encode: {:?}", e); conn.done = true; break; }
+                }
+            }
+            ConnectionState::TransmitTlsData(tt) => { tt.done(); progress = true; }
+            ConnectionState::WriteTraffic(mut wt) => {
+                conn.handshake_done = true;
+                if !conn.request_queued {
+                    let head = conn.outgoing.len();
+                    conn.outgoing.resize(head + conn.request.len() + 128, 0);
+                    match wt.encrypt(&conn.request, &mut conn.outgoing[head..]) {
+                        Ok(n) => {
+                            conn.outgoing.truncate(head + n);
+                            conn.request_queued = true;
+                            progress = true;
                         }
-                    }
-                    progress = true;
-                }
-                ConnectionState::EncodeTlsData(mut et) => {
-                    let head = outgoing.len();
-                    outgoing.resize(TLS_BUF_CAP, 0);
-                    let n = match et.encode(&mut outgoing[head..]) {
-                        Ok(n) => n,
-                        Err(e) => { println!("FAIL: tls encode: {:?}", e); return (bytes_received, 0); }
-                    };
-                    outgoing.truncate(head + n);
-                    progress = true;
-                }
-                ConnectionState::TransmitTlsData(tt) => { tt.done(); progress = true; }
-                ConnectionState::WriteTraffic(mut wt) => {
-                    if !handshake_done {
-                        handshake_done = true;
-                    }
-                    if !request_queued {
-                        let head = outgoing.len();
-                        outgoing.resize(head + request.len() + 128, 0);
-                        let n = match wt.encrypt(request, &mut outgoing[head..]) {
-                            Ok(n) => n,
-                            Err(e) => { println!("FAIL: tls encrypt: {:?}", e); return (bytes_received, 0); }
-                        };
-                        outgoing.truncate(head + n);
-                        request_queued = true;
-                        t_request_sent_ns = clk.elapsed_ns();
-                        progress = true;
+                        Err(e) => { println!("FAIL: tls encrypt: {:?}", e); conn.done = true; break; }
                     }
                 }
-                _ => {}
             }
-            incoming.drain(..discard);
+            _ => {}
         }
-
-        // `is_active()` stays true in CloseWait so we can't rely on it.
-        let ended = matches!(
-            state,
-            tcp::State::Closed | tcp::State::CloseWait | tcp::State::TimeWait
-        );
-        if handshake_done && request_queued && ended && outgoing.is_empty() {
-            let elapsed_ns = clk.elapsed_ns().saturating_sub(t_request_sent_ns);
-            return (bytes_received, elapsed_ns);
-        }
-
-        iter = iter.wrapping_add(1);
-        if iter > ITER_BUDGET {
-            println!("q{} TIMEOUT after {} ms ({} bytes)", dev.queue_id, now_ms, bytes_received);
-            return (bytes_received, clk.elapsed_ns().saturating_sub(t_request_sent_ns));
-        }
+        conn.incoming.drain(..discard);
     }
+
+    let ended = matches!(
+        state,
+        tcp::State::Closed | tcp::State::CloseWait | tcp::State::TimeWait
+    );
+    if conn.handshake_done && conn.request_queued && ended && conn.outgoing.is_empty() {
+        conn.done = true;
+    }
+    conn.done
 }
 
 // ---------------------------------------------------------------------------
-// Worker thread. Each worker owns one RSS queue, does its own iface, and
-// retries with bumped src_port when its return flow lands on another
-// queue.
+// Worker thread. Each worker owns one RSS queue and drives M parallel
+// TLS connections through one iface.poll() loop; each connection fetches
+// a disjoint byte range so the concurrent GETs together cover the
+// worker's slice of the file.
 // ---------------------------------------------------------------------------
+
+const CONNS_PER_WORKER: usize = 16;
 
 #[repr(C)]
 struct WorkerCtx {
@@ -637,8 +640,8 @@ struct WorkerCtx {
     prefix_len: u8,
     gateway_ip: [u8; 4],
     gateway_mac: [u8; 6],
-    request: [u8; 384],
-    request_len: u16,
+    range_start: u64,
+    range_end_inclusive: u64,
     bytes_received: AtomicU64,
     elapsed_ns: AtomicU64,
 }
@@ -653,8 +656,6 @@ extern "C" fn worker_thread(arg: *mut c_void) {
     let mut dev = DpdkDevice {
         queue_id: ctx.queue_id,
         pool: ctx.pool,
-        // Seed the neighbor cache with the gateway MAC — a real ARP
-        // exchange from this queue would misroute the reply to queue 0.
         pending_synth: Some(build_arp_reply(ctx.gateway_mac, gw.octets(), ctx.mac, ip.octets())),
     };
     let config = Config::new(EthernetAddress(ctx.mac).into());
@@ -662,31 +663,96 @@ extern "C" fn worker_thread(arg: *mut c_void) {
     iface.update_ip_addrs(|addrs| { let _ = addrs.push(IpCidr::new(ip.into(), ctx.prefix_len)); });
     let _ = iface.routes_mut().add_default_ipv4_route(gw);
 
-    let mut tcp_rx: Vec<u8> = alloc::vec![0u8; 4 * 1024 * 1024];
-    let mut tcp_tx: Vec<u8> = alloc::vec![0u8; 16 * 1024];
-
-    let mut src_port = ctx.local_port;
-    let mut bytes: usize = 0;
-    let mut elapsed_ns: u64 = 0;
-    for _ in 0..32u32 {
-        let tcp_sock = tcp::Socket::new(
-            tcp::SocketBuffer::new(&mut tcp_rx[..]),
-            tcp::SocketBuffer::new(&mut tcp_tx[..]),
-        );
-        let mut storage = [SocketStorage::EMPTY];
-        let mut sockets = SocketSet::new(&mut storage[..]);
-        let tcp_handle = sockets.add(tcp_sock);
-        let (b, e) = https_get(
-            &mut iface, &mut dev, &mut sockets, tcp_handle, &clk,
-            src_port, &ctx.request[..ctx.request_len as usize],
-        );
-        if b > 0 { bytes = b; elapsed_ns = e; break; }
-        println!("q{} src_port {} misrouted, retrying", ctx.queue_id, src_port);
-        src_port = src_port.wrapping_add(1);
+    // One SocketSet holding M TCP sockets. Buffers are leaked so their
+    // 'static lifetime satisfies SocketSet's borrow.
+    let mut storage: Vec<SocketStorage<'static>> =
+        (0..CONNS_PER_WORKER).map(|_| SocketStorage::EMPTY).collect();
+    let mut sockets: SocketSet<'static> = SocketSet::new(unsafe {
+        // extend storage's lifetime to 'static — it lives for the rest
+        // of this thread and workers never return
+        core::mem::transmute::<&mut [SocketStorage<'_>], &mut [SocketStorage<'static>]>(
+            &mut storage[..]
+        )
+    });
+    let mut handles: Vec<smoltcp::iface::SocketHandle> = Vec::with_capacity(CONNS_PER_WORKER);
+    for _ in 0..CONNS_PER_WORKER {
+        let rx: &'static mut [u8] =
+            Box::leak(alloc::vec![0u8; 4 * 1024 * 1024].into_boxed_slice());
+        let tx: &'static mut [u8] =
+            Box::leak(alloc::vec![0u8; 64 * 1024].into_boxed_slice());
+        let mut sock = tcp::Socket::new(tcp::SocketBuffer::new(rx), tcp::SocketBuffer::new(tx));
+        sock.set_ack_delay(None);
+        handles.push(sockets.add(sock));
     }
-    ctx.bytes_received.store(bytes as u64, Ordering::Relaxed);
+
+    let cfg = make_client_config();
+    let server_name = match ServerName::try_from(TARGET_SNI) {
+        Ok(n) => n.to_owned(),
+        Err(_) => { println!("FAIL: invalid ServerName"); return; }
+    };
+
+    // Split the worker's byte range across M connections.
+    let span = ctx.range_end_inclusive - ctx.range_start + 1;
+    let per_conn = span / (CONNS_PER_WORKER as u64);
+
+    let mut conns: Vec<Conn> = Vec::with_capacity(CONNS_PER_WORKER);
+    for i in 0..CONNS_PER_WORKER {
+        let start = ctx.range_start + (i as u64) * per_conn;
+        let end = if i == CONNS_PER_WORKER - 1 {
+            ctx.range_end_inclusive
+        } else {
+            start + per_conn - 1
+        };
+        let src_port = ctx.local_port.wrapping_add((i as u16) * 100);
+        {
+            let s = sockets.get_mut::<tcp::Socket>(handles[i]);
+            if s.connect(iface.context(), (TARGET_IP, TARGET_PORT), src_port).is_err() {
+                println!("q{}[{}] connect() rejected", ctx.queue_id, i);
+                continue;
+            }
+        }
+        let mut request_buf = [0u8; 384];
+        let n = build_range_request(&mut request_buf, start, end);
+        let tls = match UnbufferedClientConnection::new(cfg.clone(), server_name.clone()) {
+            Ok(c) => c,
+            Err(e) => { println!("FAIL: rustls new: {:?}", e); return; }
+        };
+        conns.push(Conn {
+            handle: handles[i],
+            tls,
+            tls_cfg: cfg.clone(),
+            tls_server_name: server_name.clone(),
+            incoming: Vec::with_capacity(TLS_BUF_CAP),
+            outgoing: Vec::with_capacity(TLS_BUF_CAP),
+            request: request_buf[..n].to_vec(),
+            request_queued: false,
+            handshake_done: false,
+            bytes_received: 0,
+            done: false,
+            connect_start_ms: clk.elapsed_ms(),
+            src_port_next: src_port.wrapping_add(1),
+            retries_left: 32,
+        });
+        println!("q{}[{}]: src_port {} bytes {}..{}", ctx.queue_id, i, src_port, start, end);
+    }
+
+    let start_ns = clk.elapsed_ns();
+    loop {
+        let now_ms = clk.elapsed_ms();
+        iface.poll(Instant::from_millis(now_ms), &mut dev, &mut sockets);
+        let mut all_done = true;
+        for c in conns.iter_mut() {
+            let d = conn_step(c, &mut iface, &mut sockets, &clk);
+            if !d { all_done = false; }
+        }
+        if all_done { break; }
+    }
+    let elapsed_ns = clk.elapsed_ns().saturating_sub(start_ns);
+    let total: usize = conns.iter().map(|c| c.bytes_received).sum();
+    ctx.bytes_received.store(total as u64, Ordering::Relaxed);
     ctx.elapsed_ns.store(elapsed_ns, Ordering::Relaxed);
 }
+
 
 /// DHCP + gateway ARP on port 0 / queue 0. Workers inherit (ip, prefix, gw, gw_mac).
 fn learn_network(
@@ -753,7 +819,7 @@ fn learn_network(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn osv_app_main() {
-    const N: u16 = 2;
+    const N: u16 = 1;
     const FILE_SIZE: u64 = 1_073_741_824; // 1 GiB
 
     let (pool, mac) = probe_and_open(N).unwrap_or_else(|| {
@@ -777,7 +843,7 @@ pub extern "C" fn osv_app_main() {
         // Spread initial src_ports so it's unlikely they all hash to the
         // same RSS queue; workers retry with local_port+1 on SYN timeout.
         let local_port = 49152 + (i as u16) * 1000;
-        let mut ctx = Box::new(WorkerCtx {
+        let ctx = Box::new(WorkerCtx {
             queue_id: i as u16,
             local_port,
             pool: pool.0,
@@ -786,12 +852,11 @@ pub extern "C" fn osv_app_main() {
             prefix_len,
             gateway_ip: gw_bytes,
             gateway_mac: gw_mac.0,
-            request: [0u8; 384],
-            request_len: 0,
+            range_start: start,
+            range_end_inclusive: end_inclusive,
             bytes_received: AtomicU64::new(0),
             elapsed_ns: AtomicU64::new(0),
         });
-        ctx.request_len = build_range_request(&mut ctx.request, start, end_inclusive) as u16;
         println!("worker {}: queue {} src_port {} bytes {}..{}", i, i, local_port, start, end_inclusive);
         ctxs.push(ctx);
     }
