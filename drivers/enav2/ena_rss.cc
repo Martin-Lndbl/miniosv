@@ -461,11 +461,14 @@ int ena_rss_configure(struct ena_adapter *adapter) {
   if (adapter->edev->data.nb_rx_queues == 0)
     return 0;
 
-  /* Restart the indirection table. The number of queues could change
-   * between start/stop calls, so it must be reinitialized with default
-   * values.
+  /* Fill exactly what the device advertises. convert_to_device iterates
+   * 1<<tbl_log_size and rejects any tail left as qid=0 (a TX queue).
+   * c8i.16xlarge advertises log_size=8 (256 entries); smaller instances
+   * typically 7 -- the old ENA_RX_RSS_TABLE_SIZE (128) constant only
+   * covered the latter.
    */
-  rc = ena_fill_indirect_table_default(ena_dev, ENA_RX_RSS_TABLE_SIZE,
+  size_t tbl_size = (size_t)1 << ena_dev->rss.tbl_log_size;
+  rc = ena_fill_indirect_table_default(ena_dev, tbl_size,
                                        adapter->edev->data.nb_rx_queues);
   if (unlikely(rc != 0)) {
     ena_log_raw(ERR, "Failed to fill indirection table with default values");
