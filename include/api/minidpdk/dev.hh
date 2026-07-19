@@ -232,6 +232,21 @@ __inline int rte_eth_dev_configure(uint16_t port, uint16_t nrx, uint16_t ntx,
 }
 
 __inline int rte_eth_dev_adjust_nb_rx_tx_desc(uint16_t port, uint16_t *nb_rxd, uint16_t* nb_txd){
+    // Clamp to what the device advertises before rounding to a power of 2.
+    // c5.large's ENA takes 1024; c7i.large's caps at 512 and rx_queue_setup
+    // would reject the app's over-large request without this.
+    auto *dev = eth_os::get_eth_for_port(port);
+    if (dev) {
+        rte_eth_dev_info info;
+        std::memset(&info, 0, sizeof(info));
+        dev->get_dev_info(&info);
+        if (info.rx_desc_lim.nb_max && *nb_rxd > info.rx_desc_lim.nb_max) {
+            *nb_rxd = info.rx_desc_lim.nb_max;
+        }
+        if (info.tx_desc_lim.nb_max && *nb_txd > info.tx_desc_lim.nb_max) {
+            *nb_txd = info.tx_desc_lim.nb_max;
+        }
+    }
     *nb_rxd = rte_align32prevpow2(*nb_rxd);
     *nb_txd = rte_align32prevpow2(*nb_txd);
     return 0;
