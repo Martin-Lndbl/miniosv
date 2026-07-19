@@ -46,6 +46,10 @@ namespace pci {
             }
         }
 
+        // read_bar_size() disables MEM/IO decode during sizing and doesn't
+        // re-enable it. Turn it back on so BAR MMIO reads actually work.
+        function::enable_bars_decode(true, true);
+
         return true;
     }
 

@@ -7,6 +7,8 @@
 
 #include <osv/drivers_config.h>
 
+#include <bitset>
+
 #include <osv/debug.hh>
 #include <osv/pci.hh>
 
@@ -19,6 +21,11 @@
 extern bool opt_pci_disabled;
 
 namespace pci {
+
+// Dedup for check_bus(): the top-level 0..255 loop and bridge recursion
+// both cover the same buses on some topologies. Without this, each device
+// gets registered N times and every driver probe runs N times per BDF.
+static std::bitset<256> g_visited_buses;
 
 void pci_device_print(u8 bus, u8 slot, u8 func)
 {
@@ -65,6 +72,11 @@ void pci_devices_print()
 
 bool check_bus(u16 bus)
 {
+    if (g_visited_buses.test(bus)) {
+        return false;
+    }
+    g_visited_buses.set(bus);
+
     bool found = false;
     u16 slot, func;
     for (slot = 0; slot < 32; slot++) {
@@ -118,9 +130,11 @@ bool check_bus(u16 bus)
 
 void pci_device_enumeration()
 {
+    // Walk every bus, not just up to the first non-empty one: AWS Nitro
+    // Gen 5 exposes the ENA VF on a root bus (e.g. 24-27) with no visible
+    // parent bridge on bus 0. check_bus() dedups via g_visited_buses.
     for (u16 bus = 0; bus < 256; bus++) {
-        if (check_bus(bus))
-            break;
+        check_bus(bus);
     }
 }
 
