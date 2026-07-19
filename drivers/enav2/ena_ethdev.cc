@@ -1130,6 +1130,12 @@ static int ena_device_init(struct ena_adapter *adapter, pci::device *pdev,
    */
   ena_com_set_admin_polling_mode(ena_dev, true);
 
+  /* AWS Nitro Gen 5 (c7i.large) doesn't deliver the ENA VF's MSI-X
+   * through the bridge chain even with bus-master everywhere. Auto-poll
+   * fallback keeps the admin queue alive after the resulting timeout
+   * instead of marking it dead. */
+  ena_com_set_admin_auto_polling_mode(ena_dev, true);
+
   ena_config_host_info(ena_dev);
 
   /* Get Device Attributes and features */
