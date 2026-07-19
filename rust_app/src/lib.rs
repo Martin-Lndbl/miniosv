@@ -582,6 +582,11 @@ fn make_client_config() -> Arc<ClientConfig> {
 // Sized to hold pipelined records without reallocating during the download.
 const TLS_BUF_CAP: usize = 256 * 1024;
 
+// Bench knob: once the handshake has completed and the GET is on the
+// wire, discard every incoming byte without touching the rustls record
+// layer. Isolates ENA + minidpdk + smoltcp cost from crypto cost.
+const STUB_TLS_AFTER_HANDSHAKE: bool = true;
+
 // Per-connection state driven by one shared iface.poll loop. Each
 // connection carries its own TLS session, its own preformatted GET (with
 // its own Range: header), and its own byte-tally. The main loop rotates
@@ -657,6 +662,11 @@ fn conn_step(
     }
     if s.can_recv() {
         let _ = s.recv(|buf| { conn.incoming.extend_from_slice(buf); (buf.len(), ()) });
+    }
+
+    if STUB_TLS_AFTER_HANDSHAKE && conn.handshake_done && conn.request_queued {
+        conn.bytes_received += conn.incoming.len();
+        conn.incoming.clear();
     }
 
     let mut progress = true;
@@ -934,7 +944,7 @@ fn learn_network(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn osv_app_main() {
-    const N: u16 = 1;
+    const N: u16 = 8;
     const FILE_SIZE: u64 = 10 * 1024 * 1024 * 1024; // 10 GiB
 
     let (pools, mac) = probe_and_open(N).unwrap_or_else(|| {
