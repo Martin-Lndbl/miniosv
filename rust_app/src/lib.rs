@@ -132,6 +132,8 @@ pub struct rte_pktmbuf_pool {
 }
 
 extern "C" {
+    fn shim_get_dev_info(port_id: u16, max_rx_queues: *mut u16,
+                         max_tx_queues: *mut u16) -> c_int;
     fn shim_pktmbuf_pool_create(
         name: *const u8,
         n: u32,
@@ -944,10 +946,23 @@ fn learn_network(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn osv_app_main() {
-    const N: u16 = 8;
+    const N_REQ: u16 = 32;
     const FILE_SIZE: u64 = 10 * 1024 * 1024 * 1024; // 10 GiB
 
-    let (pools, mac) = probe_and_open(N).unwrap_or_else(|| {
+    // Clamp to what the device advertises. ENA VFs cap io-queue count
+    // per instance size; rx_queue_setup for qid >= max is a hard reject.
+    let mut max_rx: u16 = 0;
+    let mut max_tx: u16 = 0;
+    unsafe { shim_get_dev_info(0, &mut max_rx, &mut max_tx) };
+    let dev_max = core::cmp::min(max_rx, max_tx);
+    let n = if dev_max == 0 { N_REQ } else { core::cmp::min(N_REQ, dev_max) };
+    if n != N_REQ {
+        println!("clamping workers {} -> {} (device max)", N_REQ, n);
+    }
+    let n_queues: u16 = n;
+    let n_workers: u64 = n as u64;
+
+    let (pools, mac) = probe_and_open(n_queues).unwrap_or_else(|| {
         println!("FAIL: no usable NIC");
         loop { core::hint::spin_loop(); }
     });
@@ -958,17 +973,17 @@ pub extern "C" fn osv_app_main() {
     let ip_bytes = ip.octets();
     let gw_bytes = gw.octets();
 
-    // Split the file across N workers via HTTP Range so total bytes =
-    // FILE_SIZE (not N * FILE_SIZE).
-    let chunk = FILE_SIZE / (N as u64);
+    // Split the file across n_workers via HTTP Range so total bytes =
+    // FILE_SIZE (not n_workers * FILE_SIZE).
+    let chunk = FILE_SIZE / n_workers;
     let mut ctxs: Vec<Box<WorkerCtx>> = Vec::new();
-    for i in 0..N as u64 {
+    for i in 0..n_workers {
         let start = i * chunk;
-        let end_inclusive = if i == N as u64 - 1 { FILE_SIZE - 1 } else { start + chunk - 1 };
-        // Split the ephemeral range 49152..65536 into N disjoint slabs
+        let end_inclusive = if i == n_workers - 1 { FILE_SIZE - 1 } else { start + chunk - 1 };
+        // Split the ephemeral range 49152..65536 into n_workers disjoint slabs
         // so each worker's M connections (and their retries) can never
         // collide with another worker's 4-tuples.
-        let port_slab: u16 = 16384 / N;
+        let port_slab: u16 = 16384 / n_queues;
         let local_port = 49152 + (i as u16) * port_slab;
         let ctx = Box::new(WorkerCtx {
             queue_id: i as u16,
