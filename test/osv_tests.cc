@@ -9,6 +9,9 @@
  *                  supposed to support and checks each behaves (conformance).
  *   - os-libc:     covers the plain C libc surface (string/stdlib/stdio/math,
  *                  qsort, setjmp, errno, calendar time) (conformance).
+ *   - os-backtrace: takes stack backtraces from interrupt context while the
+ *                  interrupted CPU is inside the unwinder or the allocator, to
+ *                  prove the .eh_frame unwinder is interrupt-safe.
  *   - os-stress:   hammers threads, the allocator, TLS, synchronization, files
  *                  and IPC concurrently to shake out races (stress).
  *
@@ -24,6 +27,7 @@ int os_libc_main();
 int os_stress_main();
 int os_iostream_main();
 int os_memmove_main();
+int os_backtrace_main();
 
 extern "C" void osv_app_main()
 {
@@ -37,6 +41,8 @@ extern "C" void osv_app_main()
     rc |= os_iostream_main();
     printf("\n");
     rc |= os_memmove_main();
+    printf("\n");
+    rc |= os_backtrace_main();
     printf("\n");
     rc |= os_stress_main();
 

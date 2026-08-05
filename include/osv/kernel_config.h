@@ -23,8 +23,16 @@
 #ifndef CONF_fs_max_file_descriptors
 #define CONF_fs_max_file_descriptors 0x4000
 #endif
+// x64 interrupts run on this per-thread stack (arch_thread::interrupt_stack).
+// 4 KiB was enough while backtraces were a frame-pointer walk, but the
+// .eh_frame unwinder needs ~4.5 KiB for its cursor and register state alone,
+// and the tracepoint backtrace, alloctracker and a panic raised inside a
+// handler all unwind from interrupt context. The interrupt stack is embedded
+// in sched::thread, so overrunning it corrupts the thread structure rather
+// than faulting - test/os-backtrace.cc measures the footprint and fails if it
+// stops fitting here.
 #ifndef CONF_interrupt_stack_size
-#define CONF_interrupt_stack_size 0x1000
+#define CONF_interrupt_stack_size 0x4000
 #endif
 #ifndef CONF_lazy_stack
 #define CONF_lazy_stack 0

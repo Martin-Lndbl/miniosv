@@ -79,7 +79,11 @@ static void print_backtrace(void)
 
     debug_ll("\n[backtrace]\n");
 
-    len = backtrace_safe(addrs, cfas, 128);
+    // We may well be panicking from inside a backtrace - that is exactly when
+    // one is most wanted - so do not let the unwinder turn us away as a
+    // re-entry. We are dying either way.
+    osv::unwind_abandon();
+    len = osv::unwind(addrs, cfas, 128);
 
     /* Start with i=1 to skip abort(const char *)  */
     int frame = 0;

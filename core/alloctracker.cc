@@ -63,9 +63,7 @@ void alloc_tracker::remember(void *addr, int size)
     // so we ask for 1024 levels (assuming we'll never have deeper recursion than
     // that), and later only save the highest levels.
     static void *bt[POLICY_DEEPEST ? MAX_BACKTRACE : 1024];
-    // We don't want to trigger a demand page fault, since this allocation may
-    // be servicing a fault itself.  Use backtrace_safe().
-    int n = backtrace_safe(bt, sizeof(bt)/sizeof(*bt));
+    int n = osv::unwind(bt, nullptr, sizeof(bt)/sizeof(*bt));
 
     // When backtrace is too deep, save only the MAX_BACKTRACE most high
     // level functions (not the first MAX_BACKTRACE functions!).

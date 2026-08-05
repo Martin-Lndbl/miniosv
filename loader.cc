@@ -226,7 +226,7 @@ void main_cont()
     enable_trace();
     if (opt_log_backtrace) {
         // can only do this after smp_launch, otherwise the IDT is not initialized,
-        // and backtrace_safe() fails as soon as we get an exception
+        // and unwinding fails as soon as we get an exception
         enable_backtraces();
     }
 #if CONF_tracepoints_strace

@@ -11,6 +11,7 @@
 #include <osv/debug.h>
 #include <osv/irqlock.hh>
 #include <osv/kernel_config.h>
+#include <osv/execinfo.hh>
 
 #include "arch-cpu.hh"
 #include "exceptions.hh"
@@ -97,10 +98,17 @@ void page_fault(exception_frame *ef)
         return handle_access_flag_fault(ef, addr);
     }
 
-    /* vm_fault might sleep, so check that the thread is preemptable,
-     * and that interrupts in the saved pstate are enabled.
-     * Then enable interrupts for the vm_fault.
-     */
+    // A backtrace taken from an interrupt walks whatever the CPU was in the
+    // middle of, so it can compute a bad frame address and read from it. Let
+    // it abandon the walk instead of panicking below - vm_fault could not help
+    // anyway, since neither sleeping nor enabling interrupts is allowed here.
+    if (!sched::preemptable() || (ef->spsr & processor::daif_i)) {
+        void *landing_pad;
+        if (osv::unwind_recover_from_fault(&landing_pad)) {
+            ef->elr = reinterpret_cast<u64>(landing_pad);
+            return;
+        }
+    }
     assert(sched::preemptable());
     assert(!(ef->spsr & processor::daif_i));
 

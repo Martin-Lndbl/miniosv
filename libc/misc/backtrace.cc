@@ -8,7 +8,10 @@
 #include <osv/execinfo.h>
 #include <osv/execinfo.hh>
 
+#include <setjmp.h>
 #include <unwind.h>
+
+#include <atomic>
 
 struct worker_arg {
     void **buffer;
@@ -39,23 +42,96 @@ static _Unwind_Reason_Code worker (struct _Unwind_Context *ctx, void *data)
     return _URC_NO_REASON;
 }
 
-// pos starts at -1 so the callback skips the wrapper's own frame; the
-// returned buffer starts at the direct caller. _Unwind_Backtrace may leave
-// a trailing null "top-most caller" that we trim.
-static int unwind(void **pc, unsigned long *cfas, int nr)
+// Unwinding runs in contexts nobody chose: a tracepoint backtrace, the
+// alloctracker and a panic raised inside a handler all unwind from an
+// interrupt, on top of whatever instruction the CPU happened to be executing.
+// At an arbitrary instruction the CFI is not always a description of a
+// complete frame - half-built prologues, half-torn-down epilogues and
+// hand-written assembly all occur - and libunwind will happily compute a
+// canonical frame address from it and dereference it. Backtracing must not be
+// able to kill the kernel, so the fault handlers hand a faulting unwind back
+// here (see recover_from_fault below) and the walk returns the frames it had
+// managed to collect. That is what the frame-pointer walker this replaced did
+// with its hand-written safe loads.
+//
+// Per-thread rather than per-CPU: an interrupt handler unwinds in the context
+// of the thread it interrupted, and a thread can migrate mid-unwind.
+static __thread bool unwinding;
+static __thread jmp_buf unwind_recovery;
+
+// The fault handler diverts the faulting instruction here. It runs in the
+// faulting context, with the exception frame already popped, and leaves it the
+// only way that context can be left safely.
+extern "C" [[noreturn]] void unwind_fault_landing_pad()
 {
+    longjmp(unwind_recovery, 1);
+}
+
+static std::atomic<unsigned long> unwind_fault_count;
+
+// Called from the arch page-fault handlers with the pc they are about to
+// resume at. Returns true (and replaces it) if this fault is an unwind walking
+// off into nothing, rather than a fault the kernel should be handling.
+bool osv::unwind_recover_from_fault(void **pc)
+{
+    if (!unwinding) {
+        return false;
+    }
+    unwind_fault_count.fetch_add(1, std::memory_order_relaxed);
+    *pc = (void *)unwind_fault_landing_pad;
+    return true;
+}
+
+unsigned long osv::unwind_faults()
+{
+    return unwind_fault_count.load(std::memory_order_relaxed);
+}
+
+void osv::unwind_abandon()
+{
+    unwinding = false;
+}
+
+// pos starts at -1 so the callback skips the frame that ran _Unwind_Backtrace
+// and the returned buffer starts at its caller. always_inline makes that frame
+// the public entry point below rather than this helper, so the skipped frame
+// is the same whether this is reached via unwind() or backtrace().
+// _Unwind_Backtrace may leave a trailing null "top-most caller" that we trim.
+__attribute__((always_inline))
+static inline int do_unwind(void **pc, unsigned long *cfas, int nr)
+{
+    if (unwinding) {
+        // Re-entered from an interrupt that landed inside libunwind, which
+        // keeps state across the callback. Nothing here is worth the risk of
+        // walking over it - the outer backtrace is the interesting one anyway.
+        return 0;
+    }
+
+    // Written by the callback through a pointer, so it survives the longjmp
+    // whether or not the compiler kept any of it in a register.
     worker_arg arg { pc, cfas, nr, -1, 0 };
-    _Unwind_Backtrace(worker, &arg);
+
+    unwinding = true;
+    if (!setjmp(unwind_recovery)) {
+        _Unwind_Backtrace(worker, &arg);
+    }
+    unwinding = false;
+
     if (arg.pos > 0 && pc[arg.pos-1] == nullptr) {
         arg.pos--;
     }
     return arg.pos > 0 ? arg.pos : 0;
 }
 
-int backtrace(void **buffer, int size)         { return unwind(buffer, nullptr, size); }
-int backtrace_safe(void **pc, int nr)          { return unwind(pc, nullptr, nr); }
-int backtrace_safe(void **pc, unsigned long *cfa, int nr)
-                                                { return unwind(pc, cfa, nr); }
+int osv::unwind(void **pc, unsigned long *cfa, int nr)
+{
+    return do_unwind(pc, cfa, nr);
+}
+
+int backtrace(void **buffer, int size)
+{
+    return do_unwind(buffer, nullptr, size);
+}
 
 #include <osv/demangle.hh>
 #include <string.h>

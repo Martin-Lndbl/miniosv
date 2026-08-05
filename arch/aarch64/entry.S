@@ -130,8 +130,12 @@ exception_vectors:
 thread_main:
         .type thread_main, @function
         .cfi_startproc simple
-        .cfi_undefined %x30
-        .cfi_def_cfa %sp, 0
+        // Plain register names: aarch64 has no %-prefixed syntax, and the
+        // assembler drops such a directive without a word of complaint - which
+        // leaves this frame with no CFA rule at all, and an unwinder walking
+        // off the bottom of a thread stack into nothing.
+        .cfi_undefined x30
+        .cfi_def_cfa sp, 0
         bl thread_main_c
         .cfi_endproc
 
@@ -271,7 +275,7 @@ call_signal_handler_thunk:
         .type call_signal_handler_thunk, @function
         .cfi_startproc simple
         .cfi_signal_frame
-        .cfi_def_cfa %sp, 0
+        .cfi_def_cfa sp, 0
         .cfi_offset x30, -32 // Point to the elr register located at the -32 offset
                              // of the exception frame to help gdb link to the
                              // address when interrupt was raised

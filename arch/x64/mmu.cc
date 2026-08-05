@@ -14,6 +14,7 @@
 #include <osv/migration-lock.hh>
 #include <osv/prio.hh>
 #include <osv/elf.hh>
+#include <osv/execinfo.hh>
 #include "exceptions.hh"
 #include <algorithm>
 
@@ -29,6 +30,17 @@ void page_fault(exception_frame *ef)
     auto pc = reinterpret_cast<void*>(ef->rip);
     if (!pc) {
         abort("trying to execute null pointer");
+    }
+    // A backtrace taken from an interrupt walks whatever the CPU was in the
+    // middle of, so it can compute a bad frame address and read from it. Let
+    // it abandon the walk instead of panicking below - vm_fault could not help
+    // anyway, since neither sleeping nor enabling interrupts is allowed here.
+    if (!sched::preemptable() || !(ef->rflags & processor::rflags_if)) {
+        void *landing_pad;
+        if (osv::unwind_recover_from_fault(&landing_pad)) {
+            ef->rip = reinterpret_cast<u64>(landing_pad);
+            return;
+        }
     }
     // The following code may sleep. So let's verify the fault did not happen
     // when preemption was disabled, or interrupts were disabled.
