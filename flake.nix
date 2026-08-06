@@ -60,6 +60,7 @@
           ctags
           mtools
           gptfdisk
+          e2fsprogs
           (python3.withPackages (ps: [ ps.pyyaml ]))
         ];
 
