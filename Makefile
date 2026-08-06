@@ -147,6 +147,7 @@ conf_memory_page_batch_size=32
 
 # --- filesystem ------------------------------------------------------------
 conf_fs_max_file_descriptors=0x4000
+conf_fs_miniext=1
 
 # --- threads / stacks ------------------------------------------------------
 conf_threads_default_kernel_stack_size=65536
@@ -728,8 +729,19 @@ libc += malloc_hooks.o
 
 
 
-# There is no filesystem: the kernel has no VFS, no fd table and no on-disk or
-# in-memory file systems. Minimal console-backed stdio lives in libc/io.cc.
+# There is still no VFS and no fd table, and libc/io.cc keeps failing every
+# file call. miniext is not wired into libc: it is a library the application
+# calls directly, and it drives its own NVMe I/O rather than sitting on top of a
+# block-device layer. See modules/miniext/miniext.hh.
+ifeq ($(conf_fs_miniext),1)
+objects += modules/miniext/device.o
+objects += modules/miniext/mount.o
+objects += modules/miniext/inode.o
+objects += modules/miniext/dir.o
+objects += modules/miniext/file.o
+endif
+
+# Minimal console-backed stdio lives in libc/io.cc.
 objects += $(addprefix libc/, $(libc))
 
 

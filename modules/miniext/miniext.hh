@@ -1,0 +1,71 @@
+/*
+ * miniext: a minimal ext4-compatible filesystem for miniOSv.
+ *
+ * The application calls this directly. There is no VFS, no file-descriptor
+ * table, and no libc file I/O involved -- open() and friends in libc/io.cc keep
+ * failing with ENOENT exactly as before.
+ *
+ * miniext talks to an NVMe namespace itself rather than through a block-device
+ * abstraction: mount() takes the id of a controller registered by
+ * drivers/nvme.cc (0 is the boot disk, 1 the second one attached with
+ * run.py --emulated-nvme).
+ *
+ * The supported on-disk subset is whatever scripts/mkdata.sh produces; mount()
+ * refuses anything else rather than guessing. See ondisk.hh.
+ */
+
+#ifndef MINIEXT_HH
+#define MINIEXT_HH
+
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <string>
+
+namespace miniext {
+
+struct file;
+
+// Negative return values are -errno throughout.
+
+// Mount the namespace of NVMe controller `nvme_id` at `mount_point` (an
+// absolute path such as "/db"). Only one filesystem may be mounted at a time.
+int mount(int nvme_id, const char *mount_point);
+int umount();
+bool is_mounted();
+
+// Paths are absolute and must start with the mount point.
+static const int O_RD = 0x1;
+
+file *open(const char *path, int flags, int *err = nullptr);
+void close(file *f);
+
+// Positional read. Returns bytes read, 0 at EOF, or -errno. A read spanning a
+// hole yields zeros there.
+int64_t pread(file *f, void *buf, size_t len, uint64_t offset);
+
+uint64_t size(file *f);
+
+// Metadata without opening.
+bool exists(const char *path);
+bool is_directory(const char *path);
+int  file_size(const char *path, uint64_t *out);
+
+// Directory listing. `cb` is called once per entry with the entry name and
+// whether it is a directory; "." and ".." are skipped.
+int list(const char *path, const std::function<void(const char *, bool)> &cb);
+
+// Geometry, for diagnostics.
+struct fs_info {
+    uint32_t block_size;
+    uint64_t block_count;
+    uint64_t free_blocks;
+    uint32_t inode_count;
+    uint32_t free_inodes;
+    uint32_t group_count;
+};
+int info(fs_info *out);
+
+} // namespace miniext
+
+#endif /* MINIEXT_HH */
