@@ -885,10 +885,27 @@ def_symbols = --defsym=OSV_KERNEL_BASE=$(kernel_base) \
               --defsym=OSV_KERNEL_VM_SHIFT=$(kernel_vm_shift)
 endif
 
+# The object list is passed through a response file rather than on the command
+# line: an application the size of DuckDB contributes ~1750 objects, which
+# overruns ARG_MAX ("sh: Argument list too long"). ld.lld reads @file the same
+# way GNU ld does, one argument per line.
+# $(file ...) writes the list without going through a shell, so the response
+# file itself does not hit the limit it exists to avoid.
+empty :=
+space := $(empty) $(empty)
+define newline
+
+
+endef
+
+link-inputs = $(patsubst %.ld,-T %.ld,$(filter-out $(app_mode_dep) $(llvm_libc_dep) $(libcxx_dep) $(compiler_rt_dep),$^))
+
 $(out)/loader.elf: $(stage1_targets) arch/$(arch)/loader.ld $(app_mode_dep) $(llvm_libc_dep) $(libcxx_dep) $(compiler_rt_dep)
+	$(call very-quiet, $(makedir))
+	$(file > $@.objects,$(subst $(space),$(newline),$(link-inputs)))
 	$(call quiet, $(LD) -o $@ $(def_symbols) \
 		-static --eh-frame-hdr -L$(out)/arch/$(arch) \
-            $(patsubst %.ld,-T %.ld,$(filter-out $(app_mode_dep) $(llvm_libc_dep) $(libcxx_dep) $(compiler_rt_dep),$^)) \
+	    @$@.objects \
 	    $(linker_archives_options) $(conf_linker_extra_options), \
 		LINK loader.elf)
 
