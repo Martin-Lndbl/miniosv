@@ -14,6 +14,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 #include "internal.hh"
 
@@ -167,6 +168,188 @@ int path_resolve(fs *f, const char *path, uint32_t *out_ino, inode *out)
     *out_ino = ino;
     *out = cur;
     return 0;
+}
+
+namespace {
+// A record occupies its 8-byte header plus the name, rounded up to 4 bytes.
+inline uint16_t dirent_need(size_t name_len)
+{
+    return static_cast<uint16_t>((DIR_ENTRY_HEADER + name_len + 3) & ~3u);
+}
+} // namespace
+
+// Link `ino` into `dir` under `name`. A live record only needs room for its own
+// name, so the rest of its rec_len is slack that can be split off; failing
+// that, a free record is taken whole, and failing that the directory grows by
+// one block.
+int dir_add(fs *f, uint32_t dir_ino, inode *dir, const char *name,
+            size_t name_len, uint32_t ino, uint8_t file_type)
+{
+    if (name_len == 0 || name_len > 255) {
+        return -EINVAL;
+    }
+    const uint16_t need = dirent_need(name_len);
+
+    // Refuse a duplicate rather than leaving two records for one name.
+    uint32_t existing = 0;
+    int rc = dir_lookup(f, dir, name, name_len, &existing);
+    if (rc < 0) {
+        return rc;
+    }
+    if (existing) {
+        return -EEXIST;
+    }
+
+    const uint64_t dsize = inode_size(dir);
+    scratch buf(f->block_size);
+    if (!buf) {
+        return -ENOMEM;
+    }
+
+    for (uint64_t off = 0; off < dsize; off += f->block_size) {
+        uint64_t phys = 0;
+        uint32_t run = 0;
+        rc = extent_lookup(f, dir, static_cast<uint32_t>(off / f->block_size),
+                           &phys, &run);
+        if (rc < 0) {
+            return rc;
+        }
+        if (phys == 0) {
+            continue;                   // sparse directory block
+        }
+        rc = f->dev.read(buf.data(), phys, 1);
+        if (rc < 0) {
+            return rc;
+        }
+
+        uint32_t pos = 0;
+        while (pos + DIR_ENTRY_HEADER <= f->block_size) {
+            auto *de = reinterpret_cast<dir_entry *>(buf.data() + pos);
+            const uint16_t rec_len = le16(de->rec_len);
+            if (rec_len < DIR_ENTRY_HEADER || pos + rec_len > f->block_size) {
+                return -EIO;
+            }
+
+            const uint16_t used = le32(de->inode) ? dirent_need(de->name_len) : 0;
+            if (rec_len - used >= need) {
+                dir_entry *slot;
+                if (used == 0) {
+                    slot = de;
+                } else {
+                    de->rec_len = le16(used);
+                    slot = reinterpret_cast<dir_entry *>(buf.data() + pos + used);
+                    slot->rec_len = le16(static_cast<uint16_t>(rec_len - used));
+                }
+                slot->inode = le32(ino);
+                slot->name_len = static_cast<uint8_t>(name_len);
+                slot->file_type = file_type;
+                memcpy(slot->name, name, name_len);
+                return f->dev.write(buf.data(), phys, 1);
+            }
+            pos += rec_len;
+        }
+    }
+
+    // Nowhere to put it: append a block holding one record that spans it.
+    memset(buf.data(), 0, f->block_size);
+    auto *de = reinterpret_cast<dir_entry *>(buf.data());
+    de->inode = le32(ino);
+    de->rec_len = le16(static_cast<uint16_t>(f->block_size));
+    de->name_len = static_cast<uint8_t>(name_len);
+    de->file_type = file_type;
+    memcpy(de->name, name, name_len);
+
+    const uint32_t fblock = static_cast<uint32_t>(dsize / f->block_size);
+    uint64_t phys = 0;
+    uint32_t run = 0;
+    rc = extent_map_write(f, dir_ino, dir, fblock, 1, &phys, &run);
+    if (rc < 0) {
+        return rc;
+    }
+    rc = f->dev.write(buf.data(), phys, 1);
+    if (rc < 0) {
+        return rc;
+    }
+
+    inode_set_size(dir, dsize + f->block_size);
+    return inode_write(f, dir_ino, dir);
+}
+
+// Remove `name` by folding its record into the preceding one. The first record
+// in a block has nothing to fold into, so it is blanked instead.
+int dir_remove(fs *f, uint32_t dir_ino, inode *dir, const char *name,
+               size_t name_len)
+{
+    (void)dir_ino;
+    const uint64_t dsize = inode_size(dir);
+    scratch buf(f->block_size);
+    if (!buf) {
+        return -ENOMEM;
+    }
+
+    for (uint64_t off = 0; off < dsize; off += f->block_size) {
+        uint64_t phys = 0;
+        uint32_t run = 0;
+        int rc = extent_lookup(f, dir, static_cast<uint32_t>(off / f->block_size),
+                               &phys, &run);
+        if (rc < 0) {
+            return rc;
+        }
+        if (phys == 0) {
+            continue;
+        }
+        rc = f->dev.read(buf.data(), phys, 1);
+        if (rc < 0) {
+            return rc;
+        }
+
+        uint32_t pos = 0;
+        uint32_t prev = 0;
+        bool have_prev = false;
+        while (pos + DIR_ENTRY_HEADER <= f->block_size) {
+            auto *de = reinterpret_cast<dir_entry *>(buf.data() + pos);
+            const uint16_t rec_len = le16(de->rec_len);
+            if (rec_len < DIR_ENTRY_HEADER || pos + rec_len > f->block_size) {
+                return -EIO;
+            }
+
+            if (le32(de->inode) && de->name_len == name_len &&
+                memcmp(de->name, name, name_len) == 0) {
+                if (have_prev) {
+                    auto *pd = reinterpret_cast<dir_entry *>(buf.data() + prev);
+                    pd->rec_len = le16(static_cast<uint16_t>(
+                        le16(pd->rec_len) + rec_len));
+                } else {
+                    de->inode = le32(0);
+                    de->name_len = 0;
+                    de->file_type = FT_UNKNOWN;
+                }
+                return f->dev.write(buf.data(), phys, 1);
+            }
+            prev = pos;
+            have_prev = true;
+            pos += rec_len;
+        }
+    }
+    return -ENOENT;
+}
+
+// Split an absolute path into its parent directory and final component.
+int path_split(fs *f, const char *path, uint32_t *parent_ino, inode *parent,
+               const char **name, size_t *name_len)
+{
+    const char *last = strrchr(path, '/');
+    if (!last || last[1] == '\0') {
+        return -EINVAL;
+    }
+    *name = last + 1;
+    *name_len = strlen(last + 1);
+    if (*name_len > 255) {
+        return -ENAMETOOLONG;
+    }
+
+    std::string dir_path(path, last == path ? 1 : static_cast<size_t>(last - path));
+    return path_resolve(f, dir_path.c_str(), parent_ino, parent);
 }
 
 } // namespace miniext

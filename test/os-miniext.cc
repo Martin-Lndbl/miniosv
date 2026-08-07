@@ -238,6 +238,143 @@ int os_miniext_main()
               err == -ENOTDIR, "descending through a file gives ENOTDIR");
     }
 
+    // --- write path -----------------------------------------------------
+    // Everything below is checked again from the host with fsck.ext4 -f -n
+    // after the run; a clean bill there is the real gate, not these checks.
+    {
+        int err = 0;
+        miniext::file *f = miniext::open("/db/written.bin",
+                                         miniext::O_RDWR | miniext::O_CREATE, &err);
+        check(f != nullptr, "create /db/written.bin");
+        if (f) {
+            // Small write, read back through a fresh open.
+            const char *msg = "miniext write path\n";
+            const size_t mlen = strlen(msg);
+            check(miniext::pwrite(f, msg, mlen, 0) == (int64_t)mlen, "pwrite small");
+            check(miniext::size(f) == mlen, "size after small write");
+
+            char back[64] = {};
+            check(miniext::pread(f, back, mlen, 0) == (int64_t)mlen &&
+                  memcmp(back, msg, mlen) == 0, "read back small write");
+
+            // Grow across many blocks so the extent tree has to grow too.
+            std::vector<uint8_t> chunk(64 * 1024);
+            for (size_t i = 0; i < chunk.size(); i++) {
+                chunk[i] = (uint8_t)(i * 31 + 7);
+            }
+            bool ok = true;
+            for (int i = 0; i < 40; i++) {          // 2.5 MiB
+                int64_t n = miniext::pwrite(f, chunk.data(), chunk.size(),
+                                            (uint64_t)i * chunk.size());
+                if (n != (int64_t)chunk.size()) { ok = false; break; }
+            }
+            check(ok, "pwrite 2.5 MiB across many extents");
+            check(miniext::size(f) == 40ull * chunk.size(), "size after bulk write");
+
+            // Verify every byte came back.
+            std::vector<uint8_t> rb(chunk.size());
+            ok = true;
+            for (int i = 0; i < 40 && ok; i++) {
+                int64_t n = miniext::pread(f, rb.data(), rb.size(),
+                                           (uint64_t)i * chunk.size());
+                if (n != (int64_t)rb.size() || memcmp(rb.data(), chunk.data(), rb.size()) != 0) {
+                    ok = false;
+                }
+            }
+            check(ok, "read back 2.5 MiB");
+
+            // Unaligned write straddling a block boundary.
+            const char *tag = "STRADDLE";
+            check(miniext::pwrite(f, tag, 8, 4090) == 8, "pwrite straddling a block");
+            char tb[8] = {};
+            check(miniext::pread(f, tb, 8, 4090) == 8 && memcmp(tb, tag, 8) == 0,
+                  "read back straddling write");
+
+            // Sparse extension: seek past EOF, write, and the gap reads zeros.
+            const uint64_t far = 40ull * chunk.size() + 100000;
+            check(miniext::pwrite(f, "END", 3, far) == 3, "pwrite past EOF");
+            uint8_t hole[16];
+            memset(hole, 0xFF, sizeof(hole));
+            check(miniext::pread(f, hole, sizeof(hole), far - 1000) == sizeof(hole),
+                  "read inside the hole");
+            bool zeros = true;
+            for (uint8_t b : hole) { if (b) zeros = false; }
+            check(zeros, "hole reads as zeros");
+
+            // Truncate down, then confirm the size and that reads clip.
+            check(miniext::truncate(f, 5000) == 0, "truncate to 5000");
+            check(miniext::size(f) == 5000, "size after truncate");
+            uint8_t t2[16];
+            check(miniext::pread(f, t2, sizeof(t2), 4996) == 4, "read clipped after truncate");
+
+            check(miniext::sync(f) == 0, "sync");
+            miniext::close(f);
+        }
+    }
+
+    // Reopen and confirm the data survived the close.
+    {
+        uint64_t sz = 0;
+        check(miniext::file_size("/db/written.bin", &sz) == 0 && sz == 5000,
+              "size persists after close");
+    }
+
+    // --- namespace operations -------------------------------------------
+    check(miniext::mkdir("/db/newdir") == 0, "mkdir /db/newdir");
+    check(miniext::is_directory("/db/newdir"), "newdir is a directory");
+    check(miniext::mkdir("/db/newdir") == -EEXIST, "mkdir twice gives EEXIST");
+
+    {
+        int err = 0;
+        miniext::file *g = miniext::open("/db/newdir/inner.txt",
+                                         miniext::O_RDWR | miniext::O_CREATE, &err);
+        check(g != nullptr, "create a file inside newdir");
+        if (g) {
+            check(miniext::pwrite(g, "inner", 5, 0) == 5, "write inside newdir");
+            miniext::close(g);
+        }
+    }
+    check(miniext::rmdir("/db/newdir") == -ENOTEMPTY, "rmdir non-empty gives ENOTEMPTY");
+    check(miniext::unlink("/db/newdir/inner.txt") == 0, "unlink inner.txt");
+    check(miniext::rmdir("/db/newdir") == 0, "rmdir now succeeds");
+    check(!miniext::exists("/db/newdir"), "newdir is gone");
+
+    check(miniext::rename("/db/written.bin", "/db/renamed.bin") == 0, "rename");
+    check(!miniext::exists("/db/written.bin"), "old name is gone");
+    check(miniext::exists("/db/renamed.bin"), "new name is present");
+    check(miniext::unlink("/db/renamed.bin") == 0, "unlink renamed.bin");
+    check(!miniext::exists("/db/renamed.bin"), "renamed.bin is gone");
+
+    // Many files in one directory, to force the directory to grow a block.
+    {
+        bool ok = true;
+        for (int i = 0; i < 200; i++) {
+            char name[64];
+            snprintf(name, sizeof(name), "/db/many-%03d.dat", i);
+            int err = 0;
+            miniext::file *g = miniext::open(name, miniext::O_RDWR | miniext::O_CREATE, &err);
+            if (!g) { ok = false; break; }
+            miniext::pwrite(g, name, strlen(name), 0);
+            miniext::close(g);
+        }
+        check(ok, "create 200 files in one directory");
+
+        int seen = 0;
+        miniext::list("/db", [&](const char *n, bool) {
+            if (strncmp(n, "many-", 5) == 0) seen++;
+        });
+        check(seen == 200, "all 200 are listed");
+
+        ok = true;
+        for (int i = 0; i < 200; i++) {
+            char name[64];
+            snprintf(name, sizeof(name), "/db/many-%03d.dat", i);
+            if (miniext::unlink(name) != 0) { ok = false; break; }
+        }
+        check(ok, "unlink all 200");
+    }
+
+    check(miniext::sync() == 0, "final sync");
     check(miniext::umount() == 0, "umount");
 
     if (failures) {

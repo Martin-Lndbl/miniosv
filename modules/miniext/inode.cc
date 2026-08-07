@@ -236,4 +236,115 @@ int64_t inode_pread(fs *f, const inode *in, void *buf, size_t len, uint64_t offs
     return static_cast<int64_t>(moved);
 }
 
+// Write into an inode, allocating blocks for any hole the range covers and
+// extending i_size. Called with the inode's rwlock held exclusively.
+int64_t inode_pwrite(fs *f, uint32_t ino, inode *in, const void *buf, size_t len,
+                     uint64_t offset)
+{
+    if (len == 0) {
+        return 0;
+    }
+
+    const uint8_t *src = static_cast<const uint8_t *>(buf);
+    size_t moved = 0;
+
+    while (moved < len) {
+        const uint64_t pos = offset + moved;
+        const uint32_t fblock = static_cast<uint32_t>(pos / f->block_size);
+        const uint32_t in_block = pos % f->block_size;
+        const size_t remaining = len - moved;
+
+        // How many whole blocks this write could still cover, so a sequential
+        // writer asks the allocator for one long run instead of many short ones.
+        uint32_t want = static_cast<uint32_t>((in_block + remaining +
+                                               f->block_size - 1) / f->block_size);
+        if (want == 0) {
+            want = 1;
+        }
+
+        uint64_t phys = 0;
+        uint32_t run = 0;
+        const bool was_hole = ([&] {
+            uint64_t p = 0;
+            uint32_t r = 0;
+            return extent_lookup(f, in, fblock, &p, &r) == 0 && p == 0;
+        })();
+
+        int rc = extent_map_write(f, ino, in, fblock, want, &phys, &run);
+        if (rc < 0) {
+            return moved ? static_cast<int64_t>(moved) : rc;
+        }
+
+        if (in_block == 0 && remaining >= f->block_size) {
+            // Whole blocks straight from the caller's buffer.
+            uint32_t nblocks = static_cast<uint32_t>(remaining / f->block_size);
+            if (nblocks > run) {
+                nblocks = run;
+            }
+            rc = f->dev.write(src + moved, phys, nblocks);
+            if (rc < 0) {
+                return moved ? static_cast<int64_t>(moved) : rc;
+            }
+            moved += static_cast<size_t>(nblocks) * f->block_size;
+            continue;
+        }
+
+        // Partial block: read-modify-write. A block that was a hole a moment
+        // ago holds whatever the last owner left behind, so start from zeros
+        // instead of reading it back.
+        size_t want_bytes = remaining;
+        const size_t to_block_end = f->block_size - in_block;
+        if (want_bytes > to_block_end) {
+            want_bytes = to_block_end;
+        }
+
+        scratch tmp(f->block_size);
+        if (!tmp) {
+            return moved ? static_cast<int64_t>(moved) : -ENOMEM;
+        }
+        if (was_hole) {
+            memset(tmp.data(), 0, f->block_size);
+        } else {
+            rc = f->dev.read(tmp.data(), phys, 1);
+            if (rc < 0) {
+                return moved ? static_cast<int64_t>(moved) : rc;
+            }
+        }
+        memcpy(tmp.data() + in_block, src + moved, want_bytes);
+        rc = f->dev.write(tmp.data(), phys, 1);
+        if (rc < 0) {
+            return moved ? static_cast<int64_t>(moved) : rc;
+        }
+        moved += want_bytes;
+    }
+
+    if (offset + moved > inode_size(in)) {
+        inode_set_size(in, offset + moved);
+    }
+    int rc = inode_write(f, ino, in);
+    if (rc < 0) {
+        return rc;
+    }
+    return static_cast<int64_t>(moved);
+}
+
+// Grow (sparse: no allocation, the tail reads as zeros) or shrink, freeing
+// blocks past the new end. Called with the inode's rwlock held exclusively.
+int inode_truncate(fs *f, uint32_t ino, inode *in, uint64_t new_size)
+{
+    const uint64_t old = inode_size(in);
+
+    if (new_size < old) {
+        const uint32_t from = static_cast<uint32_t>(
+            (new_size + f->block_size - 1) / f->block_size);
+        int rc = extent_truncate(f, ino, in, from);
+        if (rc < 0) {
+            return rc;
+        }
+    }
+
+    inode_set_size(in, new_size);
+    return inode_write(f, ino, in);
+}
+
 } // namespace miniext

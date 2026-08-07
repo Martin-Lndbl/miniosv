@@ -35,14 +35,32 @@ int umount();
 bool is_mounted();
 
 // Paths are absolute and must start with the mount point.
-static const int O_RD = 0x1;
+static const int O_RD     = 0x1;
+static const int O_WR     = 0x2;
+static const int O_RDWR   = O_RD | O_WR;
+static const int O_CREATE = 0x4;   // create if absent
+static const int O_EXCL   = 0x8;   // with O_CREATE, fail if present
+static const int O_TRUNC  = 0x10;  // truncate to zero on open
 
 file *open(const char *path, int flags, int *err = nullptr);
 void close(file *f);
 
-// Positional read. Returns bytes read, 0 at EOF, or -errno. A read spanning a
-// hole yields zeros there.
+// Positional read/write. Return bytes moved, or -errno; pread returns 0 at EOF.
+// A read spanning a hole yields zeros there; a write past EOF extends the file,
+// leaving any skipped range as a hole.
+//
+// Concurrency is POSIX-shaped and no stronger: reads on one file run in
+// parallel with each other, a write excludes readers and other writers of that
+// same file, and different files never block each other.
 int64_t pread(file *f, void *buf, size_t len, uint64_t offset);
+int64_t pwrite(file *f, const void *buf, size_t len, uint64_t offset);
+
+int truncate(file *f, uint64_t new_size);
+
+// Push the device's volatile write cache. Writes already returned are on the
+// media afterwards.
+int sync(file *f);
+int sync();
 
 uint64_t size(file *f);
 
@@ -54,6 +72,12 @@ int  file_size(const char *path, uint64_t *out);
 // Directory listing. `cb` is called once per entry with the entry name and
 // whether it is a directory; "." and ".." are skipped.
 int list(const char *path, const std::function<void(const char *, bool)> &cb);
+
+// Namespace mutation.
+int unlink(const char *path);
+int rename(const char *from, const char *to);
+int mkdir(const char *path);
+int rmdir(const char *path);
 
 // Geometry, for diagnostics.
 struct fs_info {

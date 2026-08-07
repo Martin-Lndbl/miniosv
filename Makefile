@@ -736,6 +736,8 @@ libc += malloc_hooks.o
 ifeq ($(conf_fs_miniext),1)
 objects += modules/miniext/device.o
 objects += modules/miniext/mount.o
+objects += modules/miniext/alloc.o
+objects += modules/miniext/extent.o
 objects += modules/miniext/inode.o
 objects += modules/miniext/dir.o
 objects += modules/miniext/file.o
