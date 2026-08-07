@@ -20,8 +20,8 @@
 #ifndef CONF_core_rcu_defer_queue_size
 #define CONF_core_rcu_defer_queue_size 2000
 #endif
-#ifndef CONF_fs_max_file_descriptors
-#define CONF_fs_max_file_descriptors 0x4000
+#ifndef CONF_fs_miniext
+#define CONF_fs_miniext 1
 #endif
 #ifndef CONF_interrupt_stack_size
 #define CONF_interrupt_stack_size 0x1000

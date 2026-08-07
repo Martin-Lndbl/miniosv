@@ -146,7 +146,9 @@ conf_memory_l1_pool_size=512
 conf_memory_page_batch_size=32
 
 # --- filesystem ------------------------------------------------------------
-conf_fs_max_file_descriptors=0x4000
+# miniext is a minimal ext4-compatible filesystem the application calls
+# directly (modules/miniext/miniext.hh). There is still no VFS and no fd table.
+# It drives an NVMe namespace itself, so it needs conf_drivers_nvme.
 conf_fs_miniext=1
 
 # --- threads / stacks ------------------------------------------------------
@@ -158,6 +160,14 @@ conf_interrupt_stack_size=0x1000
 conf_drivers_acpi=1
 conf_drivers_pci=1
 conf_drivers_nvme=1
+
+# miniext talks to the NVMe driver directly, so it cannot be built without it.
+# Catch that here rather than in a wall of missing-header errors.
+ifeq ($(conf_fs_miniext),1)
+ifneq ($(conf_drivers_nvme),1)
+$(error conf_fs_miniext=1 needs conf_drivers_nvme=1)
+endif
+endif
 
 ifneq ($(MAKECMDGOALS),clean)
 $(info Building into $(out))
@@ -323,7 +333,11 @@ $(out)/libc/%.o: source-dialects =
 
 # do not hide symbols in libc because it has its own hiding mechanism
 
-kernel-defines = -D_KERNEL $(source-dialects)
+# include/osv/kernel_config.h #ifndef-guards every macro precisely so the
+# Makefile can override one; pass conf_fs_miniext through so that turning the
+# filesystem off on the command line also removes it from the source's view.
+kernel-defines = -D_KERNEL $(source-dialects) \
+	-DCONF_fs_miniext=$(conf_fs_miniext)
 
 # This play the same role as "_KERNEL", but _KERNEL unfortunately is too
 # overloaded. A lot of files will expect it to be set no matter what, specially
@@ -390,8 +404,6 @@ ASFLAGS = -g $(autodepend) -D__ASSEMBLY__
 # Clang flags them under -Wunused-command-line-argument, so silence that.
 wno-unused-cli-arg := $(call compiler-flag, -Wno-unused-command-line-argument, -Wno-unused-command-line-argument)
 ASCOMPILE = $(CXX) $(COMMON) $(wno-unused-cli-arg)
-
-$(out)/fs/vfs/main.o: CXXFLAGS += -Wno-sign-compare -Wno-write-strings
 
 
 makedir = $(call very-quiet, mkdir -p $(dir $@))
@@ -793,8 +805,6 @@ endif
 # Boost.System is header-only in modern Boost, so no Boost library is linked.
 boost-includes = -isystem external/boost
 boost-libs :=
-
-# nfs/ext null vfsops went with the filesystem.
 
 
 # The OSv kernel is linked into an ordinary, non-PIE, executable, so there is no point in compiling

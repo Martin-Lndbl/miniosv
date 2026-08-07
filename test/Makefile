@@ -13,7 +13,8 @@
 #   - os-iostream  : C++ iostreams / localization checks (std::cout etc.)
 #   - os-memmove   : memmove() overlap-correctness regression test
 #   - os-stress    : concurrency / allocator / TLS stress tests
-#   - os-miniext   : miniext filesystem checks (needs --emulated-nvme; skips without)
+#   - os-miniext   : miniext filesystem checks, only when conf_fs_miniext=1
+#                    (needs --emulated-nvme at run time; skips without)
 
 app-objects =  test/osv_tests.o
 app-objects += test/os-features.o
@@ -21,4 +22,6 @@ app-objects += test/os-libc.o
 app-objects += test/os-iostream.o
 app-objects += test/os-memmove.o
 app-objects += test/os-stress.o
+ifeq ($(conf_fs_miniext),1)
 app-objects += test/os-miniext.o
+endif

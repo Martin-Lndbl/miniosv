@@ -17,6 +17,7 @@
  */
 
 #include <cstdio>
+#include <osv/kernel_config.h>
 #include <osv/power.hh>
 
 int os_features_main();
@@ -24,7 +25,9 @@ int os_libc_main();
 int os_stress_main();
 int os_iostream_main();
 int os_memmove_main();
+#if CONF_fs_miniext
 int os_miniext_main();
+#endif
 
 extern "C" void osv_app_main()
 {
@@ -39,8 +42,10 @@ extern "C" void osv_app_main()
     printf("\n");
     rc |= os_memmove_main();
     printf("\n");
+#if CONF_fs_miniext
     rc |= os_miniext_main();
     printf("\n");
+#endif
     rc |= os_stress_main();
 
     printf("\n######## OSv test application: %s ########\n\n",
