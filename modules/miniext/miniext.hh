@@ -34,6 +34,11 @@ int mount(int nvme_id, const char *mount_point);
 int umount();
 bool is_mounted();
 
+// Where the filesystem is mounted, e.g. "/db". Empty when not mounted.
+// A relative path has no meaning here -- there is no working directory -- so
+// callers that receive one resolve it against this.
+std::string mount_point();
+
 // Paths are absolute and must start with the mount point.
 static const int O_RD     = 0x1;
 static const int O_WR     = 0x2;

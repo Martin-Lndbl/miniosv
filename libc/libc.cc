@@ -19,6 +19,7 @@
 #include <osv/debug.h>
 #include <sched.h>
 #include <termios.h>
+#include "drivers/console.hh"
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <osv/clock.hh>
@@ -176,42 +177,63 @@ extern "C" int sysinfo(struct sysinfo *info)
     return 0;
 }
 
+// The terminal calls talk to the console directly. They used to go through
+// ioctl(TCGETS/TCSETS/...), which meant the one ioctl in the kernel existed
+// solely to serve them -- an indirection with nothing on the other side.
+//
+// Only the standard streams are terminals here; there is no fd table and
+// nothing else to be a tty.
+static bool is_std_fd(int fd)
+{
+    return fd >= 0 && fd <= 2;
+}
+
 int tcgetattr(int fd, termios *p)
 {
-    return ioctl(fd, TCGETS, p);
+    if (!is_std_fd(fd)) {
+        errno = ENOTTY;
+        return -1;
+    }
+    if (!p) {
+        errno = EFAULT;
+        return -1;
+    }
+    *p = console::tio;
+    return 0;
 }
 
 int tcsetattr(int fd, int action, const termios *p)
 {
+    if (!is_std_fd(fd)) {
+        errno = ENOTTY;
+        return -1;
+    }
     switch (action) {
     case TCSANOW:
-        break;
     case TCSADRAIN:
-        tcdrain(fd);
-        break;
     case TCSAFLUSH:
-        tcdrain(fd);
-        tcflush(fd,TCIFLUSH);
         break;
     default:
         errno = EINVAL;
         return -1;
     }
-    return ioctl(fd, TCSETS, p);
+    // Accepted and ignored. console::read() is already raw -- no echo, no line
+    // discipline (drivers/console-multiplexer.hh) -- which is the mode a line
+    // editor asks for, and there is nothing else to act on. Refusing would stop
+    // interactive programs from editing at all.
+    return 0;
 }
 
 int tcdrain(int fd)
 {
-    // The archaic TCSBRK is customary on Linux for draining output.
-    // BSD would have used TIOCDRAIN.
-    return ioctl(fd, TCSBRK, 1);
+    // Output is written straight through to the device; nothing is queued.
+    return is_std_fd(fd) ? 0 : (errno = ENOTTY, -1);
 }
 
 int tcflush(int fd, int what)
 {
-    // Linux uses TCFLSH. BSD would have used TIOCFLUSH (and different
-    // argument).
-    return ioctl(fd, TCFLSH, what);
+    // Nothing is buffered in either direction, so there is nothing to discard.
+    return is_std_fd(fd) ? 0 : (errno = ENOTTY, -1);
 }
 
 speed_t cfgetospeed(const termios *p)
@@ -252,7 +274,8 @@ int cfsetspeed(struct termios *tio, speed_t speed)
 
 int tcsendbreak(int fd, int dur)
 {
-	return ioctl(fd, TCSBRK, 0);
+    // A break condition has no meaning for the console.
+    return is_std_fd(fd) ? 0 : (errno = ENOTTY, -1);
 }
 
 void cfmakeraw(struct termios *t)

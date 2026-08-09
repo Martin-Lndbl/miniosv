@@ -64,6 +64,8 @@ fs *get_fs() { return &g_fs; }
 
 bool is_mounted() { return g_fs.mounted; }
 
+std::string mount_point() { return g_fs.mounted ? g_fs.mount_point : std::string(); }
+
 int mount(int nvme_id, const char *mount_point)
 {
     fs *f = &g_fs;

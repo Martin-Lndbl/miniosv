@@ -54,7 +54,11 @@ OSV_LIBC_API
 ssize_t __llvm_libc_stdio_read(void *cookie, char *buf, size_t size)
 {
     if (cookie == &__llvm_libc_stdin_cookie) {
-        return 0; // no console input: report EOF
+        // The FILE* side of stdin. read(0, ...) in libc/io.cc is a separate
+        // path -- fgets()/fgetc()/std::cin come through here -- so both have to
+        // reach the console or a program gets EOF depending only on which API
+        // it happened to use.
+        return console::read(buf, size);
     }
     return -EBADF;
 }

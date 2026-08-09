@@ -15,9 +15,14 @@
 
 namespace console {
 
-// Output-only console: fans writes out to all registered drivers, applying
-// the cooked-output \n -> \r\n (ONLCR) translation. There is no read path -
-// the console has no reader and no line discipline.
+// Fans writes out to all registered drivers, applying the cooked-output
+// \n -> \r\n (ONLCR) translation.
+//
+// Input is raw: read_char() returns the first byte any driver offers, with no
+// line discipline -- no echo, no line editing, no signal characters. The only
+// consumer is a shell that does its own editing (linenoise), which wants raw
+// bytes anyway, and a line discipline here would be a second implementation of
+// what it already does.
 class console_multiplexer {
 public:
     explicit console_multiplexer(const termios *tio, console_driver *early_driver = nullptr);
@@ -27,6 +32,8 @@ public:
     void write_ll(const char *str, size_t len);
     void write(const char *str, size_t len);
     void write(struct uio *uio, int ioflag);
+    int read_char();
+    bool input_available();
 private:
     void drivers_write(const char *str, size_t len);
     void drivers_flush();
