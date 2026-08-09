@@ -374,6 +374,72 @@ int os_miniext_main()
         check(ok, "unlink all 200");
     }
 
+    // --- out-of-order writes -------------------------------------------
+    // Extents must stay sorted by logical block. Appending blindly works for a
+    // sequential writer and corrupts the tree for anyone else: lookups then
+    // miss mappings that exist and the same block gets allocated twice. DuckDB
+    // writes this way, which is how the bug was found.
+    {
+        int err = 0;
+        miniext::file *f = miniext::open("/db/ooo.bin",
+                                         miniext::O_RDWR | miniext::O_CREATE, &err);
+        check(f != nullptr, "create /db/ooo.bin");
+        if (f) {
+            const size_t bs = 4096;
+            std::vector<uint8_t> blk(bs);
+
+            // Write descending, so every write lands before the previous one.
+            bool ok = true;
+            for (int i = 63; i >= 0; i--) {
+                memset(blk.data(), (uint8_t)(i + 1), bs);
+                if (miniext::pwrite(f, blk.data(), bs, (uint64_t)i * bs) != (int64_t)bs) {
+                    ok = false;
+                    break;
+                }
+            }
+            check(ok, "write 64 blocks in descending order");
+            check(miniext::size(f) == 64 * bs, "size after descending writes");
+
+            // Then a scattered pass over the same file.
+            const int scatter[] = {40, 3, 61, 17, 0, 58, 22, 9};
+            ok = true;
+            for (int i : scatter) {
+                memset(blk.data(), (uint8_t)(200 + i), bs);
+                if (miniext::pwrite(f, blk.data(), bs, (uint64_t)i * bs) != (int64_t)bs) {
+                    ok = false;
+                    break;
+                }
+            }
+            check(ok, "rewrite scattered blocks");
+
+            // Every block must read back exactly what was last written to it.
+            ok = true;
+            for (int i = 0; i < 64 && ok; i++) {
+                uint8_t want = (uint8_t)(i + 1);
+                for (int j : scatter) {
+                    if (j == i) {
+                        want = (uint8_t)(200 + i);
+                    }
+                }
+                if (miniext::pread(f, blk.data(), bs, (uint64_t)i * bs) != (int64_t)bs) {
+                    ok = false;
+                    break;
+                }
+                for (size_t k = 0; k < bs; k++) {
+                    if (blk[k] != want) {
+                        printf("        block %d byte %zu = %u, expected %u\n",
+                               i, k, blk[k], want);
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            check(ok, "every block reads back its last written value");
+            miniext::close(f);
+        }
+    }
+    check(miniext::unlink("/db/ooo.bin") == 0, "unlink ooo.bin");
+
     check(miniext::sync() == 0, "final sync");
     check(miniext::umount() == 0, "umount");
 

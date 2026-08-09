@@ -101,6 +101,17 @@ def setup_pflash(arch, code, vars_, workdir):
                 fh.truncate(64 * 1024 * 1024)
     return code_copy, vars_copy
 
+def set_boot_args(image, args):
+    """Store the application arguments in the boot image.
+
+    The image carries them in a reserved sector, which is the only channel that
+    works the same under QEMU and on the clouds -- see scripts/setargs.py. This
+    rewrites the image in place, so it must happen before QEMU opens it.
+    """
+    setargs = os.path.join(os.path.dirname(os.path.abspath(__file__)), "setargs.py")
+    subprocess.check_call([sys.executable, setargs, image, args])
+
+
 def start_osv_qemu(options):
     workdir = tempfile.mkdtemp(prefix='miniosv-run-')
     try:
@@ -236,6 +247,10 @@ if __name__ == "__main__":
                         help="passthrough PCI device(s) bound to vfio-pci, e.g. 0000:01:00.0")
     parser.add_argument("--gic-version", action="store", default="3",
                         help="aarch64 GIC version under TCG (default 3)")
+    parser.add_argument("--args", action="store", metavar="STRING",
+                        help="application arguments; written into the boot "
+                             "image before starting (see scripts/setargs.py). "
+                             "The first word names the executable to run.")
     cmdargs = parser.parse_args()
 
     # The build output dir is build/<mode>.<arch> (arch as x64 / aarch64), so
@@ -250,5 +265,9 @@ if __name__ == "__main__":
 
     if cmdargs.hypervisor == "auto":
         cmdargs.hypervisor = choose_hypervisor(cmdargs.arch)
+
+    # Rewrite the image before QEMU opens it.
+    if cmdargs.args is not None:
+        set_boot_args(cmdargs.image_file, cmdargs.args)
 
     main(cmdargs)

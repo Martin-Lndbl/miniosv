@@ -59,6 +59,7 @@ private:
     };
 
     int submit(void *buf, uint64_t block, uint32_t count, bool write);
+    int bounce(void *buf, uint64_t block, uint32_t count, bool write);
     queue &pick();
 
     std::vector<std::unique_ptr<queue>> _queues;

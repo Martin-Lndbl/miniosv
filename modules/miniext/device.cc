@@ -17,6 +17,7 @@
 #include <cstring>
 
 #include <osv/contiguous_alloc.hh>
+#include <osv/mmu.hh>
 #include <osv/sched.hh>
 
 #include "drivers/nvme.hh"
@@ -29,6 +30,11 @@ namespace miniext {
 // deeper would allow more in-flight requests per CPU at the cost of more
 // pinned command slots.
 static const int NVME_QUEUE_DEPTH = 16;
+
+// Largest bounce transfer. Buffers outside the linear map have to be copied
+// through DMA-capable memory, and this caps how much contiguous memory that
+// costs at a time.
+static const uint32_t BOUNCE_MAX = 128 * 1024;
 
 // One outstanding request; the completion callback runs in the MSI-X handler,
 // so it does the minimum: flag and wake. This mirrors what the driver's own
@@ -178,13 +184,54 @@ int device::submit(void *buf, uint64_t block, uint32_t count, bool write)
     return 0;
 }
 
+// virt_to_phys only translates the linear map: core/mmu.cc:163-166 asserts on
+// anything else, and its own comment says mmap'd addresses would have to be
+// bounced. DuckDB allocates its buffers with mmap, so a transfer straight into
+// one faults. Copy through DMA-capable memory when that is where we are handed.
+int device::bounce(void *buf, uint64_t block, uint32_t count, bool write)
+{
+    const uint32_t per_pass = BOUNCE_MAX / _block_size;
+    scratch tmp(per_pass * _block_size);
+    if (!tmp) {
+        return -ENOMEM;
+    }
+
+    auto *p = static_cast<uint8_t *>(buf);
+    while (count) {
+        const uint32_t here = count < per_pass ? count : per_pass;
+        const size_t bytes = static_cast<size_t>(here) * _block_size;
+
+        if (write) {
+            memcpy(tmp.data(), p, bytes);
+        }
+        int rc = submit(tmp.data(), block, here, write);
+        if (rc < 0) {
+            return rc;
+        }
+        if (!write) {
+            memcpy(p, tmp.data(), bytes);
+        }
+
+        p += bytes;
+        block += here;
+        count -= here;
+    }
+    return 0;
+}
+
 int device::read(void *buf, uint64_t block, uint32_t count)
 {
+    if (!mmu::is_linear_mapped(buf, static_cast<size_t>(count) * _block_size)) {
+        return bounce(buf, block, count, false);
+    }
     return submit(buf, block, count, false);
 }
 
 int device::write(const void *buf, uint64_t block, uint32_t count)
 {
+    if (!mmu::is_linear_mapped(buf, static_cast<size_t>(count) * _block_size)) {
+        return bounce(const_cast<void *>(buf), block, count, true);
+    }
     return submit(const_cast<void *>(buf), block, count, true);
 }
 
