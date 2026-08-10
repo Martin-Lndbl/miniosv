@@ -95,6 +95,40 @@ struct fs_info {
 };
 int info(fs_info *out);
 
+// --- raw namespaces ------------------------------------------------------
+//
+// An NVMe namespace read as one flat file, with no filesystem on it. A model
+// weights file is attached to the guest this way (scripts/run.py
+// --emulated-nvme model.gguf): the host file is the namespace, so there is no
+// image to build, nothing to stage, and reads go to the requested byte offset.
+//
+// This lives in miniext because miniext owns the NVMe device layer -- the
+// per-vCPU queues, the PRP scatter-gather and the bounce path for buffers that
+// are not linearly mapped. A second consumer costs one file here; a second copy
+// of that machinery would cost much more.
+//
+// Reads are positional, arbitrary-aligned and safe to issue concurrently: like
+// the filesystem above, a thread submits on its own CPU's queue and waits for
+// its own completion, so a caller doing its own prefetching can keep many
+// requests in flight.
+namespace raw {
+
+struct device;
+
+// `nvme_id` numbers the controllers as mount() does: 0 is the boot disk, then
+// the --emulated-nvme drives in the order they were given.
+device *open(int nvme_id, int *err = nullptr);
+void close(device *d);
+
+// The namespace size in bytes. The host file is rounded up to a whole number
+// of LBAs, so this can exceed the original file by up to one LBA.
+uint64_t size(device *d);
+
+// Bytes read, 0 at end of namespace, or -errno.
+int64_t pread(device *d, void *buf, size_t len, uint64_t offset);
+
+} // namespace raw
+
 } // namespace miniext
 
 #endif /* MINIEXT_HH */

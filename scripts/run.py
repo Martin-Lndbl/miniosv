@@ -144,11 +144,15 @@ def start_osv_qemu(options):
             "-drive", "id=bootdisk,format=raw,if=none,file=%s" % options.image_file,
             "-device", "nvme,serial=miniosv,drive=bootdisk"]
 
-        # Optional extra emulated NVMe drive (e.g. a backing store for the app).
-        if options.emulated_nvme:
+        # Extra emulated NVMe drives, in the order given: the guest sees them as
+        # controller 1, 2, ... (0 is the boot disk). A drive is either a
+        # filesystem image to mount, or a single file the application reads as a
+        # raw namespace -- llama.cpp takes its model that way, with no image to
+        # build and no filesystem in between.
+        for i, image in enumerate(options.emulated_nvme or [], start=1):
             args += [
-                "-drive", "file=%s,if=none,id=nvm1" % options.emulated_nvme,
-                "-device", "nvme,serial=deadbeef,drive=nvm1"]
+                "-drive", "file=%s,if=none,id=nvm%d,format=raw" % (image, i),
+                "-device", "nvme,serial=deadbeef%d,drive=nvm%d" % (i, i)]
 
         # PCI passthrough: one -device per address. Devices must be bound to
         # vfio-pci on the host, and QEMU must run with enough privilege (sudo).
@@ -241,8 +245,9 @@ if __name__ == "__main__":
     parser.add_argument("--arch", action="store", choices=["x86_64", "aarch64"],
                         default=host_arch,
                         help="guest architecture (default: host arch)")
-    parser.add_argument("--emulated-nvme", action="store", metavar="IMAGE",
-                        help="attach a raw disk image as an extra emulated NVMe device")
+    parser.add_argument("--emulated-nvme", action="append", metavar="IMAGE",
+                        help="attach a file as an extra emulated NVMe device; repeatable, "
+                             "and the guest numbers them 1, 2, ... in the order given")
     parser.add_argument("--pass-pci", action="store", nargs='+', metavar="ADDR",
                         help="passthrough PCI device(s) bound to vfio-pci, e.g. 0000:01:00.0")
     parser.add_argument("--gic-version", action="store", default="3",

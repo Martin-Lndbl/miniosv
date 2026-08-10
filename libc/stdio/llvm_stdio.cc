@@ -133,6 +133,23 @@ off_t ftello(FILE *f)
     return -1;
 }
 
+/* The long-offset spellings. llvm-libc omits these on baremetal for the same
+ * reason it omits fseeko/ftello: the only streams are the three unseekable
+ * console ones. Applications that need a real file go to miniext. */
+OSV_LIBC_API
+int fseek(FILE *f, long off, int whence)
+{
+    errno = ESPIPE;
+    return -1;
+}
+
+OSV_LIBC_API
+long ftell(FILE *f)
+{
+    errno = ESPIPE;
+    return -1;
+}
+
 OSV_LIBC_API
 int ungetc(int c, FILE *f)
 {

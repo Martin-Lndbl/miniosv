@@ -132,8 +132,13 @@ hw_driver *nvme_driver::probe(hw_device *dev) {
   return nullptr;
 }
 
+// An id with no controller behind it is an ordinary outcome, not a bug: an
+// image booted without a data disk asks for controller 1 and must be told no.
+// Callers already test the result (modules/miniext/device.cc:58).
 nvme_driver *nvme_driver::get_nvme_device(int id) {
-  assert(id >= 0 && (size_t)id < nvme_drives.size());
+  if (id < 0 || (size_t)id >= nvme_drives.size()) {
+    return nullptr;
+  }
   return nvme_drives[id];
 }
 

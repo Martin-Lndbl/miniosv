@@ -417,6 +417,12 @@ $(out)/%.o: %.cc | generated-headers $(out)/.libcxx-built
 	$(makedir)
 	$(call quiet, $(CXX) $(CXXFLAGS) -c -o $@ $<, CXX $*.cc)
 
+# The kernel itself uses .cc throughout; .cpp is here for the applications under
+# app/, where DuckDB and llama.cpp both use it.
+$(out)/%.o: %.cpp | generated-headers $(out)/.libcxx-built
+	$(makedir)
+	$(call quiet, $(CXX) $(CXXFLAGS) -c -o $@ $<, CXX $*.cpp)
+
 $(out)/%.o: %.c | generated-headers
 	$(makedir)
 	$(call quiet, $(CC) $(CFLAGS) -c -o $@ $<, CC $*.c)
@@ -754,6 +760,12 @@ objects += modules/miniext/extent.o
 objects += modules/miniext/inode.o
 objects += modules/miniext/dir.o
 objects += modules/miniext/file.o
+# Raw namespace reads, for data attached as a bare file rather than an image.
+objects += modules/miniext/raw.o
+# The miniext side of the std::fstream shim (include/osv/fstream_shim.hpp).
+# Both applications force-include that header: libc++ here is built with
+# LIBCXX_ENABLE_FILESYSTEM=OFF, so std::ifstream is declared and never defined.
+objects += modules/miniext/fstream.o
 endif
 
 # Minimal console-backed stdio lives in libc/io.cc.

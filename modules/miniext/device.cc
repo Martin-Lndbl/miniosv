@@ -15,6 +15,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <map>
 
 #include <osv/contiguous_alloc.hh>
 #include <osv/mmu.hh>
@@ -77,34 +78,61 @@ int device::open(int nvme_id)
     _block_size = _lba_size;
     _lbas_per_block = 1;
 
-    // One queue per vCPU, each with its completion interrupt pinned to that
-    // CPU. create_io_queue asserts on a null cpu despite its doc comment saying
-    // nullptr means "current", so the CPU is always passed explicitly.
-    //
-    // The controller may hand out fewer queues than we ask for (the driver caps
-    // MSI-X vectors at min(msix_entries, ncpus + 1), one of which is the admin
-    // queue). Whatever we get, pick() maps CPUs onto it, so fewer queues costs
-    // throughput but never correctness.
-    for (size_t i = 0; i < sched::cpus.size(); i++) {
-        auto *qp = static_cast<nvme::io_queue_pair *>(
-            drv->create_io_queue(NVME_QUEUE_DEPTH, sched::cpus[i]));
-        if (!qp) {
-            break;
-        }
-        auto slot = std::unique_ptr<queue>(new queue());
-        slot->q = qp;
-        _queues.push_back(std::move(slot));
-    }
-
-    if (_queues.empty()) {
+    _queues = queues_for(nvme_id, drv);
+    if (!_queues || _queues->empty()) {
         printf("miniext: could not create any NVMe I/O queue\n");
         return -EIO;
     }
-    if (_queues.size() < sched::cpus.size()) {
-        printf("miniext: %zu I/O queues for %zu vCPUs; some will share\n",
-               _queues.size(), sched::cpus.size());
-    }
     return 0;
+}
+
+// The queue set for a controller, created on first use and kept for the life of
+// the boot. See device::queue_set in internal.hh for why it is shared rather
+// than per-open.
+std::shared_ptr<device::queue_set> device::queues_for(int nvme_id,
+                                                      nvme::nvme_driver *drv)
+{
+    static mutex sets_lock;
+    static std::map<int, std::shared_ptr<queue_set>> sets;
+
+    WITH_LOCK(sets_lock) {
+        auto it = sets.find(nvme_id);
+        if (it != sets.end()) {
+            return it->second;
+        }
+
+        auto set = std::make_shared<queue_set>();
+
+        // One queue per vCPU, each with its completion interrupt pinned to that
+        // CPU. create_io_queue asserts on a null cpu despite its doc comment
+        // saying nullptr means "current", so the CPU is always passed
+        // explicitly.
+        //
+        // The controller may hand out fewer queues than we ask for (the driver
+        // caps MSI-X vectors at min(msix_entries, ncpus + 1), one of which is
+        // the admin queue). Whatever we get, pick() maps CPUs onto it, so fewer
+        // queues costs throughput but never correctness.
+        for (size_t i = 0; i < sched::cpus.size(); i++) {
+            auto *qp = static_cast<nvme::io_queue_pair *>(
+                drv->create_io_queue(NVME_QUEUE_DEPTH, sched::cpus[i]));
+            if (!qp) {
+                break;
+            }
+            auto slot = std::unique_ptr<queue>(new queue());
+            slot->q = qp;
+            set->push_back(std::move(slot));
+        }
+
+        if (set->empty()) {
+            return nullptr;
+        }
+        if (set->size() < sched::cpus.size()) {
+            printf("miniext: %zu I/O queues for %zu vCPUs; some will share\n",
+                   set->size(), sched::cpus.size());
+        }
+        sets.emplace(nvme_id, set);
+        return set;
+    }
 }
 
 // The queue for the CPU we are running on. A thread can migrate between
@@ -113,7 +141,7 @@ int device::open(int nvme_id)
 device::queue &device::pick()
 {
     unsigned id = sched::cpu::current()->id;
-    return *_queues[id % _queues.size()];
+    return *(*_queues)[id % _queues->size()];
 }
 
 int device::set_block_size(uint32_t block_size)
@@ -130,13 +158,14 @@ int device::set_block_size(uint32_t block_size)
 
 void device::close()
 {
-    // The driver owns the queues; there is no teardown path we need here.
-    _queues.clear();
+    // The driver owns the queues and the set outlives every device that used
+    // it; dropping the reference is all there is to do.
+    _queues.reset();
 }
 
 int device::submit(void *buf, uint64_t block, uint32_t count, bool write)
 {
-    if (_queues.empty()) {
+    if (!_queues || _queues->empty()) {
         return -ENODEV;
     }
 
@@ -237,7 +266,7 @@ int device::write(const void *buf, uint64_t block, uint32_t count)
 
 int device::flush()
 {
-    if (_queues.empty()) {
+    if (!_queues || _queues->empty()) {
         return -ENODEV;
     }
 

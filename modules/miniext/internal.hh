@@ -15,7 +15,7 @@
 #include "miniext.hh"
 #include "ondisk.hh"
 
-namespace nvme { class io_queue_pair; }
+namespace nvme { class io_queue_pair; class nvme_driver; }
 
 namespace miniext {
 
@@ -50,19 +50,35 @@ public:
 
     uint64_t lba_count() const { return _lba_count; }
     uint32_t lba_size() const { return _lba_size; }
-    size_t queue_count() const { return _queues.size(); }
+    size_t queue_count() const { return _queues ? _queues->size() : 0; }
 
-private:
     struct queue {
         nvme::io_queue_pair *q = nullptr;
         mutex lock;             // submission only, never held across the wait
     };
 
+    // The queues belong to the controller, not to whoever opened it. They are
+    // created on the first open() of a controller and shared by every device
+    // addressing it afterwards -- the filesystem and a raw namespace reader can
+    // hold the same controller with different block sizes, and opening one file
+    // twice must not ask for a second set.
+    //
+    // Sharing is safe for the same reason concurrent callers are: each queue
+    // has its own lock, held only across submission.
+    //
+    // It is also necessary. The driver allocates one MSI-X vector per queue and
+    // never recycles a queue id (drivers/nvme.cc:413), so a second set would be
+    // refused once the vectors ran out.
+    using queue_set = std::vector<std::unique_ptr<queue>>;
+
+private:
+    static std::shared_ptr<queue_set> queues_for(int nvme_id,
+                                                 nvme::nvme_driver *drv);
     int submit(void *buf, uint64_t block, uint32_t count, bool write);
     int bounce(void *buf, uint64_t block, uint32_t count, bool write);
     queue &pick();
 
-    std::vector<std::unique_ptr<queue>> _queues;
+    std::shared_ptr<queue_set> _queues;
     uint32_t _lba_size = 0;
     uint64_t _lba_count = 0;
     uint32_t _block_size = 0;

@@ -66,19 +66,32 @@
 
         ovmf_prefix = if system == "x86_64-linux" then "OVMF" else "AAVMF";
 
+        # Firmware for running the *other* architecture under emulation, so
+        # `make arch=aarch64 && scripts/run.py --arch aarch64` works from an
+        # x86_64 workstation. pkgs.qemu ships edk2-aarch64-code.fd but no
+        # matching variable store; the aarch64 pflash only needs a blank one of
+        # the right size, and scripts/run.py pads both to 64 MiB itself.
+        crossFirmware = pkgs.lib.optionalAttrs (system == "x86_64-linux") {
+          AAVMF_CODE = "${pkgs.qemu}/share/qemu/edk2-aarch64-code.fd";
+          AAVMF_VARS = pkgs.runCommand "aavmf-vars.fd" { } "install -m444 /dev/null $out";
+        };
+
       in
       {
         devShells = rec {
-          default = pkgs.mkShell {
-            nativeBuildInputs = buildDeps ++ [
-              pkgs.qemu
-              pkgs.gdb
-            ];
+          default = pkgs.mkShell (
+            {
+              nativeBuildInputs = buildDeps ++ [
+                pkgs.qemu
+                pkgs.gdb
+              ];
 
-            # UEFI boot requires OVMF installation
-            "${ovmf_prefix}_CODE" = "${pkgs.OVMF.fd}/FV/${ovmf_prefix}_CODE.fd";
-            "${ovmf_prefix}_VARS" = "${pkgs.OVMF.fd}/FV/${ovmf_prefix}_VARS.fd";
-          };
+              # UEFI boot requires OVMF installation
+              "${ovmf_prefix}_CODE" = "${pkgs.OVMF.fd}/FV/${ovmf_prefix}_CODE.fd";
+              "${ovmf_prefix}_VARS" = "${pkgs.OVMF.fd}/FV/${ovmf_prefix}_VARS.fd";
+            }
+            // crossFirmware
+          );
 
           aws = default.overrideAttrs (default: {
             nativeBuildInputs = [
