@@ -154,6 +154,20 @@ def start_osv_qemu(options):
                 "-drive", "file=%s,if=none,id=nvm%d,format=raw" % (image, i),
                 "-device", "nvme,serial=deadbeef%d,drive=nvm%d" % (i, i)]
 
+        # vAccel offload: the guest reaches a host accelerator through this
+        # device. It needs the QEMU that carries it (the lros-qemu flake, on
+        # PATH as $QEMU_VACCEL), and that QEMU needs $VACCEL_PLUGINS pointing
+        # at the plugin for the accelerator actually present -- RKNN on the
+        # Orange Pi, CUDA on a GPU host.
+        #
+        # disable-legacy=off,disable-modern=on: the device is pinned to legacy
+        # virtio at PCI id 0x1015. event_idx=off: no used-event suppression.
+        if options.vaccel:
+            args += [
+                "-object", "acceldev-backend-vaccel,id=gen0",
+                "-device", "virtio-accel-pci,id=accl0,runtime=gen0,"
+                           "disable-legacy=off,disable-modern=on,event_idx=off"]
+
         # PCI passthrough: one -device per address. Devices must be bound to
         # vfio-pci on the host, and QEMU must run with enough privilege (sudo).
         for pci in options.pass_pci or []:
@@ -173,7 +187,14 @@ def start_osv_qemu(options):
         for a in options.pass_args or []:
             args += a.split()
 
-        qemu_path = options.qemu_path or ('qemu-system-%s' % options.arch)
+        qemu_path = options.qemu_path
+        if not qemu_path and options.vaccel:
+            qemu_path = os.environ.get('QEMU_VACCEL')
+            if not qemu_path:
+                sys.exit("run: --vaccel needs the QEMU that carries virtio-accel. "
+                         "Enter the dev shell (which sets QEMU_VACCEL), or pass "
+                         "--qemu-path.")
+        qemu_path = qemu_path or ('qemu-system-%s' % options.arch)
         cmdline = [qemu_path] + args
 
         if options.dry_run:
@@ -248,6 +269,9 @@ if __name__ == "__main__":
     parser.add_argument("--emulated-nvme", action="append", metavar="IMAGE",
                         help="attach a file as an extra emulated NVMe device; repeatable, "
                              "and the guest numbers them 1, 2, ... in the order given")
+    parser.add_argument("--vaccel", action="store_true",
+                        help="attach the virtio-accel device; needs the QEMU from the "
+                             "lros-qemu flake (uses $QEMU_VACCEL unless --qemu-path is given)")
     parser.add_argument("--pass-pci", action="store", nargs='+', metavar="ADDR",
                         help="passthrough PCI device(s) bound to vfio-pci, e.g. 0000:01:00.0")
     parser.add_argument("--gic-version", action="store", default="3",

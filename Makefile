@@ -166,6 +166,10 @@ conf_drivers_nvme=1
 # device. There is no MMIO transport: the accel device is virtio-accel-pci, and
 # QEMU's aarch64 virt machine provides virtio over PCI.
 conf_drivers_virtio=1
+# The vAccel offload device. Needs the QEMU that carries it
+# (scripts/run.py --vaccel); a guest built with this on but booted without the
+# device simply finds none.
+conf_drivers_virtio_accel=1
 
 # miniext talks to the NVMe driver directly, so it cannot be built without it.
 # Catch that here rather than in a wall of missing-header errors.
@@ -552,6 +556,9 @@ ifeq ($(conf_drivers_virtio),1)
 drivers += drivers/virtio.o
 drivers += drivers/virtio-vring.o
 drivers += drivers/virtio-pci-device.o
+ifeq ($(conf_drivers_virtio_accel),1)
+drivers += drivers/virtio-accel.o
+endif
 endif
 endif
 drivers += drivers/driver.o

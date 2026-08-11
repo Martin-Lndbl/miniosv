@@ -4,6 +4,7 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     flake-utils.url = "github:numtide/flake-utils";
+    lros-qemu.url = "github:TUM-DSE/lros-qemu";
   };
 
   outputs =
@@ -11,6 +12,7 @@
       self,
       nixpkgs,
       flake-utils,
+      lros-qemu,
     }:
     flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" ] (
       system:
@@ -66,6 +68,11 @@
 
         ovmf_prefix = if system == "x86_64-linux" then "OVMF" else "AAVMF";
 
+        # The vAccel-capable QEMU, and the plain one. Both are on PATH: the
+        # normal `scripts/run.py` uses qemu-system-*, and `--vaccel` picks
+        # $QEMU_VACCEL instead, because only that binary knows the device.
+        qemuVaccel = lros-qemu.packages.${system}.qemu-vaccel;
+
         # Firmware for running the *other* architecture under emulation, so
         # `make arch=aarch64 && scripts/run.py --arch aarch64` works from an
         # x86_64 workstation. pkgs.qemu ships edk2-aarch64-code.fd but no
@@ -89,6 +96,10 @@
               # UEFI boot requires OVMF installation
               "${ovmf_prefix}_CODE" = "${pkgs.OVMF.fd}/FV/${ovmf_prefix}_CODE.fd";
               "${ovmf_prefix}_VARS" = "${pkgs.OVMF.fd}/FV/${ovmf_prefix}_VARS.fd";
+
+              # Not on PATH: it would shadow the plain qemu for every ordinary
+              # run. scripts/run.py --vaccel reaches for it by name.
+              QEMU_VACCEL = "${qemuVaccel}/bin/qemu-system-${rtArch}";
             }
             // crossFirmware
           );

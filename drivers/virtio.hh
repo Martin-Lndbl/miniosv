@@ -60,6 +60,9 @@ enum {
     VIRTIO_ID_9P      = 9,
     VIRTIO_ID_RPROC_SERIAL = 11,
     VIRTIO_ID_FS      = 26,
+    // Not a registered virtio id: the vAccel device picked 21 out of the
+    // reserved range (lros-qemu, subprojects/vaccel/include/hw/virtio).
+    VIRTIO_ID_ACCEL   = 21,
 };
 
 const unsigned max_virtqueues_nr = 64;

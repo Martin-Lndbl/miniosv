@@ -6,5 +6,6 @@
 #define CONF_drivers_pci 1
 #define CONF_drivers_nvme 1
 #define CONF_drivers_virtio 1
+#define CONF_drivers_virtio_accel 1
 
 #endif
