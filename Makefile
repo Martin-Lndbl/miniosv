@@ -160,12 +160,25 @@ conf_interrupt_stack_size=0x1000
 conf_drivers_acpi=1
 conf_drivers_pci=1
 conf_drivers_nvme=1
+# The virtio transport -- bus, vring, PCI binding -- with no device drivers of
+# its own. virtio-blk/fs went with the filesystem and virtio-net with the
+# network stack; what needs this back is virtio-accel, the vAccel offload
+# device. There is no MMIO transport: the accel device is virtio-accel-pci, and
+# QEMU's aarch64 virt machine provides virtio over PCI.
+conf_drivers_virtio=1
 
 # miniext talks to the NVMe driver directly, so it cannot be built without it.
 # Catch that here rather than in a wall of missing-header errors.
 ifeq ($(conf_fs_miniext),1)
 ifneq ($(conf_drivers_nvme),1)
 $(error conf_fs_miniext=1 needs conf_drivers_nvme=1)
+endif
+endif
+
+# The only virtio binding built is the PCI one.
+ifeq ($(conf_drivers_virtio),1)
+ifneq ($(conf_drivers_pci),1)
+$(error conf_drivers_virtio=1 needs conf_drivers_pci=1)
 endif
 endif
 
@@ -534,6 +547,11 @@ drivers += drivers/msi.o
 ifeq ($(conf_drivers_nvme),1)
 drivers += drivers/nvme.o
 drivers += drivers/nvme-queue.o
+endif
+ifeq ($(conf_drivers_virtio),1)
+drivers += drivers/virtio.o
+drivers += drivers/virtio-vring.o
+drivers += drivers/virtio-pci-device.o
 endif
 endif
 drivers += drivers/driver.o
