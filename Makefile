@@ -171,11 +171,24 @@ conf_drivers_virtio=1
 # device simply finds none.
 conf_drivers_virtio_accel=1
 
+# --- accelerator offload ---------------------------------------------------
+# The vAccel operations the application calls (modules/vaccel/include/vaccel.h),
+# on top of the virtio-accel transport. Like miniext, this is a library the
+# application calls directly -- there is no /dev/accel and no ioctl.
+conf_vaccel=1
+
 # miniext talks to the NVMe driver directly, so it cannot be built without it.
 # Catch that here rather than in a wall of missing-header errors.
 ifeq ($(conf_fs_miniext),1)
 ifneq ($(conf_drivers_nvme),1)
 $(error conf_fs_miniext=1 needs conf_drivers_nvme=1)
+endif
+endif
+
+# vAccel reaches its device through the virtio-accel driver.
+ifeq ($(conf_vaccel),1)
+ifneq ($(conf_drivers_virtio_accel),1)
+$(error conf_vaccel=1 needs conf_drivers_virtio_accel=1)
 endif
 endif
 
@@ -791,6 +804,12 @@ objects += modules/miniext/raw.o
 # Both applications force-include that header: libc++ here is built with
 # LIBCXX_ENABLE_FILESYSTEM=OFF, so std::ifstream is declared and never defined.
 objects += modules/miniext/fstream.o
+endif
+
+# The vAccel operations the application calls, on top of the virtio-accel
+# transport. See modules/vaccel/include/vaccel.h.
+ifeq ($(conf_vaccel),1)
+objects += modules/vaccel/vaccel.o
 endif
 
 # Minimal console-backed stdio lives in libc/io.cc.

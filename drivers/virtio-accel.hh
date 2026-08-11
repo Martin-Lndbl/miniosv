@@ -35,6 +35,12 @@ namespace virtio {
 // own buffer and copies from the descriptor, so the pointers below are never
 // dereferenced by the host and are carried only because they are part of the
 // struct it reads.
+//
+// Deliberately NOT packed. The device's copies are plain C structs at natural
+// alignment, and it advances through the descriptor stream by
+// `n * sizeof(struct virtio_accel_arg)` -- 48 bytes, not the 37 the fields add
+// up to. Packing these makes the device read the argument arrays at the wrong
+// stride and report "gop_arg[0] too short".
 
 enum accel_op_type : uint32_t {
     ACCEL_NO_OP           = 0,
@@ -58,22 +64,28 @@ struct accel_wire_arg {
     uint8_t *usr_pages;
     uint32_t usr_npages;
     uint8_t padding[5];
-} __attribute__((packed));
+};
 
 struct accel_wire_op {
     uint32_t in_nr;
     uint32_t out_nr;
     accel_wire_arg *in;
     accel_wire_arg *out;
-} __attribute__((packed));
+};
 
 struct accel_wire_hdr {
     uint32_t sess_id;
     uint32_t op_type;
     accel_wire_op op;
-} __attribute__((packed));
+};
 
 // --- driver --------------------------------------------------------------
+
+// The device advances through the stream by these sizes; if they drift, the
+// symptom is a mid-stream misparse rather than anything that names the cause.
+static_assert(sizeof(accel_wire_arg) == 48, "virtio_accel_arg layout");
+static_assert(sizeof(accel_wire_op) == 24, "virtio_accel_op layout");
+static_assert(sizeof(accel_wire_hdr) == 32, "virtio_accel_hdr layout");
 
 class accel : public virtio_driver {
 public:
