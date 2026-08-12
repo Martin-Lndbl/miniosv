@@ -12,6 +12,10 @@
 
 #include <osv/debug.hh>
 
+#ifdef __aarch64__
+#include "arch-pci.hh"
+#endif
+
 namespace virtio {
 
 virtio_pci_device::virtio_pci_device(pci::device *dev)
@@ -139,6 +143,7 @@ bool virtio_legacy_pci_device::parse_pci_config()
     if (_bar1 == nullptr) {
         return false;
     }
+
 
     // Check ABI version
     u8 rev = _dev->get_revision_id();
@@ -406,8 +411,29 @@ void virtio_modern_pci_device::parse_virtio_capabilities( std::vector<std::pair<
 virtio_device* create_virtio_pci_device(pci::device *dev) {
     if (dev->get_device_id() >= VIRTIO_PCI_MODERN_ID_MIN && dev->get_device_id() <= VIRTIO_PCI_MODERN_ID_MAX)
         return new virtio_modern_pci_device(dev);
-    else
-        return new virtio_legacy_pci_device(dev);
+
+#ifdef __aarch64__
+    // A legacy virtio device keeps its configuration registers behind an I/O
+    // BAR, and reaching those needs the host bridge's I/O aperture mapped.
+    // Nothing calls set_pci_io() here -- the device-tree parsing that used to
+    // went with the rest of the DTB code -- so pci_io_base is null and the
+    // first config access faults on a near-zero address.
+    //
+    // Refuse the device rather than fault: pci-generic.cc registers it as a
+    // plain PCI device instead and the guest boots. x86_64 is unaffected (it
+    // has real port I/O), and so is a modern virtio-1 device on either arch,
+    // whose configuration lives in memory BARs. Configure the device as
+    // virtio-1 if you need it here.
+    size_t io_len = 0;
+    if (pci::get_pci_io(&io_len) == 0) {
+        virtio_e("legacy virtio device %04x:%04x needs port I/O, which aarch64 "
+                 "does not map here; configure it as a modern virtio-1 device",
+                 dev->get_vendor_id(), dev->get_device_id());
+        return nullptr;
+    }
+#endif
+
+    return new virtio_legacy_pci_device(dev);
 }
 
 }

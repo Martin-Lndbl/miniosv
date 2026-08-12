@@ -160,13 +160,21 @@ def start_osv_qemu(options):
         # at the plugin for the accelerator actually present -- RKNN on the
         # Orange Pi, CUDA on a GPU host.
         #
-        # disable-legacy=off,disable-modern=on: the device is pinned to legacy
-        # virtio at PCI id 0x1015. event_idx=off: no used-event suppression.
+        # disable-legacy=on: virtio-1, with the configuration registers in
+        # memory BARs. A legacy device puts them behind an I/O BAR instead,
+        # which aarch64 cannot reach here -- nothing maps the host bridge's I/O
+        # aperture (see create_virtio_pci_device in drivers/virtio-pci-device.cc).
+        # Leaving it unset would give a transitional device on the root bus,
+        # which announces the legacy PCI id and lands on the same dead end.
+        # This needs the branch of lros-qemu that honours these properties
+        # rather than forcing legacy for Unikraft's benefit.
+        #
+        # event_idx=off: no used-event suppression.
         if options.vaccel:
             args += [
                 "-object", "acceldev-backend-vaccel,id=gen0",
                 "-device", "virtio-accel-pci,id=accl0,runtime=gen0,"
-                           "disable-legacy=off,disable-modern=on,event_idx=off"]
+                           "disable-legacy=on,event_idx=off"]
 
         # PCI passthrough: one -device per address. Devices must be bound to
         # vfio-pci on the host, and QEMU must run with enough privilege (sudo).

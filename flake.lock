@@ -42,15 +42,16 @@
         "nixpkgs": "nixpkgs"
       },
       "locked": {
-        "lastModified": 1786443150,
-        "narHash": "sha256-+6AkfYkVo8HbLU0bVOtaGT0Mp/+ZYbKCpgVKFjPmjRQ=",
+        "lastModified": 1786504779,
+        "narHash": "sha256-ijIscPI+w1KB6IWnjZBOp/qOHL59qjgijTez8c7Df0Y=",
         "owner": "TUM-DSE",
         "repo": "lros-qemu",
-        "rev": "1096af5e903706e4dcd4846ace9e380515596799",
+        "rev": "844b55482efd044a0901abd772eaa45c6ce0ebaa",
         "type": "github"
       },
       "original": {
         "owner": "TUM-DSE",
+        "ref": "master+vaccel+modern",
         "repo": "lros-qemu",
         "type": "github"
       }

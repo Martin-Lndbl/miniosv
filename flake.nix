@@ -4,7 +4,7 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     flake-utils.url = "github:numtide/flake-utils";
-    lros-qemu.url = "github:TUM-DSE/lros-qemu";
+    lros-qemu.url = "github:TUM-DSE/lros-qemu/master+vaccel+modern";
   };
 
   outputs =
@@ -67,17 +67,7 @@
         ];
 
         ovmf_prefix = if system == "x86_64-linux" then "OVMF" else "AAVMF";
-
-        # The vAccel-capable QEMU, and the plain one. Both are on PATH: the
-        # normal `scripts/run.py` uses qemu-system-*, and `--vaccel` picks
-        # $QEMU_VACCEL instead, because only that binary knows the device.
         qemuVaccel = lros-qemu.packages.${system}.qemu-vaccel;
-
-        # Firmware for running the *other* architecture under emulation, so
-        # `make arch=aarch64 && scripts/run.py --arch aarch64` works from an
-        # x86_64 workstation. pkgs.qemu ships edk2-aarch64-code.fd but no
-        # matching variable store; the aarch64 pflash only needs a blank one of
-        # the right size, and scripts/run.py pads both to 64 MiB itself.
         crossFirmware = pkgs.lib.optionalAttrs (system == "x86_64-linux") {
           AAVMF_CODE = "${pkgs.qemu}/share/qemu/edk2-aarch64-code.fd";
           AAVMF_VARS = pkgs.runCommand "aavmf-vars.fd" { } "install -m444 /dev/null $out";
@@ -96,9 +86,6 @@
               # UEFI boot requires OVMF installation
               "${ovmf_prefix}_CODE" = "${pkgs.OVMF.fd}/FV/${ovmf_prefix}_CODE.fd";
               "${ovmf_prefix}_VARS" = "${pkgs.OVMF.fd}/FV/${ovmf_prefix}_VARS.fd";
-
-              # Not on PATH: it would shadow the plain qemu for every ordinary
-              # run. scripts/run.py --vaccel reaches for it by name.
               QEMU_VACCEL = "${qemuVaccel}/bin/qemu-system-${rtArch}";
             }
             // crossFirmware
@@ -112,8 +99,6 @@
                   awscrt
                   boto3
                   botocore
-                  # We need to redeclare every python
-                  # dependency from the default shell
                   pyyaml
                 ]
               ))
