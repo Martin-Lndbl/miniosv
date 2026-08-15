@@ -198,6 +198,11 @@ struct rte_eth_dev {
   virtual int get_dev_info(rte_eth_dev_info *info) = 0;
   virtual int rss_reta_update(rte_eth_rss_reta_entry64 *reta,
                               uint16_t reta_size) = 0;
+  virtual int rss_reta_query(rte_eth_rss_reta_entry64 *reta,
+                             uint16_t reta_size) = 0;
+  // Fills rss_conf->rss_hf always, and rss_conf->rss_key when it is
+  // non-null (caller supplies a buffer of hash_key_size bytes).
+  virtual int rss_hash_conf_get(rte_eth_rss_conf *rss_conf) = 0;
 };
 
 __inline uint16_t rte_eth_tx_burst(uint16_t port, uint16_t qid,
@@ -281,6 +286,14 @@ __inline void rte_eth_macaddr_get(uint16_t port, rte_ether_addr* addr){
 
 __inline int rte_eth_dev_rss_reta_update(uint16_t port, rte_eth_rss_reta_entry64* reta, uint16_t reta_size){
     return eth_os::get_eth_for_port(port)->rss_reta_update(reta, reta_size);
+}
+
+__inline int rte_eth_dev_rss_reta_query(uint16_t port, rte_eth_rss_reta_entry64* reta, uint16_t reta_size){
+    return eth_os::get_eth_for_port(port)->rss_reta_query(reta, reta_size);
+}
+
+__inline int rte_eth_dev_rss_hash_conf_get(uint16_t port, rte_eth_rss_conf* rss_conf){
+    return eth_os::get_eth_for_port(port)->rss_hash_conf_get(rss_conf);
 }
 
 struct rte_eth_dev_tx_buffer {

@@ -75,7 +75,12 @@ int ena_rss_reta_update(rte_eth_dev *dev,
   if (reta_size == 0 || reta_conf == NULL)
     return -EINVAL;
 
-  if (!(dev->data.dev_conf.rxmode.offloads & RTE_ETH_RX_OFFLOAD_RSS_HASH)) {
+  // Gate on whether RSS is actually configured, not on RX_RSS_HASH. That
+  // offload only means "the device tags each RX descriptor with the hash
+  // value" — several ENA generations (e.g. c7i) support RSS while leaving
+  // it unadvertised, and testing it here made the key and the indirection
+  // table unreadable on exactly those devices.
+  if (!(dev->data.dev_conf.rxmode.mq_mode & RTE_ETH_MQ_RX_RSS_FLAG)) {
     ena_log_raw(ERR, "RSS was not configured for the PMD");
     return -ENOTSUP;
   }
@@ -135,7 +140,12 @@ int ena_rss_reta_query(struct rte_eth_dev *dev,
   if (reta_size == 0 || reta_conf == NULL)
     return -EINVAL;
 
-  if (!(dev->data.dev_conf.rxmode.offloads & RTE_ETH_RX_OFFLOAD_RSS_HASH)) {
+  // Gate on whether RSS is actually configured, not on RX_RSS_HASH. That
+  // offload only means "the device tags each RX descriptor with the hash
+  // value" — several ENA generations (e.g. c7i) support RSS while leaving
+  // it unadvertised, and testing it here made the key and the indirection
+  // table unreadable on exactly those devices.
+  if (!(dev->data.dev_conf.rxmode.mq_mode & RTE_ETH_MQ_RX_RSS_FLAG)) {
     ena_log_raw(ERR, "RSS was not configured for the PMD");
     return -ENOTSUP;
   }
@@ -518,7 +528,12 @@ int ena_rss_hash_conf_get(struct rte_eth_dev *dev,
   uint16_t admin_hf;
   static bool warn_once;
 
-  if (!(dev->data.dev_conf.rxmode.offloads & RTE_ETH_RX_OFFLOAD_RSS_HASH)) {
+  // Gate on whether RSS is actually configured, not on RX_RSS_HASH. That
+  // offload only means "the device tags each RX descriptor with the hash
+  // value" — several ENA generations (e.g. c7i) support RSS while leaving
+  // it unadvertised, and testing it here made the key and the indirection
+  // table unreadable on exactly those devices.
+  if (!(dev->data.dev_conf.rxmode.mq_mode & RTE_ETH_MQ_RX_RSS_FLAG)) {
     ena_log_raw(ERR, "RSS was not configured for the PMD");
     return -ENOTSUP;
   }
@@ -567,4 +582,13 @@ int ena_rss_hash_conf_get(struct rte_eth_dev *dev,
 int ena_eth_dev::rss_reta_update(rte_eth_rss_reta_entry64 *reta,
                                  uint16_t reta_size) {
   return ena_rss_reta_update(this, reta, reta_size);
+}
+
+int ena_eth_dev::rss_reta_query(rte_eth_rss_reta_entry64 *reta,
+                                uint16_t reta_size) {
+  return ena_rss_reta_query(this, reta, reta_size);
+}
+
+int ena_eth_dev::rss_hash_conf_get(rte_eth_rss_conf *rss_conf) {
+  return ena_rss_hash_conf_get(this, rss_conf);
 }
