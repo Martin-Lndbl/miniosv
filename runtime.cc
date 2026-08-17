@@ -375,11 +375,6 @@ void exit(int status)
 
 // "The function _exit() is like exit(3), but does not call any functions
 // registered with atexit(3) or on_exit(3)."
-//
-// atexit() below is already a no-op, so the two differ only in the message.
-// llvm-libc ships C's _Exit but not this POSIX spelling, and applications
-// reach for it from signal handlers -- llama.cpp's SIGINT handler calls
-// _exit(130) so the interrupt cannot re-enter what it interrupted.
 OSV_LIBC_API
 void _exit(int status)
 {

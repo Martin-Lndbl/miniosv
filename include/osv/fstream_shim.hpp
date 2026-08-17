@@ -1,29 +1,14 @@
 /*
  * miniOSv: std::ifstream / ofstream / fstream, backed by miniext.
  *
- * libc++ here is built with LIBCXX_ENABLE_FILESYSTEM=OFF (scripts/build-libcxx.sh),
- * because when it was configured the kernel had no filesystem at all. <iosfwd>
- * still declares basic_filebuf/basic_ifstream/... and the ifstream typedefs
- * unconditionally, but <fstream> only *defines* them under
- * _LIBCPP_HAS_FILESYSTEM, so std::ifstream is a typedef to an undefined
- * template. Anything that names it fails to compile.
- *
- * Both applications name it for real. DuckDB's benchmark runner reads every
- * .benchmark file with std::ifstream and writes its output and log with
- * ofstream; llama.cpp's common/ reads prompt, grammar and chat-template files
- * the same way, and the vAccel backend reads its kernel-shape JSON.
- *
- * Rather than turn libc++'s filesystem back on -- which would route these
- * through libc's fopen/fread, none of which work here -- this supplies explicit
- * char specializations that talk to miniext. It is force-included with
+ * libc++ is built with LIBCXX_ENABLE_FILESYSTEM=OFF (scripts/build-libcxx.sh),
+ * because the kernel has no filesystem. Rather than turning it on, this supplies
+ * explicit char specializations that talk to miniext. It is force-included with
  * -include, so no application source has to name it.
  *
  * The implementation lives in modules/miniext/fstream.cc behind a handful of C
  * entry points, so miniext's headers do not have to be dragged into every
  * translation unit that force-includes this.
- *
- * Specializing a std template is formally UB. So is DuckDB's wchar shim; the
- * alternative is patching each application, which is worse to maintain.
  */
 
 #pragma once
@@ -63,12 +48,10 @@ public:
 	basic_filebuf(const basic_filebuf &) = delete;
 	basic_filebuf &operator=(const basic_filebuf &) = delete;
 
-	//! Moving transfers the open file and leaves both buffers empty. The
-	//! get/put areas point into this object's own _in/_out arrays, so they
-	//! cannot be carried across; instead pending output is flushed and
-	//! read-ahead is given back to the file position, which leaves the source's
-	//! logical offset and the file's real offset equal at the moment of the
-	//! handover. underflow()/sync() re-establish the areas on first use.
+	//! Move constructor. get/put areas cannot be carried across; 
+	//! instead pending output is flushed and read-ahead is given 
+	//! back to the file position, which leaves the source's logical
+	//! offset and the file's real offset equal at the moment of the handover.
 	basic_filebuf &operator=(basic_filebuf &&other) noexcept {
 		if (this == &other) {
 			return *this;
@@ -280,9 +263,6 @@ public:
 		_buf.close();
 	}
 
-	//! `fout = std::ofstream(name, binary)` is how llama-quant.cpp:702 opens
-	//! each shard. The base's streambuf pointer stays aimed at our own _buf;
-	//! only the open file and the stream state move.
 	basic_ofstream(basic_ofstream &&other) : basic_ostream<char>(&_buf) {
 		_buf = std::move(other._buf);
 		clear(other.rdstate());

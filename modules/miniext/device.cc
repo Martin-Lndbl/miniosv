@@ -27,19 +27,14 @@
 
 namespace miniext {
 
-// Queue depth per vCPU queue. 16 matches what the driver's own callers use;
-// deeper would allow more in-flight requests per CPU at the cost of more
-// pinned command slots.
+// Queue depth per vCPU queue.
 static const int NVME_QUEUE_DEPTH = 16;
 
-// Largest bounce transfer. Buffers outside the linear map have to be copied
-// through DMA-capable memory, and this caps how much contiguous memory that
-// costs at a time.
+// Largest bounce transfer.
 static const uint32_t BOUNCE_MAX = 128 * 1024;
 
 // One outstanding request; the completion callback runs in the MSI-X handler,
-// so it does the minimum: flag and wake. This mirrors what the driver's own
-// admin queue does (drivers/nvme-queue.cc:563-565, 591-593).
+// so it does the minimum: flag and wake.
 namespace {
 struct io_request {
     sched::thread_handle waiter;
@@ -213,10 +208,7 @@ int device::submit(void *buf, uint64_t block, uint32_t count, bool write)
     return 0;
 }
 
-// virt_to_phys only translates the linear map: core/mmu.cc:163-166 asserts on
-// anything else, and its own comment says mmap'd addresses would have to be
-// bounced. DuckDB allocates its buffers with mmap, so a transfer straight into
-// one faults. Copy through DMA-capable memory when that is where we are handed.
+// Use a bounce buffer when the caller hands us a buffer outside the linear map
 int device::bounce(void *buf, uint64_t block, uint32_t count, bool write)
 {
     const uint32_t per_pass = BOUNCE_MAX / _block_size;

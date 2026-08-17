@@ -1,15 +1,3 @@
-/*
- * Application arguments read from a reserved block on the boot disk.
- *
- * See include/osv/bootargs.hh for why the boot disk and not fw_cfg or EFI
- * LoadOptions: this is the only channel that exists identically under QEMU and
- * on AWS, GCP and Azure, because nothing but this code interprets it.
- *
- * The block sits at LBA 34, in the gap the GPT layout leaves between the
- * primary partition entry array (which ends at LBA 33) and the ESP (which
- * starts at LBA 2048). scripts/setargs.py writes it; nothing else touches it.
- */
-
 #include <osv/bootargs.hh>
 #include <osv/drivers_config.h>
 
@@ -41,9 +29,8 @@ void read_complete(void *ctx, const nvme_sq_entry_t *)
     req->waiter.wake_from_kernel_or_with_irq_disabled();
 }
 
-// One raw sector off the boot disk (NVMe controller 0). Returns false when
-// there is no such controller -- booting from something else is not an error
-// here, just an absence of arguments.
+// Read one raw sector off the boot disk (NVMe controller 0). 
+// Returns false when there is no such controller (absence of arguments).
 bool read_boot_sector(unsigned lba, void *buf, unsigned bytes)
 {
     auto *drv = nvme::nvme_driver::get_nvme_device(0);
@@ -135,10 +122,6 @@ std::string bootargs()
     return cached;
 }
 
-// Whitespace-separated, with single and double quotes so an argument can hold
-// spaces -- "duckdb -c 'SELECT 42'" has to survive as three words. Quotes are
-// removed; there is no escape processing, which keeps this predictable and is
-// enough for a command line stored in a disk block.
 std::vector<std::string> bootargs_split(const std::string &line)
 {
     std::vector<std::string> out;

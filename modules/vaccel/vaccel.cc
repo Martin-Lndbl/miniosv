@@ -2,12 +2,7 @@
  * The vAccel operations, packed onto the virtio-accel transport.
  *
  * Every call has the same shape: a list of arguments the host reads, a list it
- * writes, and an opcode as the first read argument. The device copies each
- * argument out of its own descriptor, so what matters is the order and the
- * lengths -- see drivers/virtio-accel.hh for the descriptor layout, and
- * lros-unikraft/lib/libvaccelrt/operations_matmul.c for where these argument
- * lists come from. They have to match the host plugin's expectations exactly,
- * so the order below is copied rather than invented.
+ * writes, and an opcode as the first read argument.
  *
  * Handles (vaccel_tensor_mem_handle *, vaccel_matmul_ctx) are opaque host-side
  * tokens. Where an argument is a handle, it is the pointer *value* that

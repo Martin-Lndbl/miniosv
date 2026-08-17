@@ -13,7 +13,7 @@
 
 namespace {
 
-//! Same rule as LocalFileSystem: there is no working directory, so a relative
+//! There is no working directory, so a relative
 //! path is resolved against the mount point.
 std::string absolute(const char *path)
 {

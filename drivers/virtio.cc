@@ -51,11 +51,7 @@ void virtio_driver::setup_features()
     // Step 4 - negotiate features
     u64 dev_features = get_device_features();
     u64 drv_features = this->get_driver_features();
-
-    // A modern device offers VIRTIO_F_VERSION_1 and expects the driver to
-    // accept it -- that bit is what says the two sides agree on the virtio-1
-    // ring layout and the little-endian wire format. Drivers do not have to
-    // remember to ask for it; the transport already knows which one it is.
+    
     if (_dev.is_modern()) {
         drv_features |= 1ULL << VIRTIO_F_VERSION_1;
     }

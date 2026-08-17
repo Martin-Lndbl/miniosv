@@ -51,15 +51,7 @@ void set_extent(extent *e, uint32_t fblock, uint64_t phys, uint16_t len)
 
 // Insert [fblock, fblock+count) -> [phys, phys+count) into a leaf, keeping the
 // entries sorted by logical block.
-//
-// Sorted order is not cosmetic. extent_lookup() stops as soon as it sees an
-// entry starting past the block it wants, and e2fsck rejects a leaf whose
-// entries are out of order ("inode N has out of order extents"). An earlier
-// version only appended, which held for a sequential writer and broke the
-// moment DuckDB wrote a header and then blocks at scattered offsets: the list
-// went unsorted, lookups then missed mappings that existed, and the same
-// logical block got a second allocation -- inflating i_blocks and leaking the
-// first range.
+// Maintains ordering invariant: the first entry starting after fblock is at index `at`.
 //
 // Returns false only when the leaf is full and the entry cannot be merged.
 bool leaf_insert(extent_header *eh, uint16_t capacity, uint32_t fblock,
@@ -165,9 +157,6 @@ int inode_write(fs *f, uint32_t ino, const inode *in)
     return f->dev.write(buf.data(), block, 1);
 }
 
-// Mark an inode dead. Clearing i_links_count is not enough: e2fsck flags a
-// freed inode whose i_dtime is still zero ("Deleted inode N has zero dtime"),
-// because that is what distinguishes a deleted inode from a corrupt live one.
 void inode_mark_deleted(inode *in)
 {
     in->i_links_count = le16(0);
@@ -321,10 +310,7 @@ static int extent_insert(fs *f, uint32_t ino, inode *in, uint32_t fblock,
         if (rc < 0) {
             return rc;
         }
-        // An entry inserted below the leaf's index key makes that key stale,
-        // and extent_lookup() descends by comparing against it: a block before
-        // the first key looks like a hole and reads as zeros even though it is
-        // mapped. Lower the key to the leaf's new first block.
+        // Update the index entry if the leaf's first extent changed.
         const uint32_t first = le32(entries_as_extents(lh)[0].ee_block);
         if (first < le32(ix[slot].ei_block)) {
             ix[slot].ei_block = le32(first);

@@ -1,8 +1,8 @@
 /*
  * miniext: a minimal ext4-compatible filesystem for miniOSv.
  *
- * The application calls this directly. There is no VFS, no file-descriptor
- * table, and no libc file I/O involved (open() and related fail with ENOENT).
+ * The application calls these functions directly.
+ * No VFS, no file-descriptor table, and no libc file I/O involved.
  *
  * miniext interacts with the NVMe itself rather than through a block-device
  * abstraction: mount() takes the id of a controller registered by
@@ -33,7 +33,7 @@ int mount(int nvme_id, const char *mount_point);
 int umount();
 bool is_mounted();
 
-// Where the filesystem is mounted. Empty when not mounted.
+// Mountpoint. Empty when not mounted.
 // A relative path has no meaning here -- there is no working directory -- so
 // callers that receive one resolve it against this.
 std::string mount_point();

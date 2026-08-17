@@ -177,10 +177,7 @@ extern "C" int sysinfo(struct sysinfo *info)
     return 0;
 }
 
-// The terminal calls talk to the console directly. They used to go through
-// ioctl(TCGETS/TCSETS/...), which meant the one ioctl in the kernel existed
-// solely to serve them -- an indirection with nothing on the other side.
-//
+// The terminal calls talk to the console directly.
 // Only the standard streams are terminals here; there is no fd table and
 // nothing else to be a tty.
 static bool is_std_fd(int fd)
@@ -202,6 +199,7 @@ int tcgetattr(int fd, termios *p)
     return 0;
 }
 
+// The console is always ready to accept output, and has no output queue to drain.
 int tcsetattr(int fd, int action, const termios *p)
 {
     if (!is_std_fd(fd)) {
@@ -217,10 +215,8 @@ int tcsetattr(int fd, int action, const termios *p)
         errno = EINVAL;
         return -1;
     }
-    // Accepted and ignored. console::read() is already raw -- no echo, no line
-    // discipline (drivers/console-multiplexer.hh) -- which is the mode a line
-    // editor asks for, and there is nothing else to act on. Refusing would stop
-    // interactive programs from editing at all.
+    // Just accept the new settings: the console is always ready to accept output,
+    // and has no output queue to drain.
     return 0;
 }
 

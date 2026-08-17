@@ -54,10 +54,6 @@ OSV_LIBC_API
 ssize_t __llvm_libc_stdio_read(void *cookie, char *buf, size_t size)
 {
     if (cookie == &__llvm_libc_stdin_cookie) {
-        // The FILE* side of stdin. read(0, ...) in libc/io.cc is a separate
-        // path -- fgets()/fgetc()/std::cin come through here -- so both have to
-        // reach the console or a program gets EOF depending only on which API
-        // it happened to use.
         return console::read(buf, size);
     }
     return -EBADF;
@@ -133,9 +129,9 @@ off_t ftello(FILE *f)
     return -1;
 }
 
-/* The long-offset spellings. llvm-libc omits these on baremetal for the same
- * reason it omits fseeko/ftello: the only streams are the three unseekable
- * console ones. Applications that need a real file go to miniext. */
+/* Fail in all cases because the only file descriptors handled
+* by the libc are standard streams (non-seekable).
+*/
 OSV_LIBC_API
 int fseek(FILE *f, long off, int whence)
 {

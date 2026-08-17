@@ -6,15 +6,10 @@
     scripts/setargs.py build/release.x64/loader.img --clear
 
 The arguments live in one sector of the boot disk, at the LBA declared in
-include/osv/bootargs.hh. That gap -- between the end of the GPT partition entry
-array at LBA 33 and the start of the ESP at LBA 2048 -- belongs to no partition,
-so writing there disturbs nothing.
-
-Why the disk and not something more obvious: UEFI LoadOptions is empty when
-firmware boots removable media, which is how this image boots everywhere, and
-QEMU's fw_cfg does not exist on AWS Nitro, GCP or Azure. The boot disk is the
-one channel all of them have in common. This is the same idea as OSv's old
-scripts/imgedit.py, moved to an offset that is safe under GPT.
+include/osv/bootargs.hh. 
+That gap -- between the end of the GPT partition entry array at LBA 33 and 
+the start of the ESP at LBA 2048 -- belongs to no partition, so writing there 
+disturbs nothing.
 
 Editing the image in place means changing arguments costs no rebuild, and the
 same image can be re-tasked before each boot.

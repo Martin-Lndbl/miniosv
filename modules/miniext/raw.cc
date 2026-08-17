@@ -1,10 +1,8 @@
 /*
  * Reading an NVMe namespace as one flat file (miniext.hh, namespace raw).
  *
- * The device layer does all the work; this only turns byte offsets into LBAs
- * and copies the partial LBAs at each end through a scratch buffer. Whole LBAs
- * in the middle go straight into the caller's buffer, so a large aligned read
- * -- which is what a model loader issues -- costs no copy beyond the DMA.
+ * This simply translates byte offsets into LBAs and copies the partial LBAs
+ * at each end through a scratch buffer.
  *
  * Reads run at LBA granularity because that is the device's unit, so the
  * "block size" here is the LBA size: no filesystem, and nothing to align to

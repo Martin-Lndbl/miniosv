@@ -1168,7 +1168,7 @@ static int getaffinity(const sched::thread *t, size_t cpusetsize,
     // variable), it is not considered pinned.
     memset(cpuset, 0, cpusetsize);
     if (!t) {
-        // No thread (called before the scheduler is up): every CPU the kernel
+        // No thread yet (called before the scheduler is up): every CPU the kernel
         // knows about is allowable. May be none this early, in which case the
         // caller sees an empty set and has to cope -- which is still better
         // than faulting.
@@ -1190,11 +1190,9 @@ static int getaffinity(const sched::thread *t, size_t cpusetsize,
 int pthread_getaffinity_np(const pthread_t thread, size_t cpusetsize,
         cpu_set_t *cpuset)
 {
-    // Static constructors run from premain(), before sched::init(), so there is
-    // no current thread yet and pthread_self() hands back a null pthread_t.
-    // Dereferencing it faults. Report the CPUs that exist instead: a caller
-    // asking about affinity this early (jemalloc's library constructor does,
-    // via malloc_ncpus()) wants a plausible count, not a crash.
+    // Handle the case where pthread_getaffinity_np() is called before the scheduler is up. 
+    // This can happen when a static constructor calls malloc() 
+    // (which calls malloc_ncpus() which calls pthread_getaffinity_np()).
     if (!thread) {
         return getaffinity(nullptr, cpusetsize, cpuset);
     }

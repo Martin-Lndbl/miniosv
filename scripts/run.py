@@ -2,17 +2,11 @@
 
 # Launcher for the slim miniosv UEFI unikernel under QEMU.
 #
-# miniosv boots only via UEFI now (the -kernel PVH/preboot paths were removed).
-# This script boots the GPT/ESP disk image build/<mode>/loader.img through UEFI
-# firmware (OVMF on x86_64, AAVMF on aarch64) with the kernel embedded as the
-# EFI application - the same path the public clouds take. The kernel is diskless
-# (the single app is linked in); the boot disk is attached as NVMe, matching AWS
-# Nitro. The guest serial port is the console on your terminal.
-#
-# Just build, then run ./scripts/run.py. Override the firmware with the
-# OVMF_CODE/OVMF_VARS (x86_64) or AAVMF_CODE/AAVMF_VARS (aarch64) env vars.
-#
-# Console keys: Ctrl-A C opens the QEMU monitor, Ctrl-A X quits.
+# This script boots the GPT/ESP disk image build/<mode>/loader.img 
+# through UEFI firmware (OVMF on x86_64, AAVMF on aarch64) 
+# with the kernel embedded as the EFI application. 
+# The kernel is diskless (the single app is linked in); the boot disk is attached as NVMe.
+# The guest serial port is the console on your terminal.
 
 import subprocess
 import sys
@@ -155,21 +149,7 @@ def start_osv_qemu(options):
                 "-device", "nvme,serial=deadbeef%d,drive=nvm%d" % (i, i)]
 
         # vAccel offload: the guest reaches a host accelerator through this
-        # device. It needs the QEMU that carries it (the lros-qemu flake, on
-        # PATH as $QEMU_VACCEL), and that QEMU needs $VACCEL_PLUGINS pointing
-        # at the plugin for the accelerator actually present -- RKNN on the
-        # Orange Pi, CUDA on a GPU host.
-        #
-        # disable-legacy=on: virtio-1, with the configuration registers in
-        # memory BARs. A legacy device puts them behind an I/O BAR instead,
-        # which aarch64 cannot reach here -- nothing maps the host bridge's I/O
-        # aperture (see create_virtio_pci_device in drivers/virtio-pci-device.cc).
-        # Leaving it unset would give a transitional device on the root bus,
-        # which announces the legacy PCI id and lands on the same dead end.
-        # This needs the branch of lros-qemu that honours these properties
-        # rather than forcing legacy for Unikraft's benefit.
-        #
-        # event_idx=off: no used-event suppression.
+        # device.
         if options.vaccel:
             args += [
                 "-object", "acceldev-backend-vaccel,id=gen0",

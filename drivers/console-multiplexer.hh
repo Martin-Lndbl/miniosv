@@ -19,10 +19,7 @@ namespace console {
 // \n -> \r\n (ONLCR) translation.
 //
 // Input is raw: read_char() returns the first byte any driver offers, with no
-// line discipline -- no echo, no line editing, no signal characters. The only
-// consumer is a shell that does its own editing (linenoise), which wants raw
-// bytes anyway, and a line discipline here would be a second implementation of
-// what it already does.
+// line discipline. (linenoise does its own editing).
 class console_multiplexer {
 public:
     explicit console_multiplexer(const termios *tio, console_driver *early_driver = nullptr);

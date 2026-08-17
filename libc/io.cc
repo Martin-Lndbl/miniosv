@@ -160,24 +160,14 @@ OSV_LIBC_API int fstatvfs(int, struct statvfs *) { errno = ENOSYS; return -1; }
 
 OSV_LIBC_API int access(const char *, int) { errno = ENOENT; return -1; }
 OSV_LIBC_API int faccessat(int, const char *, int, int) { errno = ENOENT; return -1; }
-// There is no per-process working directory: getcwd() below always reports "/",
-// and relative paths are resolved by whatever filesystem the application talks
-// to (modules/miniext resolves them against its mount point). Accepting the
-// call is therefore truthful -- the directory a caller asks for is as current
-// as any other -- and returning an error is not: it makes portable code that
-// does chdir-then-relative-open fail at the chdir, which is not where the
-// limitation lies.
+// Applications manage their own 
 OSV_LIBC_API int chdir(const char *) { return 0; }
 OSV_LIBC_API int fchdir(int) { errno = EBADF; return -1; }
 OSV_LIBC_API int chmod(const char *, mode_t) { errno = ENOENT; return -1; }
 OSV_LIBC_API int fchmod(int, mode_t) { errno = EBADF; return -1; }
 OSV_LIBC_API int fchmodat(int, const char *, mode_t, int) { errno = ENOENT; return -1; }
 OSV_LIBC_API int fcntl(int, int, ...) { errno = EBADF; return -1; }
-// No ioctl(). It existed only for libc's own tcgetattr()/tcsetattr(), which now
-// talk to the console directly (libc/libc.cc); application code that wants the
-// terminal size calls osv_terminal_size() (include/osv/terminal.h). Anything
-// else asking for an ioctl gets a link error, which is the right answer on a
-// kernel with no device nodes.
+// No ioctl(). Applications access kernel functionality directly.
 OSV_LIBC_API int flock(int, int) { errno = EBADF; return -1; }
 OSV_LIBC_API int ftruncate(int, off_t) { errno = EBADF; return -1; }
 OSV_LIBC_API int truncate(const char *, off_t) { errno = ENOENT; return -1; }
@@ -217,9 +207,7 @@ OSV_LIBC_API int closedir(DIR *) { errno = EBADF; return -1; }
 OSV_LIBC_API int dirfd(DIR *) { errno = EINVAL; return -1; }
 
 // select()/poll() answer for the standard streams and nothing else: they are
-// the only file descriptors that exist. An interactive program asks "is a key
-// waiting" before reading, and answering ENOSYS makes it conclude the terminal
-// is broken -- the CLI's line editor does exactly that.
+// the only file descriptors that exist.
 //
 // Waiting is a poll-and-yield loop for the same reason console input is polled:
 // the only waiter is a shell sitting at a prompt.
