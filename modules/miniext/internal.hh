@@ -20,22 +20,13 @@ namespace nvme { class io_queue_pair; class nvme_driver; }
 namespace miniext {
 
 // --- device -------------------------------------------------------------
-//
-// The block layer, folded into the filesystem rather than sitting under it as
-// a separate abstraction. It turns filesystem block numbers into the byte
-// offsets the driver wants.
+// Block layer folded inside the filesysstem. It owns NVMe queues (1 per vCPU)
+//  and translate filesystem block numbers into byte offsets for the NVMe driver.
 //
 // Note the driver's submit_request() takes a BYTE offset and BYTE length
 // despite its parameter names, rings the doorbell itself, and returns 1 on
 // success / 0 when the submission queue was full and nothing was queued.
 //
-// One I/O queue per vCPU. A single io_queue_pair is not safe for concurrent
-// submitters -- its SCOPE_LOCK is commented out (drivers/nvme-queue.cc:338) and
-// the SQ tail advance is unsynchronised -- but separate queues are independent,
-// which is how leanstore drives this driver too. A thread submits on the queue
-// belonging to the CPU it is running on, and the per-queue lock is held only
-// across submit_request(), never across the wait, so many requests are in
-// flight at once.
 class device {
 public:
     int open(int nvme_id);
@@ -57,18 +48,10 @@ public:
         mutex lock;             // submission only, never held across the wait
     };
 
-    // The queues belong to the controller, not to whoever opened it. They are
-    // created on the first open() of a controller and shared by every device
-    // addressing it afterwards -- the filesystem and a raw namespace reader can
-    // hold the same controller with different block sizes, and opening one file
-    // twice must not ask for a second set.
+    // NVMe hardware queues are created once by the driver and shared in the kernel
     //
     // Sharing is safe for the same reason concurrent callers are: each queue
     // has its own lock, held only across submission.
-    //
-    // It is also necessary. The driver allocates one MSI-X vector per queue and
-    // never recycles a queue id (drivers/nvme.cc:413), so a second set would be
-    // refused once the vectors ran out.
     using queue_set = std::vector<std::unique_ptr<queue>>;
 
 private:
@@ -88,14 +71,7 @@ private:
 // --- scratch buffers ----------------------------------------------------
 //
 // A block-sized staging buffer, allocated and freed around a single access.
-// The device transfers whole blocks, so anything smaller -- the 1024-byte
-// superblock, a 256-byte inode inside a 4096-byte block, a directory block we
-// scan and discard, the partial block at the edge of an unaligned read -- lands
-// here first and is then copied out. Whole-block file reads go straight into
-// the caller's buffer instead.
-//
-// Block-sized and block-aligned makes it exactly one page, so a transfer needs
-// only prp1: no prp2, no PRP-list page.
+// Used to manipulate metadata smaller than a 4096-byte block.
 class scratch {
 public:
     explicit scratch(uint32_t size)
@@ -168,7 +144,7 @@ fs *get_fs();
 
 // --- metadata writeback -------------------------------------------------
 //
-// Every one of these lands on the device before it returns. There is no cache
+// Metadata writebacks are persisted before they returns. There is no cache
 // and no journal, so an interrupted sequence can leave the filesystem
 // inconsistent -- the order things are written in is the only ordering
 // guarantee there is. Allocate-then-link, and unlink-then-free.

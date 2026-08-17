@@ -2,10 +2,9 @@
  * miniext: a minimal ext4-compatible filesystem for miniOSv.
  *
  * The application calls this directly. There is no VFS, no file-descriptor
- * table, and no libc file I/O involved -- open() and friends in libc/io.cc keep
- * failing with ENOENT exactly as before.
+ * table, and no libc file I/O involved (open() and related fail with ENOENT).
  *
- * miniext talks to an NVMe namespace itself rather than through a block-device
+ * miniext interacts with the NVMe itself rather than through a block-device
  * abstraction: mount() takes the id of a controller registered by
  * drivers/nvme.cc (0 is the boot disk, 1 the second one attached with
  * run.py --emulated-nvme).
@@ -34,7 +33,7 @@ int mount(int nvme_id, const char *mount_point);
 int umount();
 bool is_mounted();
 
-// Where the filesystem is mounted, e.g. "/db". Empty when not mounted.
+// Where the filesystem is mounted. Empty when not mounted.
 // A relative path has no meaning here -- there is no working directory -- so
 // callers that receive one resolve it against this.
 std::string mount_point();
@@ -97,20 +96,8 @@ int info(fs_info *out);
 
 // --- raw namespaces ------------------------------------------------------
 //
-// An NVMe namespace read as one flat file, with no filesystem on it. A model
-// weights file is attached to the guest this way (scripts/run.py
-// --emulated-nvme model.gguf): the host file is the namespace, so there is no
-// image to build, nothing to stage, and reads go to the requested byte offset.
-//
-// This lives in miniext because miniext owns the NVMe device layer -- the
-// per-vCPU queues, the PRP scatter-gather and the bounce path for buffers that
-// are not linearly mapped. A second consumer costs one file here; a second copy
-// of that machinery would cost much more.
-//
-// Reads are positional, arbitrary-aligned and safe to issue concurrently: like
-// the filesystem above, a thread submits on its own CPU's queue and waits for
-// its own completion, so a caller doing its own prefetching can keep many
-// requests in flight.
+// An NVMe namespace read as one flat file, with no filesystem on it.
+// Used to attach images with a single file.
 namespace raw {
 
 struct device;

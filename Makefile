@@ -786,9 +786,8 @@ libc += malloc_hooks.o
 
 
 
-# There is still no VFS and no fd table, and libc/io.cc keeps failing every
-# file call. miniext is not wired into libc: it is a library the application
-# calls directly, and it drives its own NVMe I/O rather than sitting on top of a
+# Miniext is not wired into libc: it is a library the application calls directly, 
+# and it drives its own NVMe I/O rather than sitting on top of a
 # block-device layer. See modules/miniext/miniext.hh.
 ifeq ($(conf_fs_miniext),1)
 objects += modules/miniext/device.o
@@ -801,7 +800,7 @@ objects += modules/miniext/file.o
 # Raw namespace reads, for data attached as a bare file rather than an image.
 objects += modules/miniext/raw.o
 # The miniext side of the std::fstream shim (include/osv/fstream_shim.hpp).
-# Both applications force-include that header: libc++ here is built with
+# Applications may include that header: libc++ here is built with
 # LIBCXX_ENABLE_FILESYSTEM=OFF, so std::ifstream is declared and never defined.
 objects += modules/miniext/fstream.o
 endif

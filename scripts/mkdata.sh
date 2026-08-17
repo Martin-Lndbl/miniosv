@@ -37,7 +37,7 @@
 #                   rather than zeros.
 #   ^64bit          32-byte group descriptors and 32-bit block numbers.
 #
-# What survives is what miniext does implement: extent-mapped inodes, filetype
+# Miniext mplements the remaining: extent-mapped inodes, filetype
 # in dirents, plus flex_bg/sparse_super/large_file/huge_file/dir_nlink/
 # extra_isize/ext_attr/resize_inode, which are either allocation policy or
 # read-only-compat flags that change nothing we parse.
@@ -120,8 +120,6 @@ else
     echo "mkdata.sh: wrote $what, ext4, empty"
 fi
 
-# The same check that gates every miniext write test: the filesystem must be
-# clean before the guest ever touches it, so a later failure is unambiguously
-# ours.
+# Check that the filesystem is correct
 fsck.ext4 -f -n "$target" >/dev/null
 echo "mkdata.sh: fsck clean"
