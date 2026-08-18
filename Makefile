@@ -142,8 +142,7 @@ conf_core_debug_buffer_size=0xc800
 conf_core_dynamic_percpu_size=65536
 
 # --- memory ----------------------------------------------------------------
-conf_memory_l1_pool_size=512
-conf_memory_page_batch_size=32
+conf_memory_pressure_percent=10
 
 # --- filesystem ------------------------------------------------------------
 # miniext is a minimal ext4-compatible filesystem the application calls
@@ -664,6 +663,22 @@ objects += core/mempool.o
 ifeq ($(conf_memory_tracker),1)
 objects += core/alloctracker.o
 endif
+
+# Physical frame allocator: llfree (external/llfree, MIT) behind core/mem/frames.
+objects += external/llfree/bitfield.o
+objects += external/llfree/child.o
+objects += external/llfree/llfree.o
+objects += external/llfree/local.o
+objects += external/llfree/lower.o
+objects += external/llfree/tree.o
+objects += core/mem/frames/frames.o
+objects += core/mem/frames/boot.o
+objects += core/mem/frames/contiguous.o
+objects += core/mem/frames/pressure.o
+
+# Not ours: llfree is vendored C, and does not build under the kernel's -Werror.
+$(out)/external/llfree/%.o: CFLAGS += -w -Wno-error -I external/llfree
+$(out)/core/mem/frames/%.o: CXXFLAGS += -I external/llfree
 objects += core/printf.o
 ifeq ($(conf_tracepoints_sampler),1)
 objects += core/sampler.o
