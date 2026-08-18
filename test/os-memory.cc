@@ -20,7 +20,9 @@
 #include <osv/contiguous_alloc.hh>
 #include <osv/mempool.hh>
 #include <osv/mmu.hh>
+#include <osv/mem/frames.hh>
 #include <osv/pagealloc.hh>
+#include <osv/sched.hh>
 
 namespace {
 
@@ -79,6 +81,7 @@ unsigned n_cpus()
 }
 
 // Runs fn(i) on `threads` threads started together; returns the wall time.
+// Pins each thread to a cpu.
 template <typename F>
 double parallel(unsigned threads, F fn)
 {
@@ -87,6 +90,7 @@ double parallel(unsigned threads, F fn)
     std::atomic<bool> go{false};
     for (unsigned i = 0; i < threads; i++) {
         ts.emplace_back([&, i] {
+            sched::thread::pin(sched::cpus[i % sched::cpus.size()]);
             ready.fetch_add(1);
             while (!go.load(std::memory_order_acquire)) {
                 std::this_thread::yield();
@@ -169,7 +173,7 @@ void frames_functional()
                 ok = ok && mmu::virt_to_phys(static_cast<char *>(p) + off) == base + off;
             }
             CHECK(ok);
-            memory::free_phys_contiguous_aligned(p);
+            memory::free_phys_contiguous_aligned(p, size);
         }
     }
 
@@ -235,6 +239,46 @@ void frames_perf()
         }
     }
 
+    section("order 0, through mem::frames directly");
+    {
+        for (unsigned t = 1; t <= n_cpus(); t *= 2) {
+            double s = parallel(t, [&](unsigned) {
+                std::vector<void *> q(batch);
+                for (int r = 0; r < rounds; r++) {
+                    for (int i = 0; i < batch; i++) {
+                        q[i] = mem::frames::to_linear(mem::frames::alloc());
+                        escape(q[i]);
+                    }
+                    for (int i = 0; i < batch; i++) {
+                        mem::frames::free(mem::frames::from_linear(q[i]));
+                    }
+                }
+            });
+            report_scale("frames::alloc + free", t, 2.0 * batch * rounds * t, s);
+        }
+    }
+
+    section("cpu spread");
+    {
+        unsigned t = n_cpus();
+        std::vector<unsigned> seen(t, 0u);
+        parallel(t, [&](unsigned id) {
+            for (int i = 0; i < 1000; i++) {
+                mem::frames::free(mem::frames::alloc());
+            }
+            seen[id] = sched::cpu::current() ? sched::cpu::current()->id : 9999;
+        });
+        unsigned distinct = 0;
+        for (unsigned i = 0; i < t; i++) {
+            bool dup = false;
+            for (unsigned j = 0; j < i; j++) {
+                dup = dup || seen[j] == seen[i];
+            }
+            distinct += !dup;
+        }
+        printf("    %-46s %9u of %u\n", "distinct cpus running the threads", distinct, t);
+    }
+
     section("order 9");
     {
         const int total = 512;
@@ -266,7 +310,7 @@ void frames_perf()
                     break;
                 }
                 escape(q);
-                memory::free_phys_contiguous_aligned(q);
+                memory::free_phys_contiguous_aligned(q, size);
                 got++;
             }
             char label[64];
