@@ -156,13 +156,12 @@ bool fast_sigsegv_check(uintptr_t addr, exception_frame* ef)
         return true;
     }
 
-    struct check_cow : public virt_pte_visitor {
+    struct check_write_protected : public virt_pte_visitor {
         bool _result = false;
         void pte(pt_element<0> pte) override {
-            _result = !pte_is_cow(pte) && !pte.writable();
+            _result = !pte.writable();
         }
         void pte(pt_element<1> pte) override {
-            // large ptes are never cow yet
         }
     } visitor;
 

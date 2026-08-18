@@ -103,15 +103,10 @@ struct page_range {
 };
 
 void free_initial_memory_range(void* addr, size_t size);
-void enable_debug_allocator();
 
 extern bool tracker_enabled;
 
 
-namespace stats {
-    size_t free();
-    size_t total();
-}
 
 
 

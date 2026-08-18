@@ -6,6 +6,7 @@
  */
 
 #include <sys/mman.h>
+#include <osv/mem/frames.hh>
 #include <memory>
 #include <osv/mmu.hh>
 #include <osv/mempool.hh>
@@ -36,12 +37,6 @@ unsigned libc_flags_to_mmap(int flags)
     }
     if (flags & MAP_POPULATE) {
         mmap_flags |= mmu::mmap_populate;
-    }
-    if (flags & MAP_STACK) {
-        mmap_flags |= mmu::mmap_stack;
-    }
-    if (flags & MAP_SHARED) {
-        mmap_flags |= mmu::mmap_shared;
     }
     if (flags & MAP_UNINITIALIZED) {
         mmap_flags |= mmu::mmap_uninitialized;
@@ -236,7 +231,7 @@ static size_t break_area_size = 0;
 static bool initialize_program_break()
 {
     if (!program_break) {
-        break_area_size = align_down(memory::stats::free(), mmu::huge_page_size);
+        break_area_size = align_down(mem::frames::free_bytes(), mmu::huge_page_size);
         program_break = initial_program_break = mmap(NULL, break_area_size, PROT_READ|PROT_WRITE, MAP_ANONYMOUS|MAP_PRIVATE, -1, 0);
         return initial_program_break != MAP_FAILED;
     } else {

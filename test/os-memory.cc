@@ -183,22 +183,22 @@ void frames_functional()
         // the counter lags by up to a pool's worth. Exact accounting is one of
         // the things the rewrite should buy; record the drift for now.
         const size_t slack = 64ul << 20;
-        size_t before = memory::stats::free();
+        size_t before = mem::frames::free_bytes();
         const int n = 4096;
         std::vector<void *> p(n);
         for (int i = 0; i < n; i++) {
             p[i] = memory::alloc_page();
         }
-        size_t during = memory::stats::free();
+        size_t during = mem::frames::free_bytes();
         CHECK(during <= before);
         for (int i = 0; i < n; i++) {
             memory::free_page(p[i]);
         }
-        size_t after = memory::stats::free();
+        size_t after = mem::frames::free_bytes();
         CHECK(after >= during);
         CHECK(after + slack >= before);
         printf("      total %zu MiB, free %zu MiB, drift after %d pages: %ld KiB\n",
-               memory::stats::total() >> 20, after >> 20, n,
+               mem::frames::total_bytes() >> 20, after >> 20, n,
                (static_cast<long>(before) - static_cast<long>(after)) >> 10);
     }
 }
@@ -333,23 +333,23 @@ void vspace_functional()
     section("reserving consumes no physical memory");
     {
         const size_t size = 64ul << 20;
-        size_t before = memory::stats::free();
+        size_t before = mem::frames::free_bytes();
         void *p = mmu::map_anon(nullptr, size, 0, mmu::perm_rw);
         CHECK(p != nullptr);
-        CHECK(before - memory::stats::free() < size / 8);
+        CHECK(before - mem::frames::free_bytes() < size / 8);
         CHECK(!mmu::munmap(p, size).bad());
     }
 
     section("populate maps immediately, unmap returns the memory");
     {
         const size_t size = 8ul << 20;
-        size_t before = memory::stats::free();
+        size_t before = mem::frames::free_bytes();
         void *p = mmu::map_anon(nullptr, size, mmu::mmap_populate, mmu::perm_rw);
         CHECK(p != nullptr);
-        CHECK(before - memory::stats::free() >= size / 2);
+        CHECK(before - mem::frames::free_bytes() >= size / 2);
         CHECK(mmu::ismapped(p, size));
         CHECK(!mmu::munmap(p, size).bad());
-        CHECK(memory::stats::free() + (size / 4) >= before);
+        CHECK(mem::frames::free_bytes() + (size / 4) >= before);
     }
 
     section("reservations do not overlap");
@@ -785,7 +785,7 @@ void heap_perf()
 int os_memory_main()
 {
     printf("######## memory subsystem ########\n");
-    printf("cpus: %u, memory: %zu MiB\n", n_cpus(), memory::stats::total() >> 20);
+    printf("cpus: %u, memory: %zu MiB\n", n_cpus(), mem::frames::total_bytes() >> 20);
 
     frames_functional();
     frames_perf();

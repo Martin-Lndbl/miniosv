@@ -143,7 +143,7 @@ namespace pthread_private {
         }
         size_t size = attr.stack_size;
 #if CONF_lazy_stack
-        unsigned stack_flags = mmu::mmap_stack;
+        unsigned stack_flags = 0;
 #else
         unsigned stack_flags = mmu::mmap_populate;
 #endif

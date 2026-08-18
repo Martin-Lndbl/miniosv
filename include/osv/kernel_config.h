@@ -35,9 +35,6 @@
 #ifndef CONF_logger_debug
 #define CONF_logger_debug 0
 #endif
-#ifndef CONF_memory_debug
-#define CONF_memory_debug 0
-#endif
 #ifndef CONF_memory_pressure_percent
 #define CONF_memory_pressure_percent 10
 #endif

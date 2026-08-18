@@ -154,12 +154,6 @@ phys virt_to_phys(void *virt)
         return reinterpret_cast<phys>(static_cast<char*>(virt) - kernel_vm_shift);
     }
 
-#if CONF_memory_debug
-    if (virt > debug_base) {
-        return virt_to_phys_pt(virt);
-    }
-#endif
-
     // For now, only allow non-mmaped areas.  Later, we can either
     // bounce such addresses, or lock them in memory and translate
     assert(virt >= phys_mem);
@@ -202,15 +196,6 @@ void allocate_intermediate_level(hw_ptep<N> ptep)
 }
 
 // only 4k can be cow for now
-pt_element<0> pte_mark_cow(pt_element<0> pte, bool cow)
-{
-    if (cow) {
-        pte.set_writable(false);
-    }
-    pte.set_sw_bit(pte_cow, cow);
-    return pte;
-}
-
 template<int N>
 bool change_perm(hw_ptep<N> ptep, unsigned int perm)
 {
@@ -219,10 +204,6 @@ bool change_perm(hw_ptep<N> ptep, unsigned int perm)
     unsigned int old = (pte.valid() ? perm_read : 0) |
         (pte.writable() ? perm_write : 0) |
         (pte.executable() ? perm_exec : 0);
-
-    if (pte_is_cow(pte)) {
-        perm &= ~perm_write;
-    }
 
     // Note: in x86, if the present bit (0x1) is off, not only read is
     // disallowed, but also write and exec. So in mprotect, if any
@@ -1470,18 +1451,6 @@ linear_vma::linear_vma(void* virt, phys phys, size_t size, mattr mem_attr, const
 linear_vma::~linear_vma() {
 }
 
-std::string sysfs_linear_maps() {
-    std::string output;
-    WITH_LOCK(linear_vma_set_mutex.for_read()) {
-        for(auto *vma : linear_vma_set) {
-            char mattr = vma->_mem_attr == mmu::mattr::normal ? 'n' : 'd';
-            output += osv::sprintf("%18p %18p %12x rwxp %c %s\n",
-                vma->_virt_addr, (void*)vma->_phys_addr, vma->_size, mattr, vma->_name.c_str());
-        }
-    }
-    return output;
-}
-
 void linear_map(void* _virt, phys addr, size_t size, const char* name,
                 size_t slop, mattr mem_attr)
 {
@@ -1568,23 +1537,6 @@ error mincore(const void *addr, size_t length, unsigned char *vec)
         }
     }
     return no_error();
-}
-
-std::string procfs_maps()
-{
-    std::string output;
-    WITH_LOCK(vma_list_mutex.for_read()) {
-        for (auto& vma : vma_list) {
-            char read    = vma.perm() & perm_read  ? 'r' : '-';
-            char write   = vma.perm() & perm_write ? 'w' : '-';
-            char execute = vma.perm() & perm_exec  ? 'x' : '-';
-            char priv    = 'p';
-            output += osv::sprintf("%lx-%lx %c%c%c%c ", vma.start(), vma.end(), read, write, execute, priv);
-            // All mappings are anonymous now (no file-backed mappings).
-            output += osv::sprintf("00000000 00:00 0\n");
-        }
-    }
-    return output;
 }
 
 }

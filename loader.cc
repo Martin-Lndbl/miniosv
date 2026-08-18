@@ -211,8 +211,6 @@ void main_cont()
         // spin
     }
 
-    memory::enable_debug_allocator();
-
     if (sched::cpus.size() > sched::max_cpus) {
         printf("Too many cpus, can't boot with greater than %u cpus.\n", sched::max_cpus);
         poweroff();

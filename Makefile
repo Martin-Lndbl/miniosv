@@ -25,7 +25,6 @@
 # kconfig output and the conf/*.mk value files). Arch/mode-independent defaults:
 conf_preempt=1
 conf_tracing=0
-conf_debug_memory=0
 # debug level logging (enabled automatically in mode=debug)
 conf_logger_debug=0
 conf_debug_elf=0

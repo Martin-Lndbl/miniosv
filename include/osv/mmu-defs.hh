@@ -33,7 +33,6 @@ enum class mem_area {
     main,
     page,
     mempool,
-    debug,
 };
 
 constexpr mem_area identity_mapped_areas[] = {
@@ -62,9 +61,6 @@ constexpr void* translate_mem_area(mem_area from, mem_area to, void* addr)
 
 constexpr uintptr_t main_mem_area_base = get_mem_area_base(mem_area::main);
 static char* const phys_mem = reinterpret_cast<char*>(main_mem_area_base);
-// area for debug allocations:
-constexpr uintptr_t debug_mem_area_base = get_mem_area_base(mem_area::debug);
-static char* const debug_base = reinterpret_cast<char*>(debug_mem_area_base);
 
 enum {
     perm_read = 1,
@@ -78,20 +74,13 @@ enum {
 enum {
     mmap_fixed       = 1ul << 0,
     mmap_populate    = 1ul << 1,
-    mmap_shared      = 1ul << 2,
     mmap_uninitialized = 1ul << 3,
     mmap_small       = 1ul << 5,
-    mmap_file        = 1ul << 7,
-    mmap_stack       = 1ul << 8,
 };
 
 enum {
     advise_dontneed = 1ul << 0,
     advise_nohugepage = 1ul << 1,
-};
-
-enum {
-    pte_cow = 0,
 };
 
 /* flush tlb for the current processor */

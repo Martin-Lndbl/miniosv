@@ -31,7 +31,6 @@
 #include <osv/prio.hh>
 #include <stdlib.h>
 #include <osv/defer.hh>
-#include <osv/dbg-alloc.hh>
 #include <osv/migration-lock.hh>
 #include <osv/export.h>
 
@@ -53,15 +52,6 @@ TRACEPOINT(trace_memory_free, "buf=%p", void *);
 TRACEPOINT(trace_memory_realloc, "in=%p, newlen=%d, out=%p", void *, size_t, void *);
 TRACEPOINT(trace_memory_page_alloc, "page=%p", void*);
 TRACEPOINT(trace_memory_page_free, "page=%p", void*);
-TRACEPOINT(trace_memory_huge_failure, "page ranges=%d", unsigned long);
-TRACEPOINT(trace_memory_reclaim, "shrinker %s, target=%d, delta=%d", const char *, long, long);
-TRACEPOINT(trace_memory_wait, "allocation size=%d", size_t);
-
-namespace dbg {
-
-static size_t object_size(void* v);
-
-}
 
 std::atomic<unsigned int> smp_allocator_cnt{};
 bool smp_allocator = false;
@@ -442,17 +432,14 @@ namespace bi = boost::intrusive;
 // Our notion of free memory is "whatever is in the page ranges". Therefore it
 // starts at 0, and increases as we add page ranges.
 //
-// Free-memory accounting lives in mem::frames now; these remain because the
-// tests and the OOM message use them.
-namespace stats {
-    size_t free() { return mem::frames::free_bytes(); }
-    size_t total() { return mem::frames::total_bytes(); }
-}
-
-void oom()
+// There is nothing to reclaim: no page cache, no shrinkers, and the one client
+// that can give memory back registers with frames::watch_pressure() long before
+// it gets this far. So say what was asked for and stop, rather than block on a
+// wait that nobody will ever satisfy.
+void oom(size_t bytes)
 {
-    debug_early("Out of memory: could not allocate. Aborting.\n");
-    abort();
+    abort("Out of memory: %zu bytes requested, %zu MiB free of %zu MiB.\n",
+          bytes, mem::frames::free_bytes() >> 20, mem::frames::total_bytes() >> 20);
 }
 
 
@@ -685,7 +672,7 @@ static void* untracked_alloc_page()
 {
     void* ret = mem::frames::to_linear(mem::frames::alloc());
     if (!ret) {
-        oom();
+        oom(page_size);
     }
     trace_memory_page_alloc(ret);
     return ret;
@@ -819,8 +806,6 @@ static size_t object_size(void *object)
         }
     case mmu::mem_area::page:
         return mmu::page_size;
-    case mmu::mem_area::debug:
-        return dbg::object_size(object);
     default:
         abort();
     }
@@ -877,95 +862,9 @@ void free(void* object)
             else
                 return memory::early_free_object(object);
         }
-    case mmu::mem_area::debug:
-        return dbg::free(object);
     default:
         abort();
     }
-}
-
-namespace dbg {
-
-// debug allocator - give each allocation a new virtual range, so that
-// any use-after-free will fault.
-
-bool enabled;
-
-using mmu::debug_base;
-// FIXME: we assume the debug memory space is infinite (which it nearly is)
-// and don't reuse space
-std::atomic<char*> free_area{debug_base};
-struct header {
-    explicit header(size_t sz) : size(sz), size2(sz) {
-        memset(fence, '$', sizeof fence);
-    }
-    ~header() {
-        assert(size == size2);
-        assert(std::all_of(fence, std::end(fence), [=](char c) { return c == '$'; }));
-    }
-    size_t size;
-    char fence[16];
-    size_t size2;
-};
-static const size_t pad_before = 2 * mmu::page_size;
-static const size_t pad_after = mmu::page_size;
-
-static __thread bool recursed;
-
-void* malloc(size_t size, size_t alignment)
-{
-    if (!enabled || recursed) {
-        return std_malloc(size, alignment);
-    }
-
-    recursed = true;
-    auto unrecurse = defer([&] { recursed = false; });
-
-    {
-        auto asize = align_up(size, mmu::page_size);
-        auto padded_size = pad_before + asize + pad_after;
-        if (alignment > mmu::page_size) {
-            // Our allocations are page-aligned - might need more
-            padded_size += alignment - mmu::page_size;
-        }
-        char* v = free_area.fetch_add(padded_size, std::memory_order_relaxed);
-        // change v so that (v + pad_before) is aligned.
-        v += align_up(v + pad_before, alignment) - (v + pad_before);
-        mmu::vpopulate(v, mmu::page_size);
-        new (v) header(size);
-        v += pad_before;
-        mmu::vpopulate(v, asize);
-        memset(v + size, '$', asize - size);
-        // fill the memory with garbage, to catch use-before-init
-        uint8_t garbage = 3;
-        std::generate_n(v, size, [&] { return garbage++; });
-        return v;
-    }
-}
-
-void free(void* v)
-{
-    assert(!recursed);
-    recursed = true;
-    auto unrecurse = defer([&] { recursed = false; });
-    {
-        auto h = reinterpret_cast<header*>(static_cast<char*>(v) - pad_before);
-        auto size = h->size;
-        auto asize = align_up(size, mmu::page_size);
-        char* vv = reinterpret_cast<char*>(v);
-        assert(std::all_of(vv + size, vv + asize, [=](char c) { return c == '$'; }));
-        h->~header();
-        mmu::vdepopulate(h, mmu::page_size);
-        mmu::vdepopulate(v, asize);
-        mmu::vcleanup(h, pad_before + asize);
-    }
-}
-
-static inline size_t object_size(void* v)
-{
-    return reinterpret_cast<header*>(static_cast<char*>(v) - pad_before)->size;
-}
-
 }
 
 void* malloc(size_t size)
@@ -976,11 +875,7 @@ void* malloc(size_t size)
     if (alignment > size) {
         alignment = 1ul << ilog2_roundup(size);
     }
-#if CONF_memory_debug == 0
     void* buf = std_malloc(size, alignment);
-#else
-    void* buf = dbg::malloc(size, alignment);
-#endif
 
     trace_memory_malloc(buf, size, alignment);
     return buf;
@@ -1026,11 +921,7 @@ int posix_memalign(void **memptr, size_t alignment, size_t size)
     if (!is_power_of_two(alignment)) {
         return EINVAL;
     }
-#if CONF_memory_debug == 0
     void* ret = std_malloc(size, alignment);
-#else
-    void* ret = dbg::malloc(size, alignment);
-#endif
     trace_memory_malloc(ret, size, alignment);
     if (!ret) {
         return ENOMEM;
@@ -1065,11 +956,6 @@ void *memalign(size_t alignment, size_t size)
 }
 
 namespace memory {
-
-void enable_debug_allocator()
-{
-    dbg::enabled = true;
-}
 
 // Straight to the frame allocator: the caller passes the size back at free
 // time, so there is no header, and therefore no need for the allocation to be

@@ -139,26 +139,14 @@ bool ismapped(const void *addr, size_t size);
 bool isreadable(void *addr, size_t size);
 
 
-template<int N>
-inline bool pte_is_cow(pt_element<N> pte)
-{
-    return false;
-}
-
-template<>
-inline bool pte_is_cow(pt_element<0> pte)
-{
-    return pte.sw_bit(pte_cow); // only 4k pages can be cow for now
-}
-
-static TRACEPOINT(trace_clear_pte, "ptep=%p, cow=%d, pte=%x", void*, bool, uint64_t);
+static TRACEPOINT(trace_clear_pte, "ptep=%p, pte=%x", void*, uint64_t);
 
 template<int N>
 __attribute__((always_inline)) // Necessary because of issue #1029
 inline pt_element<N> clear_pte(hw_ptep<N> ptep)
 {
     auto old = ptep.exchange(make_empty_pte<N>());
-    trace_clear_pte(ptep.release(), pte_is_cow(old), old.addr());
+    trace_clear_pte(ptep.release(), old.addr());
     return old;
 }
 
@@ -227,23 +215,13 @@ inline bool write_pte(void *addr, hw_ptep<N> ptep, pt_element<N> pte)
     return ptep.compare_exchange(ptep.read(), pte);
 }
 
-pt_element<0> pte_mark_cow(pt_element<0> pte, bool cow);
-
+// Linear-mapped memory is contiguous in both address spaces, so a range is
+// always one physical run.
 template <typename OutputFunc>
 inline
 void virt_to_phys(void* vaddr, size_t len, OutputFunc out)
 {
-    if (CONF_memory_debug && vaddr >= debug_base) {
-        while (len) {
-            auto next = std::min(align_down(static_cast<char*>(vaddr) + page_size, page_size), static_cast<char*>(vaddr) + len);
-            size_t delta = static_cast<char*>(next) - static_cast<char*>(vaddr);
-            out(virt_to_phys(vaddr), delta);
-            vaddr = next;
-            len -= delta;
-        }
-    } else {
-        out(virt_to_phys(vaddr), len);
-    }
+    out(virt_to_phys(vaddr), len);
 }
 
 void* phys_to_virt(phys pa);
@@ -287,9 +265,6 @@ void vcleanup(void* addr, size_t size);
 error  advise(void* addr, size_t size, int advice);
 
 void vm_fault(uintptr_t addr, exception_frame* ef);
-
-std::string procfs_maps();
-std::string sysfs_linear_maps();
 
 unsigned long all_vmas_size();
 
