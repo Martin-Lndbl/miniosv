@@ -37,11 +37,11 @@ same filesystem, so nothing is copied twice.
 
 ```bash
 make app=duckdb
-app/miniduckdb/miniosv/mk-tpch.sh --src /scratch/ilya --img /scratch/tpch.img 1 10
+app/miniduckdb/miniosv/mk-tpch.sh --src [tpch_data_folder] --img [data_img] 1 10
 
-scripts/run.py --image-path build/duckdb.x64/loader.img -m 32G --emulated-nvme /scratch/tpch.img \
+scripts/run.py --image-path build/duckdb.x64/loader.img -m 32G --emulated-nvme [data_img] \
     --args "benchmark --sf 10 benchmark/tpch-parquet/q06.benchmark"        # one query
-scripts/run.py --image-path build/duckdb.x64/loader.img -m 32G --emulated-nvme /scratch/tpch.img \
+scripts/run.py --image-path build/duckdb.x64/loader.img -m 32G --emulated-nvme [data_img] \
     --args "benchmark --sf 10 'benchmark/tpch-parquet/q[0-9]+.benchmark'"  # all 22
 ```
 
@@ -98,7 +98,7 @@ Matmul offload to a host accelerator, built in by default (`conf_vaccel=0` for a
 make app=llama arch=aarch64 conf_vaccel=1
 scripts/run.py --arch aarch64 --vaccel -m 6G \
     --emulated-nvme build/data.img --emulated-nvme "$MODEL" \
-    --args "llama-cli -m nvme:2 -no-cnv -p 'The capital of France is' -n 32 -t 4"
+    --args "llama-cli -m nvme:2 -no-cnv -p 'What is a combustion engine' -n 32 -t 4"
 ```
 
 Needs the QEMU from the `lros-qemu` flake (`nix develop` sets `$QEMU_VACCEL`) and
