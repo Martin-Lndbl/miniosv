@@ -38,11 +38,8 @@
 #ifndef CONF_memory_debug
 #define CONF_memory_debug 0
 #endif
-#ifndef CONF_memory_l1_pool_size
-#define CONF_memory_l1_pool_size 512
-#endif
-#ifndef CONF_memory_page_batch_size
-#define CONF_memory_page_batch_size 32
+#ifndef CONF_memory_pressure_percent
+#define CONF_memory_pressure_percent 10
 #endif
 #ifndef CONF_memory_tracker
 #define CONF_memory_tracker 0

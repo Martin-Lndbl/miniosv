@@ -71,7 +71,7 @@ public:
     ~staging()
     {
         if (_p) {
-            memory::free_phys_contiguous_aligned(_p);
+            memory::free_phys_contiguous_aligned(_p, _size);
         }
     }
     staging(const staging &) = delete;

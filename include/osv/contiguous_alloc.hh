@@ -13,7 +13,9 @@
 namespace memory {
 
 void* alloc_phys_contiguous_aligned(size_t sz, size_t align, bool block = true);
-void free_phys_contiguous_aligned(void* p);
+// The size is the caller's to remember: there is no header in front of the
+// allocation to hold it.
+void free_phys_contiguous_aligned(void* p, size_t sz);
 
 };
 

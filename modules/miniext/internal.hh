@@ -76,11 +76,11 @@ class scratch {
 public:
     explicit scratch(uint32_t size)
         : _p(static_cast<uint8_t *>(
-              memory::alloc_phys_contiguous_aligned(size, size))) {}
+              memory::alloc_phys_contiguous_aligned(size, size))), _size(size) {}
     ~scratch()
     {
         if (_p) {
-            memory::free_phys_contiguous_aligned(_p);
+            memory::free_phys_contiguous_aligned(_p, _size);
         }
     }
     scratch(const scratch &) = delete;
@@ -91,6 +91,7 @@ public:
 
 private:
     uint8_t *_p;
+    uint32_t _size;
 };
 
 // --- mounted filesystem -------------------------------------------------

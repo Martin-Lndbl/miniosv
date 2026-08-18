@@ -100,7 +100,7 @@ std::string read_bootargs()
             out.assign(blk->args, len);
         }
     }
-    memory::free_phys_contiguous_aligned(buf);
+    memory::free_phys_contiguous_aligned(buf, 512);
     return out;
 #else
     return {};

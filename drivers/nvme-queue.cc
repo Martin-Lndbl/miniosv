@@ -67,12 +67,14 @@ namespace nvme
         std::map<u32, nvme_ns_t *> &ns)
         : _id(id), _driver_id(did), _qsize(qsize), _dev(&dev), _sq(sq_doorbell), _sq_full(false), _cq(cq_doorbell), _cq_phase_tag(1), _ns(ns)
     {
-        size_t sq_buf_size = qsize * sizeof(nvme_sq_entry_t);
+        _sq_buf_size = qsize * sizeof(nvme_sq_entry_t);
+        size_t sq_buf_size = _sq_buf_size;
         _sq._addr = (nvme_sq_entry_t *)alloc_phys_contiguous_aligned(sq_buf_size, mmu::page_size);
         assert(_sq._addr);
         memset(_sq._addr, 0, sq_buf_size);
 
-        size_t cq_buf_size = qsize * sizeof(nvme_cq_entry_t);
+        _cq_buf_size = qsize * sizeof(nvme_cq_entry_t);
+        size_t cq_buf_size = _cq_buf_size;
         _cq._addr = (nvme_cq_entry_t *)alloc_phys_contiguous_aligned(cq_buf_size, mmu::page_size);
         assert(_cq._addr);
         memset(_cq._addr, 0, cq_buf_size);
@@ -82,8 +84,8 @@ namespace nvme
 
     queue_pair::~queue_pair()
     {
-        free_phys_contiguous_aligned(_sq._addr);
-        free_phys_contiguous_aligned(_cq._addr);
+        free_phys_contiguous_aligned(_sq._addr, _sq_buf_size);
+        free_phys_contiguous_aligned(_cq._addr, _cq_buf_size);
     }
 
     inline void queue_pair::advance_sq_tail()

@@ -146,6 +146,10 @@ protected:
     // Admin queue is 8 entries long, therefore occupies 640 bytes (8 * (64 + 16))
     // I/O queue is normally 64 entries long, therefore occupies 5K (64 * (64 + 16))
     u32 _qsize;
+    // Kept so the destructor can hand the buffers back: freeing physical memory
+    // takes the size, there is no header in front of the allocation.
+    size_t _sq_buf_size;
+    size_t _cq_buf_size;
 
     pci::device* _dev;
 

@@ -252,6 +252,7 @@ class virtio_driver;
         u16 _q_index;
         // The physical of the physical address handed to the virtio device
         void* _vring_ptr;
+        size_t _vring_size;
         
         // Total number of descriptors in ring
         unsigned int _num;

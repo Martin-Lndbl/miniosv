@@ -45,6 +45,7 @@ namespace virtio {
         // Alloc enough pages for the vring...
         size_t alignment = driver->get_vring_alignment();
         size_t sz = VIRTIO_ALIGN(vring::get_size(num, alignment), alignment);
+        _vring_size = sz;
         _vring_ptr = memory::alloc_phys_contiguous_aligned(sz, 4096);
         memset(_vring_ptr, 0, sz);
         
@@ -78,7 +79,7 @@ namespace virtio {
 
     vring::~vring()
     {
-        memory::free_phys_contiguous_aligned(_vring_ptr);
+        memory::free_phys_contiguous_aligned(_vring_ptr, _vring_size);
         delete [] _cookie;
     }
 
@@ -220,7 +221,8 @@ namespace virtio {
                 int idx = elem._id;
 
                 if (_desc[idx]._flags & vring_desc::VRING_DESC_F_INDIRECT) {
-                    free_phys_contiguous_aligned(mmu::phys_to_virt(_desc[idx]._paddr));
+                    free_phys_contiguous_aligned(mmu::phys_to_virt(_desc[idx]._paddr),
+                                                 _desc[idx]._len);
                 } else
                     while (_desc[idx]._flags & vring_desc::VRING_DESC_F_NEXT) {
                         idx = _desc[idx]._next;
