@@ -142,11 +142,13 @@ conf_core_debug_buffer_size=0xc800
 conf_core_dynamic_percpu_size=65536
 
 # --- memory ----------------------------------------------------------------
-conf_memory_l1_pool_size=512
-conf_memory_page_batch_size=32
+conf_memory_pressure_percent=10
 
 # --- filesystem ------------------------------------------------------------
-conf_fs_max_file_descriptors=0x4000
+# miniext is a minimal ext4-compatible filesystem the application calls
+# directly (modules/miniext/miniext.hh). There is still no VFS and no fd table.
+# It drives an NVMe namespace itself, so it needs conf_drivers_nvme.
+conf_fs_miniext=1
 
 # --- threads / stacks ------------------------------------------------------
 conf_threads_default_kernel_stack_size=65536
@@ -157,6 +159,35 @@ conf_interrupt_stack_size=0x1000
 conf_drivers_acpi=1
 conf_drivers_pci=1
 conf_drivers_ena=1
+conf_drivers_nvme=1
+# vAccel needs virtio transport drivers (bus, vring, PCI).
+conf_drivers_virtio=1
+conf_drivers_virtio_accel=1
+
+# --- accelerator offload ---------------------------------------------------
+conf_vaccel=1
+
+# miniext talks to the NVMe driver directly, so it cannot be built without it.
+# Catch that here rather than in a wall of missing-header errors.
+ifeq ($(conf_fs_miniext),1)
+ifneq ($(conf_drivers_nvme),1)
+$(error conf_fs_miniext=1 needs conf_drivers_nvme=1)
+endif
+endif
+
+# vAccel reaches its device through the virtio-accel driver.
+ifeq ($(conf_vaccel),1)
+ifneq ($(conf_drivers_virtio_accel),1)
+$(error conf_vaccel=1 needs conf_drivers_virtio_accel=1)
+endif
+endif
+
+# The only virtio binding built is the PCI one.
+ifeq ($(conf_drivers_virtio),1)
+ifneq ($(conf_drivers_pci),1)
+$(error conf_drivers_virtio=1 needs conf_drivers_pci=1)
+endif
+endif
 
 ifneq ($(MAKECMDGOALS),clean)
 $(info Building into $(out))
@@ -322,7 +353,8 @@ $(out)/libc/%.o: source-dialects =
 
 # do not hide symbols in libc because it has its own hiding mechanism
 
-kernel-defines = -D_KERNEL $(source-dialects)
+kernel-defines = -D_KERNEL $(source-dialects) \
+	-DCONF_fs_miniext=$(conf_fs_miniext)
 
 # This play the same role as "_KERNEL", but _KERNEL unfortunately is too
 # overloaded. A lot of files will expect it to be set no matter what, specially
@@ -390,8 +422,6 @@ ASFLAGS = -g $(autodepend) -D__ASSEMBLY__
 wno-unused-cli-arg := $(call compiler-flag, -Wno-unused-command-line-argument, -Wno-unused-command-line-argument)
 ASCOMPILE = $(CXX) $(COMMON) $(wno-unused-cli-arg)
 
-$(out)/fs/vfs/main.o: CXXFLAGS += -Wno-sign-compare -Wno-write-strings
-
 
 makedir = $(call very-quiet, mkdir -p $(dir $@))
 
@@ -403,6 +433,12 @@ makedir = $(call very-quiet, mkdir -p $(dir $@))
 $(out)/%.o: %.cc | generated-headers $(out)/.libcxx-built
 	$(makedir)
 	$(call quiet, $(CXX) $(CXXFLAGS) -c -o $@ $<, CXX $*.cc)
+
+# The kernel itself uses .cc throughout; .cpp is here for the applications under
+# app/, where DuckDB and llama.cpp both use it.
+$(out)/%.o: %.cpp | generated-headers $(out)/.libcxx-built
+	$(makedir)
+	$(call quiet, $(CXX) $(CXXFLAGS) -c -o $@ $<, CXX $*.cpp)
 
 $(out)/%.o: %.c | generated-headers
 	$(makedir)
@@ -512,6 +548,18 @@ drivers += drivers/pci-device.o
 drivers += drivers/pci-function.o
 drivers += drivers/pci-bridge.o
 drivers += drivers/msi.o
+ifeq ($(conf_drivers_nvme),1)
+drivers += drivers/nvme.o
+drivers += drivers/nvme-queue.o
+endif
+ifeq ($(conf_drivers_virtio),1)
+drivers += drivers/virtio.o
+drivers += drivers/virtio-vring.o
+drivers += drivers/virtio-pci-device.o
+ifeq ($(conf_drivers_virtio_accel),1)
+drivers += drivers/virtio-accel.o
+endif
+endif
 endif
 ifeq ($(conf_drivers_ena),1)
 drivers += drivers/enav2/ena.o
@@ -618,6 +666,22 @@ objects += core/mempool.o
 ifeq ($(conf_memory_tracker),1)
 objects += core/alloctracker.o
 endif
+
+# Physical frame allocator: llfree (external/llfree, MIT) behind core/mem/frames.
+objects += external/llfree/bitfield.o
+objects += external/llfree/child.o
+objects += external/llfree/llfree.o
+objects += external/llfree/local.o
+objects += external/llfree/lower.o
+objects += external/llfree/tree.o
+objects += core/mem/frames/frames.o
+objects += core/mem/frames/boot.o
+objects += core/mem/frames/contiguous.o
+objects += core/mem/frames/pressure.o
+
+# Not ours: llfree is vendored C, and does not build under the kernel's -Werror.
+$(out)/external/llfree/%.o: CFLAGS += -w -Wno-error -I external/llfree
+$(out)/core/mem/frames/%.o: CXXFLAGS += -I external/llfree
 objects += core/printf.o
 ifeq ($(conf_tracepoints_sampler),1)
 objects += core/sampler.o
@@ -637,6 +701,7 @@ objects += core/percpu.o
 objects += core/percpu-worker.o
 objects += core/shutdown.o
 objects += core/version.o
+objects += core/bootargs.o
 objects += core/waitqueue.o
 objects += core/chart.o
 objects += core/demangle.o
@@ -726,8 +791,28 @@ libc += malloc_hooks.o
 
 
 
-# There is no filesystem: the kernel has no VFS, no fd table and no on-disk or
-# in-memory file systems. Minimal console-backed stdio lives in libc/io.cc.
+# Miniext is not wired into libc: it is a library the application calls directly, 
+# and it drives its own NVMe I/O rather than sitting on top of a
+# block-device layer. See modules/miniext/miniext.hh.
+ifeq ($(conf_fs_miniext),1)
+objects += modules/miniext/device.o
+objects += modules/miniext/mount.o
+objects += modules/miniext/alloc.o
+objects += modules/miniext/extent.o
+objects += modules/miniext/inode.o
+objects += modules/miniext/dir.o
+objects += modules/miniext/file.o
+objects += modules/miniext/raw.o
+objects += modules/miniext/fstream.o
+endif
+
+# The vAccel operations the application calls, on top of the virtio-accel
+# transport. See modules/vaccel/include/vaccel.h.
+ifeq ($(conf_vaccel),1)
+objects += modules/vaccel/vaccel.o
+endif
+
+# Minimal console-backed stdio lives in libc/io.cc.
 objects += $(addprefix libc/, $(libc))
 
 
@@ -777,8 +862,6 @@ endif
 # Boost.System is header-only in modern Boost, so no Boost library is linked.
 boost-includes = -isystem external/boost
 boost-libs :=
-
-# nfs/ext null vfsops went with the filesystem.
 
 
 # The OSv kernel is linked into an ordinary, non-PIE, executable, so there is no point in compiling
@@ -859,10 +942,23 @@ def_symbols = --defsym=OSV_KERNEL_BASE=$(kernel_base) \
               --defsym=OSV_KERNEL_VM_SHIFT=$(kernel_vm_shift)
 endif
 
+# Pass the object list to the linker via a response file, to avoid "Argument list too long" errors on large applications. 
+# The response file is generated by writing the list of object files to a temporary file, one per line, and then passed to the linker.
+empty :=
+space := $(empty) $(empty)
+define newline
+
+
+endef
+
+link-inputs = $(patsubst %.ld,-T %.ld,$(filter-out $(app_mode_dep) $(llvm_libc_dep) $(libcxx_dep) $(compiler_rt_dep),$^))
+
 $(out)/loader.elf: $(stage1_targets) arch/$(arch)/loader.ld $(app_mode_dep) $(llvm_libc_dep) $(libcxx_dep) $(compiler_rt_dep)
+	$(call very-quiet, $(makedir))
+	$(file > $@.objects,$(subst $(space),$(newline),$(link-inputs)))
 	$(call quiet, $(LD) -o $@ $(def_symbols) \
 		-static --eh-frame-hdr -L$(out)/arch/$(arch) \
-            $(patsubst %.ld,-T %.ld,$(filter-out $(app_mode_dep) $(llvm_libc_dep) $(libcxx_dep) $(compiler_rt_dep),$^)) \
+	    @$@.objects \
 	    $(linker_archives_options) $(conf_linker_extra_options), \
 		LINK loader.elf)
 

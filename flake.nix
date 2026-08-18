@@ -3,6 +3,7 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     flake-utils.url = "github:numtide/flake-utils";
+    lros-qemu.url = "github:TUM-DSE/lros-qemu/master+vaccel+modern";
   };
 
   outputs =
@@ -10,6 +11,7 @@
       self,
       nixpkgs,
       flake-utils,
+      lros-qemu,
     }:
     flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" ] (
       system:
@@ -59,23 +61,34 @@
           ctags
           mtools
           gptfdisk
+          e2fsprogs
           (python3.withPackages (ps: [ ps.pyyaml ]))
         ];
 
         ovmf_prefix = if system == "x86_64-linux" then "OVMF" else "AAVMF";
+        qemuVaccel = lros-qemu.packages.${system}.qemu-vaccel;
+        crossFirmware = pkgs.lib.optionalAttrs (system == "x86_64-linux") {
+          AAVMF_CODE = "${pkgs.qemu}/share/qemu/edk2-aarch64-code.fd";
+          AAVMF_VARS = pkgs.runCommand "aavmf-vars.fd" { } "install -m444 /dev/null $out";
+        };
+
       in
       {
         devShells = rec {
-          default = pkgs.mkShell {
-            nativeBuildInputs = buildDeps ++ [
-              pkgs.qemu
-              pkgs.gdb
-            ];
+          default = pkgs.mkShell (
+            {
+              nativeBuildInputs = buildDeps ++ [
+                pkgs.qemu
+                pkgs.gdb
+              ];
 
-            # UEFI boot requires OVMF installation
-            "${ovmf_prefix}_CODE" = "${pkgs.OVMF.fd}/FV/${ovmf_prefix}_CODE.fd";
-            "${ovmf_prefix}_VARS" = "${pkgs.OVMF.fd}/FV/${ovmf_prefix}_VARS.fd";
-          };
+              # UEFI boot requires OVMF installation
+              "${ovmf_prefix}_CODE" = "${pkgs.OVMF.fd}/FV/${ovmf_prefix}_CODE.fd";
+              "${ovmf_prefix}_VARS" = "${pkgs.OVMF.fd}/FV/${ovmf_prefix}_VARS.fd";
+              QEMU_VACCEL = "${qemuVaccel}/bin/qemu-system-${rtArch}";
+            }
+            // crossFirmware
+          );
 
           aws = default.overrideAttrs (default: {
             nativeBuildInputs = [
@@ -85,8 +98,6 @@
                   awscrt
                   boto3
                   botocore
-                  # We need to redeclare every python
-                  # dependency from the default shell
                   pyyaml
                 ]
               ))

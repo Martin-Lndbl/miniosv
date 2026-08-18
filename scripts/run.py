@@ -2,17 +2,11 @@
 
 # Launcher for the slim miniosv UEFI unikernel under QEMU.
 #
-# miniosv boots only via UEFI now (the -kernel PVH/preboot paths were removed).
-# This script boots the GPT/ESP disk image build/<mode>/loader.img through UEFI
-# firmware (OVMF on x86_64, AAVMF on aarch64) with the kernel embedded as the
-# EFI application - the same path the public clouds take. The kernel is diskless
-# (the single app is linked in); the boot disk is attached as NVMe, matching AWS
-# Nitro. The guest serial port is the console on your terminal.
-#
-# Just build, then run ./scripts/run.py. Override the firmware with the
-# OVMF_CODE/OVMF_VARS (x86_64) or AAVMF_CODE/AAVMF_VARS (aarch64) env vars.
-#
-# Console keys: Ctrl-A C opens the QEMU monitor, Ctrl-A X quits.
+# This script boots the GPT/ESP disk image build/<mode>/loader.img 
+# through UEFI firmware (OVMF on x86_64, AAVMF on aarch64) 
+# with the kernel embedded as the EFI application. 
+# The kernel is diskless (the single app is linked in); the boot disk is attached as NVMe.
+# The guest serial port is the console on your terminal.
 
 import subprocess
 import sys
@@ -101,6 +95,17 @@ def setup_pflash(arch, code, vars_, workdir):
                 fh.truncate(64 * 1024 * 1024)
     return code_copy, vars_copy
 
+def set_boot_args(image, args):
+    """Store the application arguments in the boot image.
+
+    The image carries them in a reserved sector, which is the only channel that
+    works the same under QEMU and on the clouds -- see scripts/setargs.py. This
+    rewrites the image in place, so it must happen before QEMU opens it.
+    """
+    setargs = os.path.join(os.path.dirname(os.path.abspath(__file__)), "setargs.py")
+    subprocess.check_call([sys.executable, setargs, image, args])
+
+
 def start_osv_qemu(options):
     workdir = tempfile.mkdtemp(prefix='miniosv-run-')
     try:
@@ -133,11 +138,23 @@ def start_osv_qemu(options):
             "-drive", "id=bootdisk,format=raw,if=none,file=%s" % options.image_file,
             "-device", "nvme,serial=miniosv,drive=bootdisk"]
 
-        # Optional extra emulated NVMe drive (e.g. a backing store for the app).
-        if options.emulated_nvme:
+        # Extra emulated NVMe drives, in the order given: the guest sees them as
+        # controller 1, 2, ... (0 is the boot disk). A drive is either a
+        # filesystem image to mount, or a single file the application reads as a
+        # raw namespace -- llama.cpp takes its model that way, with no image to
+        # build and no filesystem in between.
+        for i, image in enumerate(options.emulated_nvme or [], start=1):
             args += [
-                "-drive", "file=%s,if=none,id=nvm1" % options.emulated_nvme,
-                "-device", "nvme,serial=deadbeef,drive=nvm1"]
+                "-drive", "file=%s,if=none,id=nvm%d,format=raw" % (image, i),
+                "-device", "nvme,serial=deadbeef%d,drive=nvm%d" % (i, i)]
+
+        # vAccel offload: the guest reaches a host accelerator through this
+        # device.
+        if options.vaccel:
+            args += [
+                "-object", "acceldev-backend-vaccel,id=gen0",
+                "-device", "virtio-accel-pci,id=accl0,runtime=gen0,"
+                           "disable-legacy=on,event_idx=off"]
 
         # PCI passthrough: one -device per address. Devices must be bound to
         # vfio-pci on the host, and QEMU must run with enough privilege (sudo).
@@ -158,7 +175,14 @@ def start_osv_qemu(options):
         for a in options.pass_args or []:
             args += a.split()
 
-        qemu_path = options.qemu_path or ('qemu-system-%s' % options.arch)
+        qemu_path = options.qemu_path
+        if not qemu_path and options.vaccel:
+            qemu_path = os.environ.get('QEMU_VACCEL')
+            if not qemu_path:
+                sys.exit("run: --vaccel needs the QEMU that carries virtio-accel. "
+                         "Enter the dev shell (which sets QEMU_VACCEL), or pass "
+                         "--qemu-path.")
+        qemu_path = qemu_path or ('qemu-system-%s' % options.arch)
         cmdline = [qemu_path] + args
 
         if options.dry_run:
@@ -230,12 +254,20 @@ if __name__ == "__main__":
     parser.add_argument("--arch", action="store", choices=["x86_64", "aarch64"],
                         default=host_arch,
                         help="guest architecture (default: host arch)")
-    parser.add_argument("--emulated-nvme", action="store", metavar="IMAGE",
-                        help="attach a raw disk image as an extra emulated NVMe device")
+    parser.add_argument("--emulated-nvme", action="append", metavar="IMAGE",
+                        help="attach a file as an extra emulated NVMe device; repeatable, "
+                             "and the guest numbers them 1, 2, ... in the order given")
+    parser.add_argument("--vaccel", action="store_true",
+                        help="attach the virtio-accel device; needs the QEMU from the "
+                             "lros-qemu flake (uses $QEMU_VACCEL unless --qemu-path is given)")
     parser.add_argument("--pass-pci", action="store", nargs='+', metavar="ADDR",
                         help="passthrough PCI device(s) bound to vfio-pci, e.g. 0000:01:00.0")
     parser.add_argument("--gic-version", action="store", default="3",
                         help="aarch64 GIC version under TCG (default 3)")
+    parser.add_argument("--args", action="store", metavar="STRING",
+                        help="application arguments; written into the boot "
+                             "image before starting (see scripts/setargs.py). "
+                             "The first word names the executable to run.")
     cmdargs = parser.parse_args()
 
     # The build output dir is build/<mode>.<arch> (arch as x64 / aarch64), so
@@ -250,5 +282,9 @@ if __name__ == "__main__":
 
     if cmdargs.hypervisor == "auto":
         cmdargs.hypervisor = choose_hypervisor(cmdargs.arch)
+
+    # Rewrite the image before QEMU opens it.
+    if cmdargs.args is not None:
+        set_boot_args(cmdargs.image_file, cmdargs.args)
 
     main(cmdargs)

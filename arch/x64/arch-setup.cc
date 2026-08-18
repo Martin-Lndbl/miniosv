@@ -26,6 +26,12 @@
 #if CONF_drivers_ena
 #include "drivers/enav2/ena.hh"
 #endif
+#if CONF_drivers_nvme
+#include "drivers/nvme.hh"
+#endif
+#if CONF_drivers_virtio_accel
+#include "drivers/virtio-accel.hh"
+#endif
 
 // Physical pointer to the hand-off structure filled by the UEFI stub; stored
 // by start64 in boot.S.
@@ -254,6 +260,12 @@ void arch_init_drivers()
     hw::driver_manager* drvman = hw::driver_manager::instance();
 #if CONF_drivers_ena
     drvman->register_driver(aws::ena::probe);
+#endif
+#if CONF_drivers_nvme
+    drvman->register_driver(nvme::nvme_driver::probe);
+#endif
+#if CONF_drivers_virtio_accel
+    drvman->register_driver(virtio::accel::probe);
 #endif
     boot_time.event("drivers probe");
     drvman->load_all();

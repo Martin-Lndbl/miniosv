@@ -1167,6 +1167,16 @@ static int getaffinity(const sched::thread *t, size_t cpusetsize,
     // bound to a CPU with a migration_lock (e.g., while accessing a per-cpu
     // variable), it is not considered pinned.
     memset(cpuset, 0, cpusetsize);
+    if (!t) {
+        // No thread yet (called before the scheduler is up): every CPU the kernel
+        // knows about is allowable. May be none this early, in which case the
+        // caller sees an empty set and has to cope -- which is still better
+        // than faulting.
+        for (unsigned i = 0; i < sched::cpus.size(); i++) {
+            CPU_SET(i, cpuset);
+        }
+        return 0;
+    }
     if (!t->pinned()) {
         for (unsigned i = 0; i < sched::cpus.size(); i++) {
             CPU_SET(i, cpuset);
@@ -1180,6 +1190,12 @@ static int getaffinity(const sched::thread *t, size_t cpusetsize,
 int pthread_getaffinity_np(const pthread_t thread, size_t cpusetsize,
         cpu_set_t *cpuset)
 {
+    // Handle the case where pthread_getaffinity_np() is called before the scheduler is up. 
+    // This can happen when a static constructor calls malloc() 
+    // (which calls malloc_ncpus() which calls pthread_getaffinity_np()).
+    if (!thread) {
+        return getaffinity(nullptr, cpusetsize, cpuset);
+    }
     const sched::thread *t = &*pthread::from_libc(thread)->_thread;
     return getaffinity(t, cpusetsize, cpuset);
 }

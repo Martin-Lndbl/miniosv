@@ -17,6 +17,7 @@ namespace hw {
 
     enum hw_device_type {
         pci_device = 1,
+        virtio_over_pci_device = 2,
     };
 
     // generic id for device (pci or non-pci)
