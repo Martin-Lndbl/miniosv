@@ -19,7 +19,7 @@
 #include <osv/debug.hh>
 #include <osv/commands.hh>
 
-#include "arch-mmu.hh"
+#include <mem.hh>
 #include "gic-v2.hh"
 #include "gic-v3.hh"
 #include "drivers/acpi.hh"
@@ -304,8 +304,9 @@ void arch_setup_free_memory()
 
     // Step 3: hand the high RAM (>= initial_map) to the allocator. This must run
     // AFTER the switch: the per-range linear maps built above live in the
-    // runtime page tables (get_root_pt writes page_table_root[], not the boot
-    // tables), and the page allocator writes bookkeeping - the page_range header
+    // runtime page tables (the mapping layer's root_slot() names
+    // page_table_root[], not the boot tables), and the page allocator writes
+    // bookkeeping - the page_range header
     // and a trailing back-pointer - at the START and END of each freed range
     // through the linear-map window. Those addresses only resolve once the
     // runtime tables are active; the boot temporary map only covers the low

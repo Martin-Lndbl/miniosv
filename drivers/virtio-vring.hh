@@ -14,6 +14,7 @@
 #include <osv/debug.hh>
 #include <osv/mmu.hh>
 #include <osv/sched.hh>
+#include <osv/trace.hh>
 
 #define virtio_tag "virtio"
 #define virtio_d(...)   tprintf_d(virtio_tag, __VA_ARGS__)

@@ -5,6 +5,7 @@
  * BSD license as described in the LICENSE file in the top-level directory.
  */
 
+#include <cassert>
 #include <osv/debug.hh>
 #include <osv/mmio.hh>
 #include <osv/pci.hh>

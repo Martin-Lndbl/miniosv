@@ -36,10 +36,13 @@ inline void group(const char *s)
     printf("\n== %s ==\n", s);
 }
 
+// Flushed, so that a crash leaves the last section it reached on the console
+// rather than in a buffer that is never written.
 inline void section(const char *s)
 {
     current = s;
     printf("  - %s\n", s);
+    fflush(stdout);
 }
 
 inline int summary(const char *what)
@@ -128,6 +131,7 @@ double parallel(unsigned threads, F fn)
         if (!(cond)) { \
             memtest::fails.fetch_add(1); \
             printf("    FAIL [%s] %s:%d: %s\n", memtest::current, __FILE__, __LINE__, #cond); \
+            fflush(stdout); \
         } \
     } while (0)
 

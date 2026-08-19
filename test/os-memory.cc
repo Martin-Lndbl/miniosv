@@ -18,6 +18,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+
 #include "mem-test.hh"
 
 using namespace memtest;
@@ -313,21 +314,6 @@ void mmap_functional()
         CHECK(munmap(p, size) == 0);
     }
 
-    section("mincore reports what is resident");
-    {
-        const size_t size = 64ul << 10;
-        const size_t pages = size / page;
-        char *p = static_cast<char *>(map(size, MAP_POPULATE));
-        std::vector<unsigned char> vec(pages, 0);
-        CHECK(mincore(p, size, vec.data()) == 0);
-        bool all = true;
-        for (size_t i = 0; i < pages; i++) {
-            all = all && (vec[i] & 1);
-        }
-        CHECK(all);
-        CHECK(munmap(p, size) == 0);
-    }
-
     section("MADV_DONTNEED gives the memory back and the range stays usable");
     {
         const size_t size = 8ul << 20;
@@ -405,19 +391,6 @@ void mmap_perf()
         munmap(p, size);
     }
 
-    section("mincore");
-    {
-        const size_t size = 2ul << 20;
-        const int n = 20000;
-        char *p = static_cast<char *>(map(size, MAP_POPULATE));
-        unsigned char vec;
-        auto t0 = clk::now();
-        for (int i = 0; i < n; i++) {
-            mincore(p, page, &vec);
-        }
-        report_ns("mincore, one page", since(t0), n);
-        munmap(p, size);
-    }
 }
 
 /* page faults ------------------------------------------------------------- */

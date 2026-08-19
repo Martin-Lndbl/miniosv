@@ -617,7 +617,6 @@ objects += arch/$(arch)/backtrace.o
 objects += arch/$(arch)/smp.o
 objects += arch/$(arch)/tlsdesc.o
 objects += arch/$(arch)/entry.o
-objects += arch/$(arch)/mmu.o
 objects += arch/$(arch)/exceptions.o
 objects += arch/$(arch)/dump.o
 objects += arch/$(arch)/cpuid.o
@@ -675,9 +674,16 @@ objects += core/mem/frames/boot.o
 objects += core/mem/frames/contiguous.o
 objects += core/mem/frames/pressure.o
 
-# Virtual address space: one augmented tree over every reserved range.
+# Virtual address space: a maple tree over every reserved range.
 objects += core/mem/vspace/vspace.o
 objects += core/mem/vspace/maple.o
+
+# Translation: the page tables and the TLB, over an arch-specific entry format.
+objects += core/mem/mapping/walk.o
+objects += core/mem/mapping/mapping.o
+objects += core/mem/mapping/flush.o
+objects += arch/$(arch)/mem/hw.o
+objects += arch/$(arch)/mem/fault.o
 
 # Not ours: llfree is vendored C, and does not build under the kernel's -Werror.
 $(out)/external/llfree/%.o: CFLAGS += -w -Wno-error -I external/llfree

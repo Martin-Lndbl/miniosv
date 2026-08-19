@@ -15,8 +15,11 @@
 #include <thread>
 #include <vector>
 
+#include <sys/mman.h>
+
 #include <osv/contiguous_alloc.hh>
 #include <osv/mem/frames.hh>
+#include <osv/mem/mapping.hh>
 #include <osv/mem/vspace.hh>
 #include <osv/mempool.hh>
 #include <osv/mmu.hh>
@@ -587,6 +590,376 @@ void vspace_perf()
 
 }
 
+/* mapping ----------------------------------------------------------------- */
+
+namespace map = mem::mapping;
+
+// A reservation to write translations into. Nothing else hands these addresses
+// out, and the tests below never leave one attached, so no fault ever lands in
+// a region this file owns.
+struct scratch {
+    mem::vspace::region r;
+    explicit scratch(size_t bytes, size_t align = page)
+    {
+        CHECK(mem::vspace::reserve(r, bytes, align) == resa::success);
+    }
+    ~scratch() { mem::vspace::release(r); }
+    uintptr_t start() const { return r.span.start; }
+    char *ptr(size_t off = 0) const { return reinterpret_cast<char*>(r.span.start + off); }
+    mem::range range(size_t off, size_t len) const
+    {
+        return {r.span.start + off, r.span.start + off + len};
+    }
+};
+
+void mapping_functional()
+{
+    group("mapping");
+
+    section("an attached frame is reachable, and is gone once detached");
+    {
+        scratch s(page);
+        auto f = mem::frames::alloc();
+        CHECK(f != mem::no_memory);
+
+        map::attach(s.range(0, page), f, mem::perm_rw);
+        auto e = map::find(s.start());
+        CHECK(bool(e));
+        CHECK(e.level() == 0);
+        CHECK(e.addr() == f);
+        CHECK(e.perm() & mem::perm_write);
+
+        // The frame is reachable through both its linear address and the one
+        // just attached, which is what an attachment means.
+        s.ptr()[0] = 0x5a;
+        CHECK(static_cast<char*>(mem::frames::to_linear(f))[0] == 0x5a);
+
+        map::detach(s.range(0, page));
+        CHECK(!map::find(s.start()));
+        mem::frames::free(f);
+    }
+
+    section("attach refuses a range already mapped, attach_missing fills the gaps");
+    {
+        scratch s(4 * page);
+        auto f = mem::frames::alloc();
+        auto g = mem::frames::alloc();
+
+        CHECK(map::attach(s.range(0, page), f, mem::perm_rw));
+        // The whole point of the return value: the second caller is told, and
+        // the entry the first one wrote is still the one that is there.
+        CHECK(!map::attach(s.range(0, page), g, mem::perm_rw));
+        CHECK(map::find(s.start()).addr() == f);
+        // A range that only overlaps in part is refused just the same, and
+        // nothing in the untouched part of it is written.
+        CHECK(!map::attach(s.range(0, 4 * page), g, mem::perm_rw));
+        CHECK(!map::find(s.start() + page));
+
+        // attach_missing accepts the overlap as long as it agrees, and fills
+        // in what was not there. Only a different translation is an error.
+        CHECK(!map::attach_missing(s.range(0, 4 * page), g, mem::perm_rw));
+        CHECK(map::attach_missing(s.range(0, 4 * page), f, mem::perm_rw));
+        CHECK(map::find(s.start()).addr() == f);
+        for (unsigned i = 1; i < 4; i++) {
+            auto e = map::find(s.start() + i * page);
+            CHECK(bool(e));
+            CHECK(e.addr() == f + i * page);
+        }
+
+        map::detach(s.range(0, 4 * page));
+        mem::frames::free(f);
+        mem::frames::free(g);
+    }
+
+    section("populate fills a range and depopulate gives the frames back");
+    {
+        scratch s(64 * page);
+        size_t before = mem::frames::free_bytes();
+        CHECK(map::populate(s.range(0, 64 * page), mem::perm_rw));
+
+        for (unsigned i = 0; i < 64; i++) {
+            auto e = map::find(s.start() + i * page);
+            CHECK(bool(e));
+            CHECK(s.ptr(i * page)[0] == 0);   // populate zeroes by default
+            s.ptr(i * page)[0] = char(i);
+        }
+        for (unsigned i = 0; i < 64; i++) {
+            CHECK(s.ptr(i * page)[0] == char(i));
+        }
+        CHECK(before - mem::frames::free_bytes() >= 64 * page);
+
+        map::depopulate(s.range(0, 64 * page));
+        CHECK(!map::find(s.start()));
+        CHECK(mem::frames::free_bytes() >= before - page);
+    }
+
+    section("a huge-page range is one entry, and splits into 512");
+    {
+        scratch s(huge, huge);
+        // An earlier owner of these addresses may have left a table behind: one
+        // is only given back when a detach covers the whole of what it spans,
+        // and a small mapping never does. Detaching the whole span is what
+        // clears it, and without that the populate below could only build
+        // 512 small leaves under the table that is already there.
+        map::detach(s.range(0, huge));
+
+        size_t before = mem::frames::free_bytes();
+        CHECK(map::populate(s.range(0, huge), mem::perm_rw, huge));
+
+        auto e = map::find(s.start());
+        CHECK(bool(e));
+        CHECK(e.level() == 1);
+        CHECK(e.size() == huge);
+        auto phys = e.addr();
+        CHECK((phys & (huge - 1)) == 0);
+        s.ptr(huge - 1)[0] = 0x7e;
+
+        map::split(s.range(0, huge));
+        // Every one of the small entries that replaced it maps its own slice of
+        // the same frame, and the byte written through the large one is still
+        // there.
+        for (unsigned i = 0; i < 512; i += 64) {
+            auto small = map::find(s.start() + i * page);
+            CHECK(bool(small));
+            CHECK(small.level() == 0);
+            CHECK(small.addr() == phys + i * page);
+        }
+        CHECK(s.ptr(huge - 1)[0] == 0x7e);
+
+        // A huge frame given back one small piece at a time has to come back
+        // whole: the allocator handed out one block, and it is being returned
+        // as 512 frames.
+        map::depopulate(s.range(0, huge));
+        CHECK(!map::find(s.start()));
+        CHECK(mem::frames::free_bytes() >= before - page);
+    }
+
+    section("protect changes what an entry allows without moving the frame");
+    {
+        scratch s(page);
+        CHECK(map::populate(s.range(0, page), mem::perm_rw));
+        auto phys = map::find(s.start()).addr();
+        s.ptr()[0] = 0x11;
+
+        map::protect(s.range(0, page), mem::perm_read);
+        CHECK(map::find(s.start()).perm() == mem::perm_read);
+        CHECK(map::find(s.start()).addr() == phys);
+        CHECK(s.ptr()[0] == 0x11);
+
+        // Permissions of none keep the frame, which is what lets them be given
+        // back later.
+        map::protect(s.range(0, page), mem::perm_none);
+        CHECK(map::find(s.start()).perm() == mem::perm_none);
+        CHECK(map::find(s.start()).addr() == phys);
+
+        map::protect(s.range(0, page), mem::perm_rw);
+        CHECK(map::find(s.start()).perm() & mem::perm_write);
+        CHECK(s.ptr()[0] == 0x11);
+
+        map::depopulate(s.range(0, page));
+    }
+
+    section("prepare builds the levels, and the leaf is then one store away");
+    {
+        scratch s(page);
+        auto e = map::prepare(s.start());
+        CHECK(bool(e));
+        CHECK(e.level() == 0);
+        CHECK(e.empty());       // prepare writes no leaf of its own
+
+        auto f = mem::frames::alloc();
+        e.write(e.leaf_for(f, mem::perm_rw));
+        map::barrier();
+        s.ptr()[0] = 0x33;
+        CHECK(static_cast<char*>(mem::frames::to_linear(f))[0] == 0x33);
+
+        // The same slot, found the long way round.
+        auto again = map::prepare(s.start());
+        CHECK(again.addr() == f);
+        CHECK(map::find(s.start()).addr() == f);
+
+        map::detach(s.range(0, page));
+        mem::frames::free(f);
+    }
+
+    section("the software bits of an entry survive a round trip");
+    {
+        scratch s(page);
+        auto f = mem::frames::alloc();
+        map::attach(s.range(0, page), f, mem::perm_rw);
+        auto e = map::find(s.start());
+
+        CHECK(map::sw_bits >= 3);   // the fewest any supported arch has
+        for (unsigned n = 0; n < map::sw_bits; n++) {
+            CHECK(!map::pte_sw_bit(e.read(), n));
+            e.write(map::pte_set_sw_bit(e.read(), n, true));
+            CHECK(map::pte_sw_bit(e.read(), n));
+            CHECK(e.addr() == f);
+            CHECK(e.perm() & mem::perm_write);
+            e.write(map::pte_set_sw_bit(e.read(), n, false));
+            CHECK(!map::pte_sw_bit(e.read(), n));
+        }
+        s.ptr()[0] = 0x44;      // still a usable mapping afterwards
+
+        map::detach(s.range(0, page));
+        mem::frames::free(f);
+    }
+
+    section("nothing is mapped where nothing was attached");
+    {
+        scratch s(16 * page);
+        CHECK(!map::find(s.start()));
+        CHECK(!map::find(s.start() + 15 * page));
+
+        map::populate(s.range(page, page), mem::perm_rw);
+        CHECK(!map::find(s.start()));
+        CHECK(bool(map::find(s.start() + page)));
+        CHECK(!map::find(s.start() + 2 * page));
+        map::depopulate(s.range(page, page));
+    }
+
+    section("a global flush advances the epoch and a deferred detach does not");
+    {
+        scratch s(page);
+        CHECK(map::populate(s.range(0, page), mem::perm_rw));
+
+        auto before = map::flush_epoch();
+        map::flush_all();
+        CHECK(map::flush_epoch() > before);
+
+        auto phys = map::find(s.start()).addr();
+        before = map::flush_epoch();
+
+        // The addresses come back in the caller's own record, so it can settle
+        // exactly them, and nothing was invalidated on the way out.
+        map::pending_invalidation stale;
+        map::detach_deferred(s.range(0, page), stale);
+        CHECK(stale.count == 1);
+        CHECK(stale.va[0] == s.start());
+        CHECK(!stale.all);
+        CHECK(!map::find(s.start()));
+        CHECK(map::flush_epoch() == before);
+
+        // Two completed global invalidations settle the debt, not one: the
+        // first may have been under way while the entry was still mapped.
+        // Once they have happened, invalidate() has nothing left to do, and it
+        // says so by not moving the epoch itself.
+        map::flush_all();
+        map::flush_all();
+        auto quiet = map::flush_epoch();
+        stale.invalidate();
+        CHECK(map::flush_epoch() == quiet);
+        CHECK(stale.count == 0);
+        CHECK(!stale.all);
+        mem::frames::free(phys);
+    }
+}
+
+void mapping_perf()
+{
+    group("mapping - performance");
+
+    section("attach and detach one page");
+    {
+        // attach() refuses a range that is already mapped, so each one has to
+        // land on a page of its own; the detach that empties them again is
+        // outside the measurement.
+        const size_t pages = 512;
+        const int rounds = 40;
+        scratch s(pages * page);
+        auto f = mem::frames::alloc();
+        map::prepare(s.range(0, pages * page), page);
+
+        double total = 0;
+        for (int r = 0; r < rounds; r++) {
+            auto t0 = clk::now();
+            for (size_t i = 0; i < pages; i++) {
+                map::attach(s.range(i * page, page), f, mem::perm_rw);
+            }
+            total += since(t0);
+            map::detach(s.range(0, pages * page));
+        }
+        report_ns("attach 4 KiB, levels already built", total,
+                  double(rounds) * pages);
+
+        const int n = 20000;
+        auto t0 = clk::now();
+        for (int i = 0; i < n; i++) {
+            map::attach(s.range(0, page), f, mem::perm_rw);
+            map::detach(s.range(0, page));
+        }
+        report_ns("attach + detach 4 KiB, one global flush each", since(t0), n);
+
+        mem::frames::free(f);
+    }
+
+    section("the prepared path: one store per page");
+    {
+        const size_t pages = 512;
+        scratch s(pages * page);
+        auto f = mem::frames::alloc();
+        std::vector<map::pte_ref> slot(pages);
+
+        auto t0 = clk::now();
+        for (size_t i = 0; i < pages; i++) {
+            slot[i] = map::prepare(s.start() + i * page);
+        }
+        report_ns("prepare, per 4 KiB page", since(t0), pages);
+
+        const int rounds = 2000;
+        t0 = clk::now();
+        for (int r = 0; r < rounds; r++) {
+            for (size_t i = 0; i < pages; i++) {
+                slot[i].write(slot[i].leaf_for(f, mem::perm_rw));
+            }
+        }
+        map::barrier();
+        report_ns("write a prepared leaf", since(t0), double(rounds) * pages);
+
+        map::detach(s.range(0, pages * page));
+        mem::frames::free(f);
+    }
+
+    section("populate and depopulate");
+    {
+        struct { const char *name; size_t size; size_t leaf; int n; } cases[] = {
+            {"64 pages, 4 KiB leaves", 64 * page, page, 2000},
+            {"2 MiB, 4 KiB leaves",    huge,      page, 300},
+            {"2 MiB, one huge leaf",   huge,      huge, 300},
+        };
+        for (auto &c : cases) {
+            scratch s(c.size, c.leaf);
+            auto t0 = clk::now();
+            for (int i = 0; i < c.n; i++) {
+                map::populate(s.range(0, c.size), mem::perm_rw, c.leaf);
+                map::depopulate(s.range(0, c.size));
+            }
+            double s_total = since(t0);
+            char label[80];
+            snprintf(label, sizeof(label), "populate + depopulate %s", c.name);
+            report_ns(label, s_total, c.n);
+            snprintf(label, sizeof(label), "  the same, per 4 KiB page");
+            report_ns(label, s_total, double(c.n) * (c.size / page));
+        }
+    }
+
+    section("find");
+    {
+        scratch s(huge, huge);
+        map::populate(s.range(0, huge), mem::perm_rw);
+        const int probes = 200000;
+
+        map::pte e = 0;
+        auto t0 = clk::now();
+        for (int i = 0; i < probes; i++) {
+            e |= map::find(s.start() + (i % 512) * page).read();
+        }
+        escape(&e);
+        report_ns("find, 4 KiB leaf", since(t0), probes);
+        map::depopulate(s.range(0, huge));
+    }
+}
+
 }
 
 int os_memory_primitives_main()
@@ -599,6 +972,8 @@ int os_memory_primitives_main()
     frames_perf();
     vspace_functional();
     vspace_perf();
+    mapping_functional();
+    mapping_perf();
 
     return summary("MEMORY PRIMITIVE");
 }

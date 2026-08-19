@@ -184,16 +184,6 @@ int msync(void *addr, size_t length, int flags)
 }
 
 OSV_LIBC_API
-int mincore(void *addr, size_t length, unsigned char *vec)
-{
-    if (!mmu::is_page_aligned(addr)) {
-        return libc_error(EINVAL);
-    }
-
-    return mmu::mincore(addr, length, vec).to_libc();
-}
-
-OSV_LIBC_API
 int madvise(void *addr, size_t length, int advice)
 {
     auto err = mmu::advise(addr, length, libc_madvise_to_advise(advice));

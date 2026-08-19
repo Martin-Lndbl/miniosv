@@ -13,6 +13,13 @@
 
 namespace mem {
 
+// A physical address. Not a pointer: physical memory is not
+// addressable until it is mapped, or reached through frames::to_linear().
+using phys_addr = uint64_t;
+
+// Nothing is allocated at physical 0, used to return "no memory" from alloc() and claim_run().
+constexpr phys_addr no_memory = 0;
+
 // A half-open range of virtual addresses.
 struct range {
     uintptr_t start = 0;
@@ -36,6 +43,13 @@ enum {
     perm_exec = 4,
     perm_rw = perm_read | perm_write,
     perm_rwx = perm_read | perm_write | perm_exec,
+};
+
+// How the hardware may reorder, cache and combine accesses to a mapping.
+// Only aarch64 distinguishes the two.
+enum class mattr {
+    normal,
+    dev,
 };
 
 }

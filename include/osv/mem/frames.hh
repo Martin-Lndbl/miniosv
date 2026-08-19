@@ -9,15 +9,9 @@
 #include <cstddef>
 #include <cstdint>
 
+#include <osv/mem/types.hh>
+
 namespace mem {
-
-// A physical address. Not a pointer: physical memory is not
-// addressable until it is mapped, or reached through frames::to_linear().
-using phys_addr = uint64_t;
-
-// Nothing is allocated at physical 0, used to return "no memory" from alloc() and claim_run().
-constexpr phys_addr no_memory = 0;
-
 namespace frames {
 
 constexpr size_t page_size = 4096;

@@ -6,6 +6,8 @@
  * BSD license as described in the LICENSE file in the top-level directory.
  */
 
+#include <cassert>
+
 #include <osv/mmio.hh>
 #include <osv/mmu.hh>
 #include <osv/kernel_config.h>
@@ -14,6 +16,7 @@
 #include "processor.hh"
 #include "gic-v2.hh"
 #include "arm-clock.hh"
+#include "exceptions.hh"
 
 extern class interrupt_table idt;
 
