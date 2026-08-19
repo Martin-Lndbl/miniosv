@@ -28,6 +28,7 @@ int os_stress_main();
 int os_iostream_main();
 int os_memmove_main();
 int os_memory_main();
+int os_memory_primitives_main();
 #if CONF_fs_miniext
 int os_miniext_main();
 #endif
@@ -47,7 +48,8 @@ const suite suites[] = {
 	{"libc",     os_libc_main,     "C libc surface conformance"},
 	{"iostream", os_iostream_main, "C++ iostreams and localization"},
 	{"memmove",  os_memmove_main,  "memmove() overlap correctness"},
-	{"memory",   os_memory_main,   "memory subsystem, per layer"},
+	{"memory",   os_memory_main,   "memory an application can see: malloc, mmap, faults"},
+	{"memory-primitives", os_memory_primitives_main, "frame and address-space primitives"},
 #if CONF_fs_miniext
 	{"miniext",  os_miniext_main,  "miniext filesystem (needs --emulated-nvme)"},
 #endif

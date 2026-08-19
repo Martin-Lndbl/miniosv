@@ -675,6 +675,10 @@ objects += core/mem/frames/boot.o
 objects += core/mem/frames/contiguous.o
 objects += core/mem/frames/pressure.o
 
+# Virtual address space: one augmented tree over every reserved range.
+objects += core/mem/vspace/vspace.o
+objects += core/mem/vspace/maple.o
+
 # Not ours: llfree is vendored C, and does not build under the kernel's -Werror.
 $(out)/external/llfree/%.o: CFLAGS += -w -Wno-error -I external/llfree
 $(out)/core/mem/frames/%.o: CXXFLAGS += -I external/llfree

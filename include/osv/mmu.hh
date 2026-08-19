@@ -9,10 +9,8 @@
 #define MMU_HH
 
 #include <stdint.h>
-#include <boost/intrusive/set.hpp>
 #include <osv/types.h>
 #include <osv/error.h>
-#include <osv/addr_range.hh>
 #include <osv/mmu-defs.hh>
 #include <osv/align.hh>
 #include <osv/trace.hh>
@@ -36,98 +34,16 @@ inline unsigned pt_index(void *virt, unsigned level)
     return (reinterpret_cast<ulong>(virt) >> (page_size_shift + level * pte_per_page_shift)) & (pte_per_page - 1);
 }
 
-struct page_allocator;
+// Page-table work over a range: fill it with frames, empty it, change its
+// permissions, split its huge leaves.
+void populate_anon(void *region_start, void *addr, size_t size, unsigned perm,
+                   bool write, bool small_pages, bool zero);
+void depopulate_anon(void *region_start, void *addr, size_t size);
+void protect_pages(void *region_start, void *addr, size_t size, unsigned perm);
+void use_small_pages(void *region_start, void *addr, size_t size);
 
-struct linear_vma {
-    void* _virt_addr;
-    phys _phys_addr;
-    size_t _size;
-    mattr _mem_attr;
-    std::string _name;
-
-    linear_vma(void* virt, phys phys, size_t size, mattr mem_attr, const char* name);
-    ~linear_vma();
-
-    uintptr_t v_start() const { return reinterpret_cast<uintptr_t>(_virt_addr); }
-    uintptr_t v_end() const { return reinterpret_cast<uintptr_t>(static_cast<char*>(_virt_addr) + _size); }
-};
-
-class vma {
-public:
-    vma(addr_range range, unsigned perm, unsigned flags, bool map_dirty, page_allocator *page_ops = nullptr);
-    virtual ~vma();
-    void set(uintptr_t start, uintptr_t end);
-    void protect(unsigned perm);
-    uintptr_t start() const;
-    uintptr_t end() const;
-    void* addr() const;
-    uintptr_t size() const;
-    unsigned perm() const;
-    unsigned flags() const;
-    virtual void fault(uintptr_t addr, exception_frame *ef);
-    virtual void split(uintptr_t edge) = 0;
-    virtual error sync(uintptr_t start, uintptr_t end) = 0;
-    virtual int validate_perm(unsigned perm) { return 0; }
-    virtual page_allocator* page_ops();
-    void update_flags(unsigned flag);
-    bool has_flags(unsigned flag);
-    template<typename T> ulong operate_range(T mapper, void *start, size_t size);
-    template<typename T> ulong operate_range(T mapper);
-    bool map_dirty();
-    class addr_compare;
-protected:
-    addr_range _range;
-    unsigned _perm;
-    unsigned _flags;
-    bool _map_dirty;
-    page_allocator *_page_ops;
-public:
-    boost::intrusive::set_member_hook<> _vma_list_hook;
-};
-
-struct vma_range {
-    const void* _vma;
-    bool _is_linear;
-
-    vma_range(const linear_vma* v) {
-       _vma = v;
-       _is_linear = true;
-    }
-
-    vma_range(const vma* v) {
-       _vma = v;
-       _is_linear = false;
-    }
-
-    uintptr_t start() const {
-       if (_is_linear) {
-          return static_cast<const linear_vma*>(_vma)->v_start();
-       } else {
-          return static_cast<const vma*>(_vma)->start();
-       }
-    }
-
-    uintptr_t end() const {
-       if (_is_linear) {
-          return static_cast<const linear_vma*>(_vma)->v_end();
-       } else {
-          return static_cast<const vma*>(_vma)->end();
-       }
-    }
-};
-
-class anon_vma : public vma {
-public:
-    anon_vma(addr_range range, unsigned perm, unsigned flags);
-    virtual void split(uintptr_t edge) override;
-    virtual error sync(uintptr_t start, uintptr_t end) override;
-};
-
-// There is no filesystem: file-backed mappings (file_vma) have been removed;
-// only anonymous mappings remain.
-
-// The POSIX shared-memory file (shm_file) is gone with the filesystem.
-
+// Anonymous memory over a vspace reservation. There is no filesystem, so
+// these are the only mappings.
 void* map_anon(const void* addr, size_t size, unsigned flags, unsigned perm);
 
 error munmap(const void* addr, size_t size);
@@ -148,33 +64,6 @@ inline pt_element<N> clear_pte(hw_ptep<N> ptep)
     auto old = ptep.exchange(make_empty_pte<N>());
     trace_clear_pte(ptep.release(), old.addr());
     return old;
-}
-
-template<int N>
-inline bool clear_accessed(hw_ptep<N> ptep)
-{
-    pt_element<N> pte = ptep.read();
-    bool accessed = pte.accessed();
-    if (accessed) {
-        pt_element<N> clear = pte;
-        clear.set_accessed(false);
-        ptep.compare_exchange(pte, clear);
-    }
-    return accessed;
-}
-
-template<int N>
-inline bool clear_dirty(hw_ptep<N> ptep)
-{
-    static_assert(pt_level_traits<N>::leaf_capable::value, "non leaf pte");
-    pt_element<N> pte = ptep.read();
-    bool dirty = pte.dirty();
-    if (dirty) {
-        pt_element<N> clear = pte;
-        clear.set_dirty(false);
-        ptep.compare_exchange(pte, clear);
-    }
-    return dirty;
 }
 
 template<int N>
@@ -256,17 +145,9 @@ void linear_map(void* virt, phys addr, size_t size, const char* name,
 void free_initial_memory_range(uintptr_t addr, size_t size);
 void switch_to_runtime_page_tables();
 
-void set_nr_page_sizes(unsigned nr);
-
-void vpopulate(void* addr, size_t size);
-void vdepopulate(void* addr, size_t size);
-void vcleanup(void* addr, size_t size);
-
 error  advise(void* addr, size_t size, int advice);
 
 void vm_fault(uintptr_t addr, exception_frame* ef);
-
-unsigned long all_vmas_size();
 
 // Synchronize cpu data and instruction caches for specified area of virtual memory
 void synchronize_cpu_caches(void *v, size_t size);

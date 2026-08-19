@@ -1,15 +1,13 @@
 /*
- * Memory subsystem: correctness and performance, per layer.
+ * Memory as an application sees it: malloc, mmap, page faults.
  *
- * The test application is linked into the kernel, so it calls the memory
- * primitives directly rather than through libc. Sections follow the layers in
- * PLAN_mem.md; until those layers exist they call today's equivalents, and the
- * numbers printed here are the baseline the rewrite is measured against.
+ * Everything here goes through interfaces that exist on Linux and on OSv as
+ * well as on miniOSv, so the numbers can be compared against either and the
+ * checks say nothing about how the kernel is built inside. The primitives
+ * underneath have their own suite in os-memory-primitives.cc.
  */
 
-#include <algorithm>
 #include <atomic>
-#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -17,613 +15,29 @@
 #include <thread>
 #include <vector>
 
-#include <osv/contiguous_alloc.hh>
-#include <osv/mempool.hh>
-#include <osv/mmu.hh>
-#include <osv/mem/frames.hh>
-#include <osv/pagealloc.hh>
-#include <osv/sched.hh>
+#include <sys/mman.h>
+#include <unistd.h>
+
+#include "mem-test.hh"
+
+using namespace memtest;
 
 namespace {
 
-std::atomic<int> g_checks{0};
-std::atomic<int> g_fails{0};
-const char *g_section = "";
+const size_t page = 4096;
+const size_t huge = 2ul << 20;
 
-#define CHECK(cond) do { \
-        g_checks.fetch_add(1); \
-        if (!(cond)) { \
-            g_fails.fetch_add(1); \
-            printf("    FAIL [%s] %s:%d: %s\n", g_section, __FILE__, __LINE__, #cond); \
-        } \
-    } while (0)
-
-void group(const char *s) { printf("\n== %s ==\n", s); }
-void section(const char *s) { g_section = s; printf("  - %s\n", s); }
-
-using clk = std::chrono::steady_clock;
-
-double since(clk::time_point t0)
+size_t free_bytes()
 {
-    return std::chrono::duration<double>(clk::now() - t0).count();
+    long pages = sysconf(_SC_AVPHYS_PAGES);
+    return pages > 0 ? static_cast<size_t>(pages) * page : 0;
 }
 
-// clang knows malloc/free and will delete a pair whose result is unused.
-void escape(void *p)
+void *map(size_t bytes, int extra = 0)
 {
-    asm volatile("" : : "r,m"(p) : "memory");
-}
-
-void report_ns(const char *what, double s, double n)
-{
-    printf("    %-46s %9.1f ns/op\n", what, s * 1e9 / n);
-}
-
-// ops is the total across all threads; the per-thread cost is what shows
-// whether the work actually got faster or just got shared out.
-void report_scale(const char *what, unsigned threads, double ops, double s)
-{
-    printf("    %-32s %3u thr %8.2f Mops/s %9.1f ns/op\n",
-           what, threads, ops / s / 1e6, s * 1e9 * threads / ops);
-}
-
-// For measurements that are serialised today, keep the total work constant so
-// the run does not take longer and longer as threads are added.
-int share(int total, unsigned threads, int least = 4)
-{
-    return std::max(least, total / static_cast<int>(threads));
-}
-
-unsigned n_cpus()
-{
-    unsigned n = std::thread::hardware_concurrency();
-    return n ? n : 1;
-}
-
-// Runs fn(i) on `threads` threads started together; returns the wall time.
-// Pins each thread to a cpu.
-template <typename F>
-double parallel(unsigned threads, F fn)
-{
-    std::vector<std::thread> ts;
-    std::atomic<unsigned> ready{0};
-    std::atomic<bool> go{false};
-    for (unsigned i = 0; i < threads; i++) {
-        ts.emplace_back([&, i] {
-            sched::thread::pin(sched::cpus[i % sched::cpus.size()]);
-            ready.fetch_add(1);
-            while (!go.load(std::memory_order_acquire)) {
-                std::this_thread::yield();
-            }
-            fn(i);
-        });
-    }
-    while (ready.load() != threads) {
-        std::this_thread::yield();
-    }
-    auto t0 = clk::now();
-    go.store(true, std::memory_order_release);
-    for (auto &t : ts) {
-        t.join();
-    }
-    double s = since(t0);
-    return s;
-}
-
-/* frames ------------------------------------------------------------------ */
-
-void frames_functional()
-{
-    group("frames");
-
-    section("4 KiB frames are distinct, aligned and writable");
-    {
-        const int n = 64;
-        void *p[n];
-        for (int i = 0; i < n; i++) {
-            p[i] = memory::alloc_page();
-            CHECK(p[i] != nullptr);
-            CHECK(mmu::is_page_aligned(p[i]));
-            memset(p[i], 0xa5, mmu::page_size);
-        }
-        for (int i = 0; i < n; i++) {
-            for (int j = i + 1; j < n; j++) {
-                CHECK(p[i] != p[j]);
-            }
-        }
-        for (int i = 0; i < n; i++) {
-            CHECK(static_cast<unsigned char *>(p[i])[mmu::page_size - 1] == 0xa5);
-            memory::free_page(p[i]);
-        }
-    }
-
-    section("frames are in the linear map and round-trip virt<->phys");
-    {
-        void *p = memory::alloc_page();
-        CHECK(mmu::is_linear_mapped(p, mmu::page_size));
-        mmu::phys pa = mmu::virt_to_phys(p);
-        CHECK(mmu::phys_to_virt(pa) == p);
-        CHECK((pa & (mmu::page_size - 1)) == 0);
-        memory::free_page(p);
-    }
-
-    section("2 MiB frames are 2 MiB aligned");
-    {
-        void *h = memory::alloc_huge_page(mmu::huge_page_size);
-        CHECK(h != nullptr);
-        if (h) {
-            CHECK((reinterpret_cast<uintptr_t>(h) & (mmu::huge_page_size - 1)) == 0);
-            memset(h, 0x5a, mmu::huge_page_size);
-            memory::free_huge_page(h, mmu::huge_page_size);
-        }
-    }
-
-    section("contiguous allocation really is contiguous");
-    {
-        const size_t sizes[] = {1ul << 20, 8ul << 20};
-        for (size_t size : sizes) {
-            void *p = memory::alloc_phys_contiguous_aligned(size, mmu::page_size);
-            CHECK(p != nullptr);
-            if (!p) {
-                continue;
-            }
-            mmu::phys base = mmu::virt_to_phys(p);
-            bool ok = true;
-            for (size_t off = 0; off < size; off += mmu::page_size) {
-                ok = ok && mmu::virt_to_phys(static_cast<char *>(p) + off) == base + off;
-            }
-            CHECK(ok);
-            memory::free_phys_contiguous_aligned(p, size);
-        }
-    }
-
-    section("free memory returns to its starting value");
-    {
-        // The per-CPU page pools sit between alloc_page and the accounting, so
-        // the counter lags by up to a pool's worth. Exact accounting is one of
-        // the things the rewrite should buy; record the drift for now.
-        const size_t slack = 64ul << 20;
-        size_t before = mem::frames::free_bytes();
-        const int n = 4096;
-        std::vector<void *> p(n);
-        for (int i = 0; i < n; i++) {
-            p[i] = memory::alloc_page();
-        }
-        size_t during = mem::frames::free_bytes();
-        CHECK(during <= before);
-        for (int i = 0; i < n; i++) {
-            memory::free_page(p[i]);
-        }
-        size_t after = mem::frames::free_bytes();
-        CHECK(after >= during);
-        CHECK(after + slack >= before);
-        printf("      total %zu MiB, free %zu MiB, drift after %d pages: %ld KiB\n",
-               mem::frames::total_bytes() >> 20, after >> 20, n,
-               (static_cast<long>(before) - static_cast<long>(after)) >> 10);
-    }
-}
-
-void frames_perf()
-{
-    group("frames - performance");
-
-    const int batch = 512;
-    const int rounds = 100;
-    std::vector<void *> p(batch);
-
-    section("order 0");
-    {
-        // Warm the per-CPU pools so the first measurement is not the only one
-        // paying for a refill.
-        for (int i = 0; i < batch; i++) {
-            p[i] = memory::alloc_page();
-        }
-        for (int i = 0; i < batch; i++) {
-            memory::free_page(p[i]);
-        }
-
-        for (unsigned t = 1; t <= n_cpus(); t *= 2) {
-            double s = parallel(t, [&](unsigned) {
-                std::vector<void *> q(batch);
-                for (int r = 0; r < rounds; r++) {
-                    for (int i = 0; i < batch; i++) {
-                        q[i] = memory::alloc_page();
-                        escape(q[i]);
-                    }
-                    for (int i = 0; i < batch; i++) {
-                        memory::free_page(q[i]);
-                    }
-                }
-            });
-            report_scale("alloc_page + free_page", t, 2.0 * batch * rounds * t, s);
-        }
-    }
-
-    section("order 0, through mem::frames directly");
-    {
-        for (unsigned t = 1; t <= n_cpus(); t *= 2) {
-            double s = parallel(t, [&](unsigned) {
-                std::vector<void *> q(batch);
-                for (int r = 0; r < rounds; r++) {
-                    for (int i = 0; i < batch; i++) {
-                        q[i] = mem::frames::to_linear(mem::frames::alloc());
-                        escape(q[i]);
-                    }
-                    for (int i = 0; i < batch; i++) {
-                        mem::frames::free(mem::frames::from_linear(q[i]));
-                    }
-                }
-            });
-            report_scale("frames::alloc + free", t, 2.0 * batch * rounds * t, s);
-        }
-    }
-
-    section("cpu spread");
-    {
-        unsigned t = n_cpus();
-        std::vector<unsigned> seen(t, 0u);
-        parallel(t, [&](unsigned id) {
-            for (int i = 0; i < 1000; i++) {
-                mem::frames::free(mem::frames::alloc());
-            }
-            seen[id] = sched::cpu::current() ? sched::cpu::current()->id : 9999;
-        });
-        unsigned distinct = 0;
-        for (unsigned i = 0; i < t; i++) {
-            bool dup = false;
-            for (unsigned j = 0; j < i; j++) {
-                dup = dup || seen[j] == seen[i];
-            }
-            distinct += !dup;
-        }
-        printf("    %-46s %9u of %u\n", "distinct cpus running the threads", distinct, t);
-    }
-
-    section("order 9");
-    {
-        const int total = 512;
-        for (unsigned t = 1; t <= n_cpus(); t *= 2) {
-            const int n = share(total, t);
-            double s = parallel(t, [&](unsigned) {
-                for (int i = 0; i < n; i++) {
-                    void *h = memory::alloc_huge_page(mmu::huge_page_size);
-                    if (!h) {
-                        break;
-                    }
-                    escape(h);
-                    memory::free_huge_page(h, mmu::huge_page_size);
-                }
-            });
-            report_scale("alloc_huge_page + free", t, 2.0 * n * t, s);
-        }
-    }
-
-    section("contiguous");
-    {
-        const int n = 64;
-        for (size_t size : {1ul << 20, 8ul << 20, 64ul << 20}) {
-            auto t0 = clk::now();
-            int got = 0;
-            for (int i = 0; i < n; i++) {
-                void *q = memory::alloc_phys_contiguous_aligned(size, mmu::page_size);
-                if (!q) {
-                    break;
-                }
-                escape(q);
-                memory::free_phys_contiguous_aligned(q, size);
-                got++;
-            }
-            char label[64];
-            snprintf(label, sizeof(label), "alloc_phys_contiguous %zu MiB + free", size >> 20);
-            if (got) {
-                report_ns(label, since(t0), got);
-            } else {
-                printf("    %-46s %9s\n", label, "failed");
-            }
-        }
-    }
-}
-
-/* vspace ------------------------------------------------------------------ */
-
-void vspace_functional()
-{
-    group("vspace");
-
-    section("reserving consumes no physical memory");
-    {
-        const size_t size = 64ul << 20;
-        size_t before = mem::frames::free_bytes();
-        void *p = mmu::map_anon(nullptr, size, 0, mmu::perm_rw);
-        CHECK(p != nullptr);
-        CHECK(before - mem::frames::free_bytes() < size / 8);
-        CHECK(!mmu::munmap(p, size).bad());
-    }
-
-    section("populate maps immediately, unmap returns the memory");
-    {
-        const size_t size = 8ul << 20;
-        size_t before = mem::frames::free_bytes();
-        void *p = mmu::map_anon(nullptr, size, mmu::mmap_populate, mmu::perm_rw);
-        CHECK(p != nullptr);
-        CHECK(before - mem::frames::free_bytes() >= size / 2);
-        CHECK(mmu::ismapped(p, size));
-        CHECK(!mmu::munmap(p, size).bad());
-        CHECK(mem::frames::free_bytes() + (size / 4) >= before);
-    }
-
-    section("reservations do not overlap");
-    {
-        const size_t size = 2ul << 20;
-        const int n = 32;
-        void *p[n];
-        for (int i = 0; i < n; i++) {
-            p[i] = mmu::map_anon(nullptr, size, 0, mmu::perm_rw);
-            CHECK(p[i] != nullptr);
-        }
-        for (int i = 0; i < n; i++) {
-            for (int j = i + 1; j < n; j++) {
-                uintptr_t a = reinterpret_cast<uintptr_t>(p[i]);
-                uintptr_t b = reinterpret_cast<uintptr_t>(p[j]);
-                CHECK(a + size <= b || b + size <= a);
-            }
-        }
-        for (int i = 0; i < n; i++) {
-            CHECK(!mmu::munmap(p[i], size).bad());
-        }
-    }
-
-    section("reservations from several threads do not overlap");
-    {
-        const size_t size = 1ul << 20;
-        const int per_thread = 16;
-        unsigned threads = n_cpus();
-        std::vector<void *> got(threads * per_thread, nullptr);
-        parallel(threads, [&](unsigned id) {
-            for (int i = 0; i < per_thread; i++) {
-                got[id * per_thread + i] = mmu::map_anon(nullptr, size, 0, mmu::perm_rw);
-            }
-        });
-        for (void *q : got) {
-            CHECK(q != nullptr);
-        }
-        std::vector<uintptr_t> addr;
-        for (void *q : got) {
-            if (q) {
-                addr.push_back(reinterpret_cast<uintptr_t>(q));
-            }
-        }
-        std::sort(addr.begin(), addr.end());
-        for (size_t i = 1; i < addr.size(); i++) {
-            CHECK(addr[i - 1] + size <= addr[i]);
-        }
-        for (void *q : got) {
-            if (q) {
-                mmu::munmap(q, size);
-            }
-        }
-    }
-
-    section("a reservation made on one thread can be released on another");
-    {
-        const size_t size = 2ul << 20;
-        void *p = nullptr;
-        std::thread a([&] { p = mmu::map_anon(nullptr, size, mmu::mmap_populate, mmu::perm_rw); });
-        a.join();
-        bool ok = false;
-        std::thread b([&] { ok = !mmu::munmap(p, size).bad(); });
-        b.join();
-        CHECK(ok);
-    }
-
-    section("protect changes permissions without unmapping");
-    {
-        const size_t size = 2ul << 20;
-        void *p = mmu::map_anon(nullptr, size, mmu::mmap_populate, mmu::perm_rw);
-        CHECK(!mmu::mprotect(p, size, mmu::perm_read).bad());
-        CHECK(mmu::isreadable(p, size));
-        CHECK(!mmu::mprotect(p, size, mmu::perm_rw).bad());
-        memset(p, 1, size);
-        CHECK(!mmu::munmap(p, size).bad());
-    }
-}
-
-void vspace_perf()
-{
-    group("vspace - performance");
-
-    struct { const char *name; size_t size; int n; } cases[] = {
-        {"4 KiB",  4ul << 10, 2000},
-        {"2 MiB",  2ul << 20, 1000},
-        {"64 MiB", 64ul << 20, 64},
-    };
-
-    section("reserve + release");
-    for (auto &c : cases) {
-        auto t0 = clk::now();
-        for (int i = 0; i < c.n; i++) {
-            void *p = mmu::map_anon(nullptr, c.size, 0, mmu::perm_rw);
-            mmu::munmap(p, c.size);
-        }
-        char label[64];
-        snprintf(label, sizeof(label), "map_anon + munmap %s, no backing", c.name);
-        report_ns(label, since(t0), c.n);
-    }
-
-    section("reserve + release, scaling");
-    {
-        const size_t size = 2ul << 20;
-        const int total = 2000;
-        for (unsigned t = 1; t <= n_cpus(); t *= 2) {
-            const int n = share(total, t);
-            double s = parallel(t, [&](unsigned) {
-                for (int i = 0; i < n; i++) {
-                    void *p = mmu::map_anon(nullptr, size, 0, mmu::perm_rw);
-                    escape(p);
-                    mmu::munmap(p, size);
-                }
-            });
-            report_scale("map_anon + munmap 2 MiB", t, static_cast<double>(n) * t, s);
-        }
-    }
-
-    section("lookup");
-    {
-        const size_t size = 2ul << 20;
-        for (int live : {1, 100, 1000}) {
-            std::vector<void *> p;
-            for (int i = 0; i < live; i++) {
-                p.push_back(mmu::map_anon(nullptr, size, 0, mmu::perm_rw));
-            }
-            const int probes = 20000;
-            char *target = static_cast<char *>(p[p.size() / 2]);
-            auto t0 = clk::now();
-            for (int i = 0; i < probes; i++) {
-                mmu::ismapped(target, mmu::page_size);
-            }
-            char label[64];
-            snprintf(label, sizeof(label), "ismapped with %d live reservations", live);
-            report_ns(label, since(t0), probes);
-            for (void *q : p) {
-                mmu::munmap(q, size);
-            }
-        }
-    }
-}
-
-/* mapping ----------------------------------------------------------------- */
-
-void mapping_functional()
-{
-    group("mapping");
-
-    section("anonymous memory faults in zeroed and keeps what is written");
-    {
-        const size_t size = 4ul << 20;
-        char *p = static_cast<char *>(mmu::map_anon(nullptr, size, 0, mmu::perm_rw));
-        CHECK(p != nullptr);
-        bool zero = true;
-        for (size_t off = 0; off < size; off += mmu::page_size) {
-            zero = zero && p[off] == 0;
-        }
-        CHECK(zero);
-        for (size_t off = 0; off < size; off += mmu::page_size) {
-            p[off] = static_cast<char>(off / mmu::page_size);
-        }
-        bool kept = true;
-        for (size_t off = 0; off < size; off += mmu::page_size) {
-            kept = kept && p[off] == static_cast<char>(off / mmu::page_size);
-        }
-        CHECK(kept);
-        CHECK(!mmu::munmap(p, size).bad());
-    }
-
-    section("concurrent faults on one region");
-    {
-        const size_t size = 16ul << 20;
-        char *p = static_cast<char *>(mmu::map_anon(nullptr, size, 0, mmu::perm_rw));
-        unsigned threads = n_cpus();
-        parallel(threads, [&](unsigned id) {
-            size_t stride = mmu::page_size * threads;
-            for (size_t off = id * mmu::page_size; off < size; off += stride) {
-                p[off] = 42;
-            }
-        });
-        bool ok = true;
-        for (size_t off = 0; off < size; off += mmu::page_size) {
-            ok = ok && p[off] == 42;
-        }
-        CHECK(ok);
-        CHECK(!mmu::munmap(p, size).bad());
-    }
-
-    // Note: pages of an mmap'd region cannot be checked for distinct backing
-    // frames today. mmu::virt_to_phys asserts the address is linear-mapped, and
-    // the page-table walk that would answer it (virt_to_phys_pt) is private to
-    // core/mmu.cc. mapping::walk makes this testable.
-
-    section("pages within a region are independent");
-    {
-        const size_t size = 256ul << 10;
-        unsigned char *p = static_cast<unsigned char *>(
-            mmu::map_anon(nullptr, size, mmu::mmap_populate, mmu::perm_rw));
-        CHECK(p != nullptr);
-        size_t pages = size / mmu::page_size;
-        for (size_t i = 0; i < pages; i++) {
-            memset(p + i * mmu::page_size, static_cast<int>(i & 0xff), mmu::page_size);
-        }
-        bool ok = true;
-        for (size_t i = 0; i < pages; i++) {
-            ok = ok && p[i * mmu::page_size] == (i & 0xff);
-            ok = ok && p[i * mmu::page_size + mmu::page_size - 1] == (i & 0xff);
-        }
-        CHECK(ok);
-        CHECK(!mmu::munmap(p, size).bad());
-    }
-}
-
-void mapping_perf()
-{
-    group("mapping - performance");
-
-    section("first touch");
-    {
-        const size_t size = 64ul << 20;
-        char *p = static_cast<char *>(mmu::map_anon(nullptr, size, 0, mmu::perm_rw));
-        auto t0 = clk::now();
-        for (size_t off = 0; off < size; off += mmu::page_size) {
-            p[off] = 1;
-        }
-        report_ns("fault + populate, 4 KiB", since(t0), size / mmu::page_size);
-        mmu::munmap(p, size);
-    }
-
-    section("populate at map time");
-    {
-        const size_t size = 16ul << 20;
-        const int n = 16;
-        auto t0 = clk::now();
-        for (int i = 0; i < n; i++) {
-            void *p = mmu::map_anon(nullptr, size, mmu::mmap_populate, mmu::perm_rw);
-            mmu::munmap(p, size);
-        }
-        report_ns("mmap_populate + munmap, per 4 KiB page",
-                  since(t0), static_cast<double>(n) * size / mmu::page_size);
-    }
-
-    section("map + touch + unmap, scaling");
-    {
-        const size_t size = 4ul << 20;
-        const int total = 128;
-        for (unsigned t = 1; t <= n_cpus(); t *= 2) {
-            const int n = share(total, t, 2);
-            double s = parallel(t, [&](unsigned) {
-                for (int i = 0; i < n; i++) {
-                    char *p = static_cast<char *>(mmu::map_anon(nullptr, size, 0, mmu::perm_rw));
-                    for (size_t off = 0; off < size; off += mmu::page_size) {
-                        p[off] = 1;
-                    }
-                    mmu::munmap(p, size);
-                }
-            });
-            report_scale("map+touch+unmap 4 MiB, per page", t,
-                         static_cast<double>(n) * t * size / mmu::page_size, s);
-        }
-    }
-
-    section("protect");
-    {
-        const size_t size = 2ul << 20;
-        const int n = 200;
-        void *p = mmu::map_anon(nullptr, size, mmu::mmap_populate, mmu::perm_rw);
-        auto t0 = clk::now();
-        for (int i = 0; i < n; i++) {
-            mmu::mprotect(p, size, mmu::perm_read);
-            mmu::mprotect(p, size, mmu::perm_rw);
-        }
-        report_ns("mprotect 2 MiB", since(t0), 2.0 * n);
-        mmu::munmap(p, size);
-    }
+    void *p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | extra, -1, 0);
+    return p == MAP_FAILED ? nullptr : p;
 }
 
 /* heap -------------------------------------------------------------------- */
@@ -780,24 +194,397 @@ void heap_perf()
     }
 }
 
-} // namespace
+/* mmap -------------------------------------------------------------------- */
+
+void mmap_functional()
+{
+    group("mmap");
+
+    section("a mapping is usable and unmaps cleanly");
+    {
+        const size_t size = 2ul << 20;
+        char *p = static_cast<char *>(map(size));
+        CHECK(p != nullptr);
+        memset(p, 0x5a, size);
+        CHECK(p[0] == 0x5a);
+        CHECK(p[size - 1] == 0x5a);
+        CHECK(munmap(p, size) == 0);
+    }
+
+    section("mappings do not overlap");
+    {
+        const size_t size = 2ul << 20;
+        const int n = 32;
+        void *p[n];
+        for (int i = 0; i < n; i++) {
+            p[i] = map(size);
+            CHECK(p[i] != nullptr);
+        }
+        for (int i = 0; i < n; i++) {
+            for (int j = i + 1; j < n; j++) {
+                uintptr_t a = reinterpret_cast<uintptr_t>(p[i]);
+                uintptr_t b = reinterpret_cast<uintptr_t>(p[j]);
+                CHECK(a + size <= b || b + size <= a);
+            }
+        }
+        for (int i = 0; i < n; i++) {
+            CHECK(munmap(p[i], size) == 0);
+        }
+    }
+
+    section("mappings from several threads do not overlap");
+    {
+        const size_t size = 1ul << 20;
+        const int per_thread = 16;
+        unsigned threads = n_cpus();
+        std::vector<void *> got(threads * per_thread, nullptr);
+        parallel(threads, [&](unsigned id) {
+            for (int i = 0; i < per_thread; i++) {
+                got[id * per_thread + i] = map(size);
+            }
+        });
+        std::vector<uintptr_t> addr;
+        for (void *q : got) {
+            CHECK(q != nullptr);
+            if (q) {
+                addr.push_back(reinterpret_cast<uintptr_t>(q));
+            }
+        }
+        std::sort(addr.begin(), addr.end());
+        for (size_t i = 1; i < addr.size(); i++) {
+            CHECK(addr[i - 1] + size <= addr[i]);
+        }
+        for (void *q : got) {
+            if (q) {
+                munmap(q, size);
+            }
+        }
+    }
+
+    section("a mapping made on one thread can be unmapped on another");
+    {
+        const size_t size = 2ul << 20;
+        void *p = nullptr;
+        std::thread a([&] { p = map(size, MAP_POPULATE); });
+        a.join();
+        int rc = -1;
+        std::thread b([&] { rc = munmap(p, size); });
+        b.join();
+        CHECK(rc == 0);
+    }
+
+    section("mapping reserves address space, touching spends memory");
+    {
+        const size_t size = 64ul << 20;
+        size_t before = free_bytes();
+        char *p = static_cast<char *>(map(size));
+        CHECK(p != nullptr);
+        size_t reserved = free_bytes();
+        CHECK(before - reserved < size / 8);
+        for (size_t off = 0; off < size; off += page) {
+            p[off] = 1;
+        }
+        CHECK(reserved - free_bytes() >= size / 2);
+        CHECK(munmap(p, size) == 0);
+        CHECK(free_bytes() + (size / 4) >= before);
+    }
+
+    section("MAP_POPULATE spends the memory up front");
+    {
+        const size_t size = 8ul << 20;
+        size_t before = free_bytes();
+        void *p = map(size, MAP_POPULATE);
+        CHECK(p != nullptr);
+        CHECK(before - free_bytes() >= size / 2);
+        CHECK(munmap(p, size) == 0);
+    }
+
+    section("mprotect changes access without unmapping");
+    {
+        const size_t size = 2ul << 20;
+        char *p = static_cast<char *>(map(size, MAP_POPULATE));
+        memset(p, 7, size);
+        CHECK(mprotect(p, size, PROT_READ) == 0);
+        CHECK(p[0] == 7);
+        CHECK(p[size - 1] == 7);
+        CHECK(mprotect(p, size, PROT_READ | PROT_WRITE) == 0);
+        memset(p, 8, size);
+        CHECK(p[size - 1] == 8);
+        CHECK(munmap(p, size) == 0);
+    }
+
+    section("mincore reports what is resident");
+    {
+        const size_t size = 64ul << 10;
+        const size_t pages = size / page;
+        char *p = static_cast<char *>(map(size, MAP_POPULATE));
+        std::vector<unsigned char> vec(pages, 0);
+        CHECK(mincore(p, size, vec.data()) == 0);
+        bool all = true;
+        for (size_t i = 0; i < pages; i++) {
+            all = all && (vec[i] & 1);
+        }
+        CHECK(all);
+        CHECK(munmap(p, size) == 0);
+    }
+
+    section("MADV_DONTNEED gives the memory back and the range stays usable");
+    {
+        const size_t size = 8ul << 20;
+        char *p = static_cast<char *>(map(size, MAP_POPULATE));
+        memset(p, 9, size);
+        size_t populated = free_bytes();
+        CHECK(madvise(p, size, MADV_DONTNEED) == 0);
+        CHECK(free_bytes() - populated >= size / 2);
+        CHECK(p[0] == 0);
+        CHECK(p[size - 1] == 0);
+        CHECK(munmap(p, size) == 0);
+    }
+
+    section("msync on anonymous memory succeeds, and fails off the map");
+    {
+        const size_t size = 2ul << 20;
+        char *p = static_cast<char *>(map(size));
+        CHECK(msync(p, size, MS_SYNC) == 0);
+        CHECK(munmap(p, size) == 0);
+        CHECK(msync(p, size, MS_SYNC) != 0);
+    }
+}
+
+void mmap_perf()
+{
+    group("mmap - performance");
+
+    struct { const char *name; size_t size; int n; } cases[] = {
+        {"4 KiB",  4ul << 10, 2000},
+        {"2 MiB",  2ul << 20, 1000},
+        {"64 MiB", 64ul << 20, 64},
+    };
+
+    section("map + unmap, nothing touched");
+    for (auto &c : cases) {
+        auto t0 = clk::now();
+        for (int i = 0; i < c.n; i++) {
+            void *p = map(c.size);
+            escape(p);
+            munmap(p, c.size);
+        }
+        char label[64];
+        snprintf(label, sizeof(label), "mmap + munmap %s", c.name);
+        report_ns(label, since(t0), c.n);
+    }
+
+    section("map + unmap, scaling");
+    {
+        const size_t size = 2ul << 20;
+        const int total = 2000;
+        for (unsigned t = 1; t <= n_cpus(); t *= 2) {
+            const int n = share(total, t);
+            double s = parallel(t, [&](unsigned) {
+                for (int i = 0; i < n; i++) {
+                    void *p = map(size);
+                    escape(p);
+                    munmap(p, size);
+                }
+            });
+            report_scale("mmap + munmap 2 MiB", t, static_cast<double>(n) * t, s);
+        }
+    }
+
+    section("mprotect");
+    {
+        const size_t size = 2ul << 20;
+        const int n = 200;
+        void *p = map(size, MAP_POPULATE);
+        auto t0 = clk::now();
+        for (int i = 0; i < n; i++) {
+            mprotect(p, size, PROT_READ);
+            mprotect(p, size, PROT_READ | PROT_WRITE);
+        }
+        report_ns("mprotect 2 MiB", since(t0), 2.0 * n);
+        munmap(p, size);
+    }
+
+    section("mincore");
+    {
+        const size_t size = 2ul << 20;
+        const int n = 20000;
+        char *p = static_cast<char *>(map(size, MAP_POPULATE));
+        unsigned char vec;
+        auto t0 = clk::now();
+        for (int i = 0; i < n; i++) {
+            mincore(p, page, &vec);
+        }
+        report_ns("mincore, one page", since(t0), n);
+        munmap(p, size);
+    }
+}
+
+/* page faults ------------------------------------------------------------- */
+
+void fault_functional()
+{
+    group("page faults");
+
+    section("a faulted page arrives zeroed and keeps what is written");
+    {
+        const size_t size = 4ul << 20;
+        char *p = static_cast<char *>(map(size));
+        CHECK(p != nullptr);
+        bool zero = true;
+        for (size_t off = 0; off < size; off += page) {
+            zero = zero && p[off] == 0;
+        }
+        CHECK(zero);
+        for (size_t off = 0; off < size; off += page) {
+            p[off] = static_cast<char>(off / page);
+        }
+        bool kept = true;
+        for (size_t off = 0; off < size; off += page) {
+            kept = kept && p[off] == static_cast<char>(off / page);
+        }
+        CHECK(kept);
+        CHECK(munmap(p, size) == 0);
+    }
+
+    section("threads faulting one mapping at once each get their own pages");
+    {
+        const size_t size = 16ul << 20;
+        char *p = static_cast<char *>(map(size));
+        unsigned threads = n_cpus();
+        parallel(threads, [&](unsigned id) {
+            size_t stride = page * threads;
+            for (size_t off = id * page; off < size; off += stride) {
+                p[off] = static_cast<char>(id + 1);
+            }
+        });
+        bool ok = true;
+        for (size_t off = 0; off < size; off += page) {
+            unsigned who = (off / page) % threads;
+            ok = ok && p[off] == static_cast<char>(who + 1);
+        }
+        CHECK(ok);
+        CHECK(munmap(p, size) == 0);
+    }
+
+    section("writing one page leaves its neighbours alone");
+    {
+        const size_t size = 256ul << 10;
+        unsigned char *p = static_cast<unsigned char *>(map(size, MAP_POPULATE));
+        CHECK(p != nullptr);
+        size_t pages = size / page;
+        for (size_t i = 0; i < pages; i++) {
+            memset(p + i * page, static_cast<int>(i & 0xff), page);
+        }
+        bool ok = true;
+        for (size_t i = 0; i < pages; i++) {
+            ok = ok && p[i * page] == (i & 0xff);
+            ok = ok && p[i * page + page - 1] == (i & 0xff);
+        }
+        CHECK(ok);
+        CHECK(munmap(p, size) == 0);
+    }
+}
+
+void fault_perf()
+{
+    group("page faults - performance");
+
+    section("first touch");
+    {
+        const size_t size = 64ul << 20;
+        char *p = static_cast<char *>(map(size));
+        auto t0 = clk::now();
+        for (size_t off = 0; off < size; off += page) {
+            p[off] = 1;
+        }
+        report_ns("fault + populate, 4 KiB", since(t0), size / page);
+        munmap(p, size);
+    }
+
+    section("populate at map time instead");
+    {
+        const size_t size = 16ul << 20;
+        const int n = 16;
+        auto t0 = clk::now();
+        for (int i = 0; i < n; i++) {
+            void *p = map(size, MAP_POPULATE);
+            munmap(p, size);
+        }
+        report_ns("MAP_POPULATE + munmap, per 4 KiB page",
+                  since(t0), static_cast<double>(n) * size / page);
+    }
+
+    section("map + touch + unmap, scaling");
+    {
+        const size_t size = 4ul << 20;
+        const int total = 128;
+        for (unsigned t = 1; t <= n_cpus(); t *= 2) {
+            const int n = share(total, t, 2);
+            double s = parallel(t, [&](unsigned) {
+                for (int i = 0; i < n; i++) {
+                    char *p = static_cast<char *>(map(size));
+                    for (size_t off = 0; off < size; off += page) {
+                        p[off] = 1;
+                    }
+                    munmap(p, size);
+                }
+            });
+            report_scale("map+touch+unmap 4 MiB, per page", t,
+                         static_cast<double>(n) * t * size / page, s);
+        }
+    }
+
+    section("one mapping faulted by every thread, scaling");
+    {
+        // Constant total work, so throughput rising with threads means the
+        // fault path really is parallel. Every thread faults pages of the same
+        // mapping, which is what a database with one large mapping does.
+        const size_t size = 256ul << 20;
+        const double pages = static_cast<double>(size / page);
+        for (unsigned t = 1; t <= n_cpus(); t *= 2) {
+            char *p = static_cast<char *>(map(size));
+            if (!p) {
+                break;
+            }
+            double s = parallel(t, [&](unsigned id) {
+                size_t stride = page * t;
+                for (size_t off = id * page; off < size; off += stride) {
+                    p[off] = 1;
+                }
+            });
+            report_scale("one shared mapping, per page", t, pages, s);
+            munmap(p, size);
+        }
+    }
+
+    section("first touch of a huge-page-aligned mapping");
+    {
+        const size_t size = 64ul << 20;
+        char *p = static_cast<char *>(map(size));
+        auto t0 = clk::now();
+        for (size_t off = 0; off < size; off += huge) {
+            p[off] = 1;
+        }
+        report_ns("fault + populate, one touch per 2 MiB", since(t0), size / huge);
+        munmap(p, size);
+    }
+}
+
+}
 
 int os_memory_main()
 {
-    printf("######## memory subsystem ########\n");
-    printf("cpus: %u, memory: %zu MiB\n", n_cpus(), mem::frames::total_bytes() >> 20);
+    reset();
+    printf("######## memory, as an application sees it ########\n");
+    printf("cpus: %u, free: %zu MiB\n", n_cpus(), free_bytes() >> 20);
 
-    frames_functional();
-    frames_perf();
-    vspace_functional();
-    vspace_perf();
-    mapping_functional();
-    mapping_perf();
     heap_functional();
     heap_perf();
+    mmap_functional();
+    mmap_perf();
+    fault_functional();
+    fault_perf();
 
-    int fails = g_fails.load();
-    printf("\n%d checks, %d failures\n", g_checks.load(), fails);
-    printf("RESULT: %s\n", fails ? "MEMORY TESTS FAILED" : "ALL MEMORY TESTS PASSED");
-    return fails ? 1 : 0;
+    return summary("MEMORY");
 }

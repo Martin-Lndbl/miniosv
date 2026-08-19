@@ -6,25 +6,22 @@
  */
 
 #include <osv/mmu.hh>
+#include <osv/mem/vspace.hh>
 #include <osv/mempool.hh>
 #include "processor.hh"
-#include <osv/debug.hh>
 #include "exceptions.hh"
-#include <string.h>
-#include <iterator>
+#include "dump.hh"
 #include "libc/signal.hh"
+#include <osv/debug.hh>
+#include <string.h>
+#include <assert.h>
 #include <osv/align.hh>
 #include <osv/ilog2.hh>
-#include <osv/prio.hh>
 #include <safe-ptr.hh>
 #include <osv/error.h>
 #include <osv/trace.hh>
-#include "dump.hh"
 #include <osv/rcu.hh>
-#include <osv/rwlock.h>
 #include <algorithm>
-#include <numeric>
-#include <set>
 
 #include <osv/kernel_config.h>
 
@@ -40,86 +37,6 @@ extern size_t elf_size;
 extern const char text_start[], text_end[];
 
 namespace mmu {
-
-#if CONF_lazy_stack
-// We need to ensure that lazy stack is populated deeply enough (2 pages)
-// for all the cases when the vma_list_mutex is taken for write to prevent
-// page faults triggered on stack. The page-fault handling logic would
-// attempt to take same vma_list_mutex fo read and end up with a deadlock.
-#define PREVENT_STACK_PAGE_FAULT \
-    arch::ensure_next_two_stack_pages();
-#else
-#define PREVENT_STACK_PAGE_FAULT
-#endif
-
-struct vma_range_compare {
-    bool operator()(const vma_range& a, const vma_range& b) const {
-        return a.start() < b.start();
-    }
-};
-
-//Set of all vma ranges - both linear and non-linear ones
-__attribute__((init_priority((int)init_prio::vma_range_set)))
-std::set<vma_range, vma_range_compare> vma_range_set;
-rwlock_t vma_range_set_mutex;
-
-struct linear_vma_compare {
-    bool operator()(const linear_vma* a, const linear_vma* b) const {
-        return a->_virt_addr < b->_virt_addr;
-    }
-};
-
-__attribute__((init_priority((int)init_prio::linear_vma_set)))
-std::set<linear_vma*, linear_vma_compare> linear_vma_set;
-rwlock_t linear_vma_set_mutex;
-
-namespace bi = boost::intrusive;
-
-class vma_compare {
-public:
-    bool operator ()(const vma& a, const vma& b) const {
-        return a.addr() < b.addr();
-    }
-};
-
-constexpr uintptr_t lower_vma_limit = 0x0;
-constexpr uintptr_t upper_vma_limit = 0x400000000000;
-
-typedef boost::intrusive::set<vma,
-                              bi::compare<vma_compare>,
-                              bi::member_hook<vma,
-                                              bi::set_member_hook<>,
-                                              &vma::_vma_list_hook>,
-                              bi::optimize_size<true>
-                              > vma_list_base;
-
-struct vma_list_type : vma_list_base {
-    vma_list_type() {
-        // insert markers for the edges of allocatable area
-        // simplifies searches
-        auto lower_edge = new anon_vma(addr_range(lower_vma_limit, lower_vma_limit), 0, 0);
-        insert(*lower_edge);
-        auto upper_edge = new anon_vma(addr_range(upper_vma_limit, upper_vma_limit), 0, 0);
-        insert(*upper_edge);
-
-        WITH_LOCK(vma_range_set_mutex.for_write()) {
-            vma_range_set.insert(vma_range(lower_edge));
-            vma_range_set.insert(vma_range(upper_edge));
-        }
-    }
-};
-
-__attribute__((init_priority((int)init_prio::vma_list)))
-vma_list_type vma_list;
-
-// protects vma list and page table modifications.
-// anything that may add, remove, split vma, zaps pte or changes pte permission
-// should hold the lock for write
-rwlock_t vma_list_mutex;
-
-// A mutex serializing modifications to the high part of the page table
-// (linear map, etc.) which are not part of vma_list.
-mutex page_table_high_mutex;
 
 // 1's for the bits provided by the pte for this level
 // 0's for the bits provided by the virtual address for this level
@@ -247,12 +164,6 @@ struct page_allocator {
     virtual ~page_allocator() {}
 };
 
-unsigned long all_vmas_size()
-{
-    SCOPE_LOCK(vma_list_mutex.for_read());
-    return std::accumulate(vma_list.begin(), vma_list.end(), size_t(0), [](size_t s, vma& v) { return s + v.size(); });
-}
-
 void clamp(uintptr_t& vstart1, uintptr_t& vend1,
            uintptr_t min, size_t max, size_t slop)
 {
@@ -268,11 +179,6 @@ inline unsigned pt_index(uintptr_t virt, unsigned level)
 }
 
 unsigned nr_page_sizes = 2; // FIXME: detect 1GB pages
-
-void set_nr_page_sizes(unsigned nr)
-{
-    nr_page_sizes = nr;
-}
 
 enum class allocate_intermediate_opt : bool {no = true, yes = false};
 enum class skip_empty_opt : bool {no = true, yes = false};
@@ -690,33 +596,6 @@ public:
     bool tlb_flush_needed(void) {return do_flush;}
 };
 
-template <typename T, account_opt Account = account_opt::no>
-class dirty_cleaner : public vma_operation<allocate_intermediate_opt::no, skip_empty_opt::yes, Account> {
-private:
-    bool do_flush;
-    T handler;
-public:
-    dirty_cleaner(T handler) : do_flush(false), handler(handler) {}
-
-    template<int N>
-    bool page(hw_ptep<N> ptep, uintptr_t offset) {
-        pt_element<N> pte = ptep.read();
-        if (!pte.dirty()) {
-            return true;
-        }
-        do_flush |= true;
-        pte.set_dirty(false);
-        ptep.write(pte);
-        handler(ptep.read().addr(), offset, pt_level_traits<N>::size::value);
-        return true;
-    }
-
-    bool tlb_flush_needed(void) {return do_flush;}
-    void finalize() {
-        handler.finalize();
-    }
-};
-
 class virt_to_phys_map :
         public page_table_operation<allocate_intermediate_opt::no, skip_empty_opt::yes,
         descend_opt::yes, once_opt::yes, split_opt::no> {
@@ -742,44 +621,6 @@ public:
         assert(ptep.read().large());
         page(ptep, offset);
     }
-};
-
-class cleanup_intermediate_pages
-    : public page_table_operation<
-          allocate_intermediate_opt::no,
-          skip_empty_opt::yes,
-          descend_opt::yes,
-          once_opt::no,
-          split_opt::no> {
-public:
-    template<int N>
-    bool page(hw_ptep<N> ptep, uintptr_t offset) {
-        if (!pt_level_traits<N>::large_capable::value) {
-            ++live_ptes;
-        }
-        return true;
-    }
-    void intermediate_page_pre(hw_ptep<1> ptep, uintptr_t offset) {
-        live_ptes = 0;
-    }
-    void intermediate_page_post(hw_ptep<1> ptep, uintptr_t offset) {
-        if (!live_ptes) {
-            auto old = ptep.read();
-            auto v = phys_cast<u64*>(old.addr());
-            for (unsigned i = 0; i < 512; ++i) {
-                assert(v[i] == 0);
-            }
-            ptep.write(make_empty_pte<1>());
-            osv::rcu_defer([](void *page) { memory::free_page(page); }, phys_to_virt(old.addr()));
-            do_flush = true;
-        }
-    }
-    bool tlb_flush_needed() { return do_flush; }
-    void finalize() {}
-    ulong account_results(void) { return 0; }
-private:
-    unsigned live_ptes;
-    bool do_flush = false;
 };
 
 class virt_to_pte_map_rcu :
@@ -848,189 +689,6 @@ void virt_visit_pte_rcu(uintptr_t virt, virt_pte_visitor& visitor)
     }
 }
 
-bool contains(uintptr_t start, uintptr_t end, vma& y)
-{
-    return y.start() >= start && y.end() <= end;
-}
-
-// So that we don't need to create a vma (with size, permission and alot of
-// other irrelevant data) just to find an address in the vma list, we have
-// the following addr_compare, which compares exactly like vma_compare does,
-// except that it takes a bare uintptr_t instead of a vma.
-class addr_compare {
-public:
-    bool operator()(const vma& x, uintptr_t y) const { return x.start() < y; }
-    bool operator()(uintptr_t x, const vma& y) const { return x < y.start(); }
-};
-
-// Find the single (if any) vma which contains the given address.
-// The complexity is logarithmic in the number of vmas in vma_list.
-static inline vma_list_type::iterator
-find_intersecting_vma(uintptr_t addr) {
-    auto vma = vma_list.lower_bound(addr, addr_compare());
-    if (vma->start() == addr) {
-        return vma;
-    }
-    // Otherwise, vma->start() > addr, so we need to check the previous vma
-    --vma;
-    if (addr >= vma->start() && addr < vma->end()) {
-        return vma;
-    } else {
-        return vma_list.end();
-    }
-}
-
-// Find the list of vmas which intersect a given address range. Because the
-// vmas are sorted in vma_list, the result is a consecutive slice of vma_list,
-// [first, second), between the first returned iterator (inclusive), and the
-// second returned iterator (not inclusive).
-// The complexity is logarithmic in the number of vmas in vma_list.
-static inline std::pair<vma_list_type::iterator, vma_list_type::iterator>
-find_intersecting_vmas(const addr_range& r)
-{
-    if (r.end() <= r.start()) { // empty range, so nothing matches
-        return {vma_list.end(), vma_list.end()};
-    }
-    auto start = vma_list.lower_bound(r.start(), addr_compare());
-    if (start->start() > r.start()) {
-        // The previous vma might also intersect with our range if it ends
-        // after our range's start.
-        auto prev = std::prev(start);
-        if (prev->end() > r.start()) {
-            start = prev;
-        }
-    }
-    // If the start vma is actually beyond the end of the search range,
-    // there is no intersection.
-    if (start->start() >= r.end()) {
-        return {vma_list.end(), vma_list.end()};
-    }
-    // end is the first vma starting >= r.end(), so any previous vma (after
-    // start) surely started < r.end() so is part of the intersection.
-    auto end = vma_list.lower_bound(r.end(), addr_compare());
-    return {start, end};
-}
-
-
-/**
- * Change virtual memory range protection
- *
- * Change protection for a virtual memory range.  Updates page tables and VMas
- * for populated memory regions and just VMAs for unpopulated ranges.
- *
- * \return returns EACCESS/EPERM if requested permission cannot be granted
- */
-static error protect(const void *addr, size_t size, unsigned int perm)
-{
-    uintptr_t start = reinterpret_cast<uintptr_t>(addr);
-    uintptr_t end = start + size;
-    auto range = find_intersecting_vmas(addr_range(start, end));
-    for (auto i = range.first; i != range.second; ++i) {
-        if (i->perm() == perm)
-            continue;
-        int err = i->validate_perm(perm);
-        if (err != 0) {
-            return make_error(err);
-        }
-        i->split(end);
-        i->split(start);
-        if (contains(start, end, *i)) {
-            i->protect(perm);
-            i->operate_range(protection(perm));
-        }
-    }
-    return no_error();
-}
-
-class vma_range_addr_compare {
-public:
-    bool operator()(const vma_range& x, uintptr_t y) const { return x.start() < y; }
-    bool operator()(uintptr_t x, const vma_range& y) const { return x < y.start(); }
-};
-
-uintptr_t find_hole(uintptr_t start, uintptr_t size)
-{
-    bool small = size < huge_page_size;
-    uintptr_t good_enough = 0;
-
-    SCOPE_LOCK(vma_range_set_mutex.for_read());
-    //Find first vma range which starts before the start parameter or is the 1st one
-    auto p = std::lower_bound(vma_range_set.begin(), vma_range_set.end(), start, vma_range_addr_compare());
-    if (p != vma_range_set.begin()) {
-        --p;
-    }
-    auto n = std::next(p);
-    while (n->start() <= upper_vma_limit) { //we only go up to the upper mmap vma limit
-        //See if desired hole fits between p and n vmas
-        if (start >= p->end() && start + size <= n->start()) {
-            return start;
-        }
-        //See if shifting start to the end of p makes desired hole fit between p and n
-        if (p->end() >= start && n->start() - p->end() >= size) {
-            good_enough = p->end();
-            if (small) {
-                return good_enough;
-            }
-            //See if huge hole fits between p and n
-            if (n->start() - align_up(good_enough, huge_page_size) >= size) {
-                return align_up(good_enough, huge_page_size);
-            }
-        }
-        //If nothing worked move next in the list
-        p = n;
-        ++n;
-    }
-    if (good_enough) {
-        return good_enough;
-    }
-    throw make_error(ENOMEM);
-}
-
-ulong evacuate(uintptr_t start, uintptr_t end)
-{
-    auto range = find_intersecting_vmas(addr_range(start, end));
-    ulong ret = 0;
-    for (auto i = range.first; i != range.second; ++i) {
-        i->split(end);
-        i->split(start);
-        if (contains(start, end, *i)) {
-            auto& dead = *i--;
-            auto size = dead.operate_range(unpopulate<account_opt::yes>(dead.page_ops()));
-            ret += size;
-            vma_list.erase(dead);
-            WITH_LOCK(vma_range_set_mutex.for_write()) {
-                vma_range_set.erase(vma_range(&dead));
-            }
-            delete &dead;
-        }
-    }
-    return ret;
-    // FIXME: range also indicates where we can insert a new anon_vma, use it
-}
-
-static void unmap(const void* addr, size_t size)
-{
-    size = align_up(size, mmu::page_size);
-    auto start = reinterpret_cast<uintptr_t>(addr);
-    evacuate(start, start+size);
-}
-
-static error sync(const void* addr, size_t length, int flags)
-{
-    length = align_up(length, mmu::page_size);
-    auto start = reinterpret_cast<uintptr_t>(addr);
-    auto end = start+length;
-    auto err = make_error(ENOMEM);
-    auto range = find_intersecting_vmas(addr_range(start, end));
-    for (auto i = range.first; i != range.second; ++i) {
-        err = i->sync(std::max(start, i->start()), std::min(end, i->end()));
-        if (err.bad()) {
-            break;
-        }
-    }
-    return err;
-}
-
 class uninitialized_anonymous_page_provider : public page_allocator {
 private:
     virtual void* fill(void* addr, uint64_t offset, uintptr_t size) {
@@ -1079,136 +737,100 @@ private:
     }
 };
 
-uintptr_t allocate(vma *v, uintptr_t start, size_t size, bool search)
+static uninitialized_anonymous_page_provider page_allocator_noinit;
+static initialized_anonymous_page_provider page_allocator_init;
+
+static page_allocator *anon_provider(bool zero)
 {
-    if (search) {
-        // search for unallocated hole around start
-        if (!start) {
-            start = 0x200000000000ul;
-        }
-        start = find_hole(start, size);
+    return zero ? static_cast<page_allocator*>(&page_allocator_init)
+                : static_cast<page_allocator*>(&page_allocator_noinit);
+}
+
+void populate_anon(void *region_start, void *addr, size_t size, unsigned perm,
+                   bool write, bool small_pages, bool zero)
+{
+    page_allocator *pops = anon_provider(zero);
+    if (small_pages) {
+        operate_range(populate_small<>(pops, perm, write, true), region_start, addr, size);
     } else {
-        // we don't know if the given range is free, need to evacuate it first
-        evacuate(start, start+size);
+        operate_range(populate<>(pops, perm, write, true), region_start, addr, size);
     }
-    v->set(start, start+size);
-
-    vma_list.insert(*v);
-    WITH_LOCK(vma_range_set_mutex.for_write()) {
-        vma_range_set.insert(vma_range(v));
-    }
-
-    return start;
-}
-
-inline bool in_vma_range(void* addr)
-{
-    return reinterpret_cast<long>(addr) >= 0;
-}
-
-void vpopulate(void* addr, size_t size)
-{
-    assert(!in_vma_range(addr));
-    WITH_LOCK(page_table_high_mutex) {
-        initialized_anonymous_page_provider map;
-        operate_range(populate<>(&map, perm_rwx), addr, size);
+    // Where the data and instruction caches are separate, code that was just
+    // mapped has to be made visible to the instruction side.
+    if (perm & perm_exec) {
+        synchronize_cpu_caches(addr, size);
     }
 }
 
-void vdepopulate(void* addr, size_t size)
+void depopulate_anon(void *region_start, void *addr, size_t size)
 {
-    assert(!in_vma_range(addr));
-    WITH_LOCK(page_table_high_mutex) {
-        initialized_anonymous_page_provider map;
-        operate_range(unpopulate<>(&map), addr, size);
-    }
+    operate_range(unpopulate<>(anon_provider(true)), region_start, addr, size);
 }
 
-void vcleanup(void* addr, size_t size)
+void protect_pages(void *region_start, void *addr, size_t size, unsigned perm)
 {
-    assert(!in_vma_range(addr));
-    WITH_LOCK(page_table_high_mutex) {
-        cleanup_intermediate_pages cleaner;
-        operate_range(cleaner, addr, addr, size);
-    }
+    operate_range(protection(perm), region_start, addr, size);
 }
 
-static void depopulate(void* addr, size_t length)
+void use_small_pages(void *region_start, void *addr, size_t size)
 {
-    length = align_up(length, mmu::page_size);
-    auto start = reinterpret_cast<uintptr_t>(addr);
-    auto range = find_intersecting_vmas(addr_range(start, start + length));
-    for (auto i = range.first; i != range.second; ++i) {
-        i->operate_range(unpopulate<>(i->page_ops()), reinterpret_cast<void*>(start), std::min(length, i->size()));
-        start += i->size();
-        length -= i->size();
-    }
+    operate_range(splithugepages(), region_start, addr, size);
 }
 
-static void nohugepage(void* addr, size_t length)
+// Everything this file reserves. The kind tells a fault which of the two it
+// landed in, and the rest is how an anonymous region wants its pages.
+struct tracked_region {
+    mem::vspace::region r;
+    enum { anon, linear } kind;
+    bool zero;
+    bool small_pages;
+};
+
+static tracked_region *tracked_of(mem::vspace::region *r)
 {
-    length = align_up(length, mmu::page_size);
-    auto start = reinterpret_cast<uintptr_t>(addr);
-    auto range = find_intersecting_vmas(addr_range(start, start + length));
-    for (auto i = range.first; i != range.second; ++i) {
-        if (!i->has_flags(mmap_small)) {
-            i->update_flags(mmap_small);
-            i->operate_range(splithugepages(), reinterpret_cast<void*>(start), std::min(length, i->size()));
-        }
-        start += i->size();
-        length -= i->size();
-    }
-}
-
-error advise(void* addr, size_t size, int advice)
-{
-    PREVENT_STACK_PAGE_FAULT
-    WITH_LOCK(vma_list_mutex.for_write()) {
-        if (!ismapped(addr, size)) {
-            return make_error(ENOMEM);
-        }
-        if (advice == advise_dontneed) {
-            depopulate(addr, size);
-            return no_error();
-        } else if (advice == advise_nohugepage) {
-            nohugepage(addr, size);
-            return no_error();
-        }
-        return make_error(EINVAL);
-    }
-}
-
-template<account_opt Account = account_opt::no>
-ulong populate_vma(vma *vma, void *v, size_t size, bool write = false)
-{
-    page_allocator *map = vma->page_ops();
-    auto total = vma->has_flags(mmap_small) ?
-        vma->operate_range(populate_small<Account>(map, vma->perm(), write, vma->map_dirty()), v, size) :
-        vma->operate_range(populate<Account>(map, vma->perm(), write, vma->map_dirty()), v, size);
-
-    // On some architectures, the cpu data and instruction caches are separate (non-unified)
-    // and therefore it might be necessary to synchronize data cache with instruction cache
-    // after populating vma with executable code.
-    if (vma->perm() & perm_exec) {
-        synchronize_cpu_caches(v, size);
-    }
-
-    return total;
+    return reinterpret_cast<tracked_region*>(r);
 }
 
 void* map_anon(const void* addr, size_t size, unsigned flags, unsigned perm)
 {
-    bool search = !(flags & mmap_fixed);
-    size = align_up(size, mmu::page_size);
+    size = align_up(size, page_size);
+    auto *t = new tracked_region();
+    t->kind = tracked_region::anon;
+    t->zero = !(flags & mmap_uninitialized);
+    t->small_pages = flags & mmap_small;
+    t->r.perm = perm;
+
     auto start = reinterpret_cast<uintptr_t>(addr);
-    auto* vma = new mmu::anon_vma(addr_range(start, start + size), perm, flags);
-    PREVENT_STACK_PAGE_FAULT
-    SCOPE_LOCK(vma_list_mutex.for_write());
-    auto v = (void*) allocate(vma, start, size, search);
+    auto result = (flags & mmap_fixed)
+        ? mem::vspace::reserve_at(t->r, {start, start + size})
+        : mem::vspace::reserve(t->r, size, size >= huge_page_size ? huge_page_size : page_size);
+    if (result != mem::vspace::resa_result::success && !(flags & mmap_fixed) &&
+        size >= huge_page_size) {
+        // Huge alignment is a preference: a mapping without it beats no mapping.
+        result = mem::vspace::reserve(t->r, size, page_size);
+    }
+    if (result != mem::vspace::resa_result::success) {
+        delete t;
+        throw make_error(ENOMEM);
+    }
+
+    void *v = reinterpret_cast<void*>(t->r.span.start);
     if (flags & mmap_populate) {
-        populate_vma(vma, v, size);
+        populate_anon(v, v, size, perm, false, t->small_pages, t->zero);
     }
     return v;
+}
+
+// The region starting exactly here, or null.
+static tracked_region *anon_at(const void *addr, size_t size)
+{
+    auto start = reinterpret_cast<uintptr_t>(addr);
+    auto *r = mem::vspace::lookup(start);
+    if (!r || r->span.start != start || r->span.size() != align_up(size, page_size)) {
+        return nullptr;
+    }
+    auto *t = tracked_of(r);
+    return t->kind == tracked_region::anon ? t : nullptr;
 }
 
 bool is_linear_mapped(const void *addr, size_t size)
@@ -1219,21 +841,11 @@ bool is_linear_mapped(const void *addr, size_t size)
     return addr >= phys_mem;
 }
 
-// Checks if the entire given memory region is mmap()ed (in vma_list).
+// Is every byte of this region reserved in the address space?
 bool ismapped(const void *addr, size_t size)
 {
-    uintptr_t start = (uintptr_t) addr;
-    uintptr_t end = start + size;
-
-    auto range = find_intersecting_vmas(addr_range(start, end));
-    for (auto p = range.first; p != range.second; ++p) {
-        if (p->start() > start)
-            return false;
-        start = p->end();
-        if (start >= end)
-            return true;
-    }
-    return false;
+    auto start = reinterpret_cast<uintptr_t>(addr);
+    return mem::vspace::reserved({start, start + size});
 }
 
 // Checks if the entire given memory region is readable.
@@ -1248,209 +860,6 @@ bool isreadable(void *addr, size_t size)
     return true;
 }
 
-bool access_fault(vma& vma, unsigned int error_code)
-{
-    auto perm = vma.perm();
-    if (mmu::is_page_fault_insn(error_code)) {
-        return !(perm & perm_exec);
-    }
-
-    if (mmu::is_page_fault_write(error_code)) {
-        return !(perm & perm_write);
-    }
-
-    return !(perm & perm_read);
-}
-
-TRACEPOINT(trace_mmu_vm_fault, "addr=%p, error_code=%x", uintptr_t, unsigned int);
-TRACEPOINT(trace_mmu_vm_fault_sigsegv, "addr=%p, error_code=%x, %s", uintptr_t, unsigned int, const char*);
-TRACEPOINT(trace_mmu_vm_fault_ret, "addr=%p, error_code=%x", uintptr_t, unsigned int);
-#if CONF_lazy_stack
-TRACEPOINT(trace_mmu_vm_stack_fault, "thread=%d, addr=%p, page_no=%d", unsigned int, uintptr_t, unsigned int);
-#endif
-
-static void vm_sigsegv(uintptr_t addr, exception_frame* ef)
-{
-    void *pc = ef->get_pc();
-    if (pc >= text_start && pc < text_end) {
-        debug_ll("page fault outside application, addr: 0x%016lx\n", addr);
-        dump_registers(ef);
-        abort();
-    }
-    osv::handle_mmap_fault(addr, SIGSEGV, ef);
-}
-
-void vm_fault(uintptr_t addr, exception_frame* ef)
-{
-    trace_mmu_vm_fault(addr, ef->get_error());
-    if (fast_sigsegv_check(addr, ef)) {
-        vm_sigsegv(addr, ef);
-        trace_mmu_vm_fault_sigsegv(addr, ef->get_error(), "fast");
-        return;
-    }
-#if CONF_lazy_stack
-    auto stack = sched::thread::current()->get_stack_info();
-    void *v_addr = reinterpret_cast<void*>(addr);
-    if (v_addr >= stack.begin && v_addr < stack.begin + stack.size) {
-        trace_mmu_vm_stack_fault(sched::thread::current()->id(), addr,
-            ((u64)(stack.begin + stack.size - addr)) / 4096);
-    }
-#endif
-    addr = align_down(addr, mmu::page_size);
-    WITH_LOCK(vma_list_mutex.for_read()) {
-        auto vma = find_intersecting_vma(addr);
-        if (vma == vma_list.end() || access_fault(*vma, ef->get_error())) {
-            vm_sigsegv(addr, ef);
-            trace_mmu_vm_fault_sigsegv(addr, ef->get_error(), "slow");
-            return;
-        }
-        vma->fault(addr, ef);
-    }
-    trace_mmu_vm_fault_ret(addr, ef->get_error());
-}
-
-vma::vma(addr_range range, unsigned perm, unsigned flags, bool map_dirty, page_allocator *page_ops)
-    : _range(align_down(range.start(), mmu::page_size), align_up(range.end(), mmu::page_size))
-    , _perm(perm)
-    , _flags(flags)
-    , _map_dirty(map_dirty)
-    , _page_ops(page_ops)
-{
-}
-
-vma::~vma()
-{
-}
-
-void vma::set(uintptr_t start, uintptr_t end)
-{
-    _range = addr_range(align_down(start, mmu::page_size), align_up(end, mmu::page_size));
-}
-
-void vma::protect(unsigned perm)
-{
-    _perm = perm;
-}
-
-uintptr_t vma::start() const
-{
-    return _range.start();
-}
-
-uintptr_t vma::end() const
-{
-    return _range.end();
-}
-
-void* vma::addr() const
-{
-    return reinterpret_cast<void*>(_range.start());
-}
-
-uintptr_t vma::size() const
-{
-    return _range.end() - _range.start();
-}
-
-unsigned vma::perm() const
-{
-    return _perm;
-}
-
-unsigned vma::flags() const
-{
-    return _flags;
-}
-
-void vma::update_flags(unsigned flag)
-{
-    assert(vma_list_mutex.wowned());
-    _flags |= flag;
-}
-
-bool vma::has_flags(unsigned flag)
-{
-    return _flags & flag;
-}
-
-template<typename T> ulong vma::operate_range(T mapper, void *addr, size_t size)
-{
-    return mmu::operate_range(mapper, reinterpret_cast<void*>(start()), addr, size);
-}
-
-template<typename T> ulong vma::operate_range(T mapper)
-{
-    void *addr = reinterpret_cast<void*>(start());
-    return mmu::operate_range(mapper, addr, addr, size());
-}
-
-bool vma::map_dirty()
-{
-    return _map_dirty;
-}
-
-void vma::fault(uintptr_t addr, exception_frame *ef)
-{
-    auto hp_start = align_up(_range.start(), huge_page_size);
-    auto hp_end = align_down(_range.end(), huge_page_size);
-    size_t size;
-    if (!has_flags(mmap_small) && (hp_start <= addr && addr < hp_end)) {
-        addr = align_down(addr, huge_page_size);
-        size = huge_page_size;
-    } else {
-        size = page_size;
-    }
-
-    populate_vma<account_opt::yes>(this, (void*)addr, size,
-        mmu::is_page_fault_write(ef->get_error()));
-}
-
-page_allocator* vma::page_ops()
-{
-    return _page_ops;
-}
-
-static uninitialized_anonymous_page_provider page_allocator_noinit;
-static initialized_anonymous_page_provider page_allocator_init;
-static page_allocator *page_allocator_noinitp = &page_allocator_noinit, *page_allocator_initp = &page_allocator_init;
-
-anon_vma::anon_vma(addr_range range, unsigned perm, unsigned flags)
-    : vma(range, perm, flags, true, (flags & mmap_uninitialized) ? page_allocator_noinitp : page_allocator_initp)
-{
-}
-
-void anon_vma::split(uintptr_t edge)
-{
-    if (edge <= _range.start() || edge >= _range.end()) {
-        return;
-    }
-    vma* n = new anon_vma(addr_range(edge, _range.end()), _perm, _flags);
-    set(_range.start(), edge);
-    vma_list.insert(*n);
-    WITH_LOCK(vma_range_set_mutex.for_write()) {
-        vma_range_set.insert(vma_range(n));
-    }
-}
-
-error anon_vma::sync(uintptr_t start, uintptr_t end)
-{
-    return no_error();
-}
-
-// There is no filesystem: file-backed mappings (file_vma) and the POSIX shared
-// memory file (shm_file) have been removed; only anonymous mappings remain.
-
-linear_vma::linear_vma(void* virt, phys phys, size_t size, mattr mem_attr, const char* name) {
-    _virt_addr = virt;
-    _phys_addr = phys;
-    _size = size;
-    _mem_attr = mem_attr;
-    _name = name;
-}
-
-linear_vma::~linear_vma() {
-}
-
 void linear_map(void* _virt, phys addr, size_t size, const char* name,
                 size_t slop, mattr mem_attr)
 {
@@ -1459,12 +868,16 @@ void linear_map(void* _virt, phys addr, size_t size, const char* name,
     assert((virt & (slop - 1)) == (addr & (slop - 1)));
     linear_page_mapper phys_map(addr, size, mem_attr);
     map_range(virt, virt, size, phys_map, slop);
-    auto _vma = new linear_vma(_virt, addr, size, mem_attr, name);
-    WITH_LOCK(linear_vma_set_mutex.for_write()) {
-       linear_vma_set.insert(_vma);
-    }
-    WITH_LOCK(vma_range_set_mutex.for_write()) {
-       vma_range_set.insert(vma_range(_vma));
+
+    // Hold the range so nothing else is handed the same addresses. Some of
+    // these overlap -- ACPI maps pages that are also part of a reserved range
+    // -- and the first reservation is enough to keep them all out.
+    auto *t = new tracked_region();
+    t->kind = tracked_region::linear;
+    t->r.perm = perm_rwx;
+    if (mem::vspace::reserve_at(t->r, {virt, virt + size}) !=
+        mem::vspace::resa_result::success) {
+        delete t;
     }
 }
 
@@ -1485,47 +898,124 @@ void free_initial_memory_range(uintptr_t addr, size_t size)
     memory::free_initial_memory_range(phys_cast<void>(addr), size);
 }
 
+// Permissions live in the page tables; the region records what was asked for.
 error mprotect(const void *addr, size_t len, unsigned perm)
 {
-    PREVENT_STACK_PAGE_FAULT
-    SCOPE_LOCK(vma_list_mutex.for_write());
-
+    len = align_up(len, page_size);
+    auto start = reinterpret_cast<uintptr_t>(addr);
     if (!ismapped(addr, len)) {
         return make_error(ENOMEM);
     }
-
-    return protect(addr, len, perm);
+    if (auto *r = mem::vspace::lookup(start)) {
+        r->perm = perm;
+    }
+    protect_pages(const_cast<void*>(addr), const_cast<void*>(addr), len, perm);
+    return no_error();
 }
 
 error munmap(const void *addr, size_t length)
 {
-    PREVENT_STACK_PAGE_FAULT
-    SCOPE_LOCK(vma_list_mutex.for_write());
-
-    length = align_up(length, mmu::page_size);
-    if (!ismapped(addr, length)) {
+    auto *t = anon_at(addr, length);
+    if (!t) {
         return make_error(EINVAL);
     }
-    sync(addr, length, 0);
-    unmap(addr, length);
+    void *v = const_cast<void*>(addr);
+    depopulate_anon(v, v, t->r.span.size());
+    mem::vspace::release(t->r);
+    delete t;
     return no_error();
 }
 
-error msync(const void* addr, size_t length, int flags)
+error advise(void* addr, size_t size, int advice)
 {
-    SCOPE_LOCK(vma_list_mutex.for_read());
-
-    if (!ismapped(addr, length)) {
+    size = align_up(size, page_size);
+    if (!ismapped(addr, size)) {
         return make_error(ENOMEM);
     }
-    return sync(addr, length, flags);
+    if (advice == advise_dontneed) {
+        depopulate_anon(addr, addr, size);
+        return no_error();
+    }
+    if (advice == advise_nohugepage) {
+        use_small_pages(addr, addr, size);
+        return no_error();
+    }
+    return make_error(EINVAL);
+}
+
+// There is nowhere to write anonymous memory back to, so this only reports
+// whether the range is mapped at all.
+error msync(const void* addr, size_t length, int flags)
+{
+    return ismapped(addr, length) ? no_error() : make_error(ENOMEM);
+}
+
+TRACEPOINT(trace_mmu_vm_fault, "addr=%p, error_code=%x", uintptr_t, unsigned int);
+TRACEPOINT(trace_mmu_vm_fault_sigsegv, "addr=%p, error_code=%x, %s", uintptr_t, unsigned int, const char*);
+TRACEPOINT(trace_mmu_vm_fault_ret, "addr=%p, error_code=%x", uintptr_t, unsigned int);
+
+static void vm_sigsegv(uintptr_t addr, exception_frame* ef)
+{
+    void *pc = ef->get_pc();
+    if (pc >= text_start && pc < text_end) {
+        debug_ll("page fault outside application, addr: 0x%016lx\n", addr);
+        dump_registers(ef);
+        abort();
+    }
+    osv::handle_mmap_fault(addr, SIGSEGV, ef);
+}
+
+static bool permitted(unsigned perm, unsigned error_code)
+{
+    if (is_page_fault_insn(error_code)) {
+        return perm & perm_exec;
+    }
+    if (is_page_fault_write(error_code)) {
+        return perm & perm_write;
+    }
+    return perm & perm_read;
+}
+
+// Anonymous memory is the only thing that faults. The shared guard is what
+// keeps the region reserved while its pages are filled in.
+void vm_fault(uintptr_t addr, exception_frame* ef)
+{
+    unsigned error = ef->get_error();
+    trace_mmu_vm_fault(addr, error);
+    if (fast_sigsegv_check(addr, ef)) {
+        vm_sigsegv(addr, ef);
+        trace_mmu_vm_fault_sigsegv(addr, error, "fast");
+        return;
+    }
+    addr = align_down(addr, page_size);
+
+    auto *r = mem::vspace::lookup(addr);
+    auto *t = r ? tracked_of(r) : nullptr;
+    if (!t || t->kind != tracked_region::anon || !permitted(r->perm, error)) {
+        vm_sigsegv(addr, ef);
+        trace_mmu_vm_fault_sigsegv(addr, error, "slow");
+        return;
+    }
+
+    size_t size = page_size;
+    if (!t->small_pages) {
+        uintptr_t huge_start = align_up(r->span.start, huge_page_size);
+        uintptr_t huge_end = align_down(r->span.end, huge_page_size);
+        if (huge_start <= addr && addr < huge_end) {
+            addr = align_down(addr, huge_page_size);
+            size = huge_page_size;
+        }
+    }
+    populate_anon(reinterpret_cast<void*>(r->span.start),
+                  reinterpret_cast<void*>(addr), size, r->perm,
+                  is_page_fault_write(error), t->small_pages, t->zero);
+    trace_mmu_vm_fault_ret(addr, error);
 }
 
 error mincore(const void *addr, size_t length, unsigned char *vec)
 {
     char *end = align_up((char *)addr + length, page_size);
     char tmp;
-    SCOPE_LOCK(vma_list_mutex.for_read());
     if (!is_linear_mapped(addr, length) && !ismapped(addr, length)) {
         return make_error(ENOMEM);
     }
