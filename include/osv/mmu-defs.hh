@@ -99,13 +99,6 @@ constexpr size_t page_size_level(unsigned level)
     return size_t(1) << (page_size_shift + pte_per_page_shift * level);
 }
 
-/* take an error code coming from the exception frame, and return
-   whether the error reports a page fault (insn/write) */
-bool is_page_fault_insn(unsigned int err);
-bool is_page_fault_write(unsigned int err);
-
-bool fast_sigsegv_check(uintptr_t addr, exception_frame* ef);
-
 }
 
 #endif

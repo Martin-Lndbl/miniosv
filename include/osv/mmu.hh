@@ -49,16 +49,6 @@ error mprotect(const void *addr, size_t size, unsigned int perm);
 error msync(const void* addr, size_t length, int flags);
 bool is_linear_mapped(const void *addr, size_t size);
 bool ismapped(const void *addr, size_t size);
-bool isreadable(void *addr, size_t size);
-
-// Linear-mapped memory is contiguous in both address spaces, so a range is
-// always one physical run.
-template <typename OutputFunc>
-inline
-void virt_to_phys(void* vaddr, size_t len, OutputFunc out)
-{
-    out(virt_to_phys(vaddr), len);
-}
 
 void* phys_to_virt(phys pa);
 

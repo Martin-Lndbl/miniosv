@@ -5,6 +5,8 @@
 #include <atomic>
 
 #include <osv/align.hh>
+#include <cassert>
+
 #include <osv/debug.hh>
 #include <osv/mem/frames.hh>
 #include <osv/mmu.hh>
@@ -12,8 +14,16 @@
 
 #include "internal.hh"
 
+extern void *elf_start;
+extern size_t elf_size;
+extern "C" u64 kernel_vm_shift;
+
 namespace mem {
 namespace frames {
+
+// Total usable RAM the firmware reported, which is more than the allocator
+// ever holds: the kernel image's own pages are never handed to it.
+size_t phys_mem_size;
 
 static_assert(page_size == mmu::page_size, "frames::page_size disagrees with mmu");
 
@@ -197,17 +207,36 @@ void free(phys_addr addr, size_t bytes)
     release_run(first, first + frames_for(bytes));
 }
 
+/*
+ * The linear map: every frame is reachable at a fixed offset from its physical
+ * address, so translating one into a pointer is arithmetic.
+ *
+ * The kernel image is the exception. It is loaded wherever the firmware put it
+ * and linked to run at a fixed virtual address.
+ */
 void *to_linear(phys_addr p)
 {
-    return mmu::phys_to_virt(p);
+    void *phys_addr = reinterpret_cast<void *>(p);
+    if (phys_addr >= mmu::elf_phys_start &&
+        phys_addr < static_cast<char *>(mmu::elf_phys_start) + elf_size) {
+        return static_cast<char *>(phys_addr) + kernel_vm_shift;
+    }
+    return mmu::phys_mem + p;
 }
 
 phys_addr from_linear(void *addr)
 {
-    return mmu::virt_to_phys(addr);
+    if (addr >= elf_start &&
+        addr < static_cast<char *>(elf_start) + elf_size) {
+        return reinterpret_cast<phys_addr>(static_cast<char *>(addr) - kernel_vm_shift);
+    }
+    // Anything else has to be in the linear map: there is nowhere else a
+    // physical address can be recovered from.
+    assert(addr >= mmu::phys_mem);
+    return reinterpret_cast<uintptr_t>(addr) & (mmu::mem_area_size - 1);
 }
 
-size_t total_bytes()
+size_t total_available_bytes()
 {
     return llf ? total : boot_total();
 }

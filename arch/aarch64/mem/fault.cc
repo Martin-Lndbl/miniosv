@@ -84,7 +84,8 @@ void page_fault(exception_frame *ef)
 #endif
 }
 
-namespace mmu {
+namespace mem {
+namespace mapping {
 
 bool is_page_fault_insn(unsigned int esr) {
     unsigned int ec = esr >> 26;
@@ -102,4 +103,5 @@ bool fast_sigsegv_check(uintptr_t addr, exception_frame* ef) {
     return false;
 }
 
+}
 }

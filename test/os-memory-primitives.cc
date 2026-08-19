@@ -124,7 +124,7 @@ void frames_functional()
         CHECK(after >= during);
         CHECK(after + slack >= before);
         printf("      total %zu MiB, free %zu MiB, drift after %d pages: %ld KiB\n",
-               mem::frames::total_bytes() >> 20, after >> 20, n,
+               mem::frames::total_available_bytes() >> 20, after >> 20, n,
                (static_cast<long>(before) - static_cast<long>(after)) >> 10);
     }
 }
@@ -966,7 +966,7 @@ int os_memory_primitives_main()
 {
     reset();
     printf("######## memory primitives ########\n");
-    printf("cpus: %u, memory: %zu MiB\n", n_cpus(), mem::frames::total_bytes() >> 20);
+    printf("cpus: %u, memory: %zu MiB\n", n_cpus(), mem::frames::total_available_bytes() >> 20);
 
     frames_functional();
     frames_perf();

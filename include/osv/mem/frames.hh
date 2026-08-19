@@ -34,7 +34,12 @@ void *to_linear(phys_addr p);
 phys_addr from_linear(void *addr);
 
 size_t free_bytes();
-size_t total_bytes();
+
+// What the allocator holds (less than the RAM the firmware reported).
+size_t total_available_bytes();
+
+// Total usable RAM as the firmware reported it. Set during arch setup.
+extern size_t phys_mem_size;
 
 // Called when free memory falls below conf_memory_pressure_percent of the
 // total. Callbacks run on the freeing path, so they must not block.

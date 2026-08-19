@@ -303,7 +303,7 @@ long sysconf(int name)
     case _SC_THREAD_PROCESS_SHARED: return true;
     case _SC_NPROCESSORS_ONLN: return sched::cpus.size();
     case _SC_NPROCESSORS_CONF: return sched::cpus.size();
-    case _SC_PHYS_PAGES: return memory::phys_mem_size / memory::page_size;
+    case _SC_PHYS_PAGES: return mem::frames::phys_mem_size / mem::frames::page_size;
     case _SC_AVPHYS_PAGES: return mem::frames::free_bytes() / mem::frames::page_size;
     case _SC_GETPW_R_SIZE_MAX: return 1024;
     case _SC_IOV_MAX: return IOV_MAX;

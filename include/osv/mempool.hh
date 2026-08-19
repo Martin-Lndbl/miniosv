@@ -25,7 +25,6 @@ namespace memory {
 
 const size_t page_size = 4096;
 
-extern size_t phys_mem_size;
 
 void setup_free_memory(void* start, size_t bytes);
 

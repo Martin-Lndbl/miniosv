@@ -19,6 +19,8 @@
 
 #include <mem/hw.hh>
 
+struct exception_frame;
+
 namespace mem {
 namespace mapping {
 
@@ -35,6 +37,11 @@ void tlb_flush_local();
 // not, each costs an IPI to every other cpu and a wait for it to answer.
 void tlb_flush_all();
 void tlb_flush_pages_all(const uintptr_t *va, size_t count);
+
+// Fault handling helpers.
+bool is_page_fault_insn(unsigned int err);
+bool is_page_fault_write(unsigned int err);
+bool fast_sigsegv_check(uintptr_t addr, exception_frame *ef);
 
 }
 }

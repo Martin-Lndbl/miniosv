@@ -9,6 +9,7 @@
 #include "arch.hh"
 #include "arch-cpu.hh"
 #include "arch-setup.hh"
+#include <osv/mem/frames.hh>
 #include <osv/mempool.hh>
 #include <osv/mmu.hh>
 #include "processor.hh"
@@ -118,7 +119,7 @@ void arch_setup_free_memory()
     snapshot_memmap();
 
     for_each_usable_range([] (mem_range ent) {
-        memory::phys_mem_size += ent.size;
+        mem::frames::phys_mem_size += ent.size;
     });
     constexpr u64 initial_map = 1 << 30; // 1GB mapped by startup code
 

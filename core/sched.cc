@@ -6,6 +6,7 @@
  */
 
 #include <osv/sched.hh>
+#include <osv/mem/mapping.hh>
 #include <osv/mmu.hh>
 #include <list>
 #include <osv/mutex.h>
@@ -398,7 +399,7 @@ void cpu::reschedule_from_interrupt(bool called_from_yield,
         app_thread.store(n->_app, std::memory_order_relaxed);
     }
     if (lazy_flush_tlb.exchange(false, std::memory_order_seq_cst)) {
-        mmu::flush_tlb_local();
+        mem::mapping::tlb_flush_local();
     }
 #ifdef __aarch64__
     switch_data.old_thread_state = &(p->_state);

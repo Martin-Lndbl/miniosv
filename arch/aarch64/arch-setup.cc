@@ -11,6 +11,7 @@
 #include <osv/kernel_config.h>
 #include "arch-setup.hh"
 #include <osv/sched.hh>
+#include <osv/mem/frames.hh>
 #include <osv/mempool.hh>
 #include <osv/elf.hh>
 #include <osv/types.h>
@@ -151,9 +152,9 @@ void __attribute__((constructor(init_prio::dtb))) uefi_memory_setup()
     if (usable_range_count == 0) {
         abort("uefi_memory_setup: firmware reported no usable memory.\n");
     }
-    memory::phys_mem_size = 0;
+    mem::frames::phys_mem_size = 0;
     for (unsigned i = 0; i < usable_range_count; i++) {
-        memory::phys_mem_size += usable_ranges[i].size;
+        mem::frames::phys_mem_size += usable_ranges[i].size;
     }
 
     // Command line and wall-clock base provided by the UEFI stub.

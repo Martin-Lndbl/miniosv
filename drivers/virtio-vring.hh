@@ -16,6 +16,13 @@
 #include <osv/sched.hh>
 #include <osv/trace.hh>
 
+// Hand each physically contiguous run of [vaddr, vaddr+len) to "out".
+template <typename OutputFunc>
+static inline void for_each_phys_run(void *vaddr, size_t len, OutputFunc out)
+{
+    out(mmu::virt_to_phys(vaddr), len);
+}
+
 #define virtio_tag "virtio"
 #define virtio_d(...)   tprintf_d(virtio_tag, __VA_ARGS__)
 #define virtio_i(...)   tprintf_i(virtio_tag, __VA_ARGS__)
@@ -226,7 +233,9 @@ class virtio_driver;
         }
 
         void add_sg(void* vaddr, u32 len, vring_desc::flags desc_flags) {
-            mmu::virt_to_phys(vaddr, len, [this, desc_flags] (mmu::phys paddr, size_t len) {
+            // Linear-mapped memory is contiguous in both address spaces, so
+            // the buffer is always one physical run.
+            for_each_phys_run(vaddr, len, [this, desc_flags] (mmu::phys paddr, size_t len) {
                 _sg_vec.emplace_back(paddr, len, desc_flags);
             });
         }

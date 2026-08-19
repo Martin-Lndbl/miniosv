@@ -38,7 +38,8 @@ void page_fault(exception_frame *ef)
     }
 }
 
-namespace mmu {
+namespace mem {
+namespace mapping {
 
 enum {
     page_fault_prot  = 1ul << 0,
@@ -82,4 +83,5 @@ bool fast_sigsegv_check(uintptr_t addr, exception_frame* ef)
     return false;
 }
 
+}
 }

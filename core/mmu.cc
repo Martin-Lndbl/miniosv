@@ -6,6 +6,7 @@
  */
 
 #include <osv/mmu.hh>
+#include <osv/mem/frames.hh>
 #include <osv/mem/mapping.hh>
 #include <osv/mem/vspace.hh>
 #include <osv/mempool.hh>
@@ -37,26 +38,16 @@ namespace mmu {
 void *elf_phys_start;
 extern "C" u64 kernel_vm_shift;
 
+// The linear map belongs to the frame allocator; these are what the drivers
+// and the boot code still call it by.
 void* phys_to_virt(phys pa)
 {
-    void* phys_addr = reinterpret_cast<void*>(pa);
-    if ((phys_addr >= elf_phys_start) && (phys_addr < static_cast<char*>(elf_phys_start) + elf_size)) {
-        return static_cast<char*>(phys_addr) + kernel_vm_shift;
-    }
-
-    return phys_mem + pa;
+    return mem::frames::to_linear(pa);
 }
 
 phys virt_to_phys(void *virt)
 {
-    if ((virt >= elf_start) && (virt < static_cast<char*>(elf_start) + elf_size)) {
-        return reinterpret_cast<phys>(static_cast<char*>(virt) - kernel_vm_shift);
-    }
-
-    // For now, only allow non-mmaped areas.  Later, we can either
-    // bounce such addresses, or lock them in memory and translate
-    assert(virt >= phys_mem);
-    return reinterpret_cast<uintptr_t>(virt) & (mem_area_size - 1);
+    return mem::frames::from_linear(virt);
 }
 
 static mem::range page_range(const void *addr, size_t size)
@@ -71,11 +62,10 @@ bool populate_anon(void *addr, size_t size, unsigned perm, bool small_pages, boo
                                 small_pages ? page_size : huge_page_size, zero)) {
         return false;
     }
-    // Where the data and instruction caches are separate, code that was just
-    // mapped has to be made visible to the instruction side.
-    if (perm & perm_exec) {
-        synchronize_cpu_caches(addr, size);
-    }
+    // Nothing is done for the instruction cache here: these pages are freshly
+    // allocated and hold no code yet, so there would be nothing to publish.
+    // Whoever writes instructions into them owes that, and the page cache will
+    // be the first thing in this kernel that does (step 7).
     return true;
 }
 
@@ -167,18 +157,6 @@ bool ismapped(const void *addr, size_t size)
 {
     auto start = reinterpret_cast<uintptr_t>(addr);
     return mem::vspace::reserved({start, start + size});
-}
-
-// Checks if the entire given memory region is readable.
-bool isreadable(void *addr, size_t size)
-{
-    char *end = align_up((char *)addr + size, mmu::page_size);
-    char tmp;
-    for (char *p = (char *)addr; p < end; p += mmu::page_size) {
-        if (!safe_load(p, tmp))
-            return false;
-    }
-    return true;
 }
 
 void linear_map(void* _virt, phys addr, size_t size, const char* name,
@@ -294,10 +272,10 @@ static void vm_sigsegv(uintptr_t addr, exception_frame* ef)
 
 static bool permitted(unsigned perm, unsigned error_code)
 {
-    if (is_page_fault_insn(error_code)) {
+    if (mem::mapping::is_page_fault_insn(error_code)) {
         return perm & perm_exec;
     }
-    if (is_page_fault_write(error_code)) {
+    if (mem::mapping::is_page_fault_write(error_code)) {
         return perm & perm_write;
     }
     return perm & perm_read;
@@ -309,7 +287,7 @@ void vm_fault(uintptr_t addr, exception_frame* ef)
 {
     unsigned error = ef->get_error();
     trace_mmu_vm_fault(addr, error);
-    if (fast_sigsegv_check(addr, ef)) {
+    if (mem::mapping::fast_sigsegv_check(addr, ef)) {
         vm_sigsegv(addr, ef);
         trace_mmu_vm_fault_sigsegv(addr, error, "fast");
         return;

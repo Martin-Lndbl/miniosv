@@ -439,7 +439,7 @@ namespace bi = boost::intrusive;
 void oom(size_t bytes)
 {
     abort("Out of memory: %zu bytes requested, %zu MiB free of %zu MiB.\n",
-          bytes, mem::frames::free_bytes() >> 20, mem::frames::total_bytes() >> 20);
+          bytes, mem::frames::free_bytes() >> 20, mem::frames::total_available_bytes() >> 20);
 }
 
 
