@@ -19,6 +19,7 @@
 
 #include <osv/contiguous_alloc.hh>
 #include <osv/mem/frames.hh>
+#include <osv/mem/heap.hh>
 #include <osv/mem/mapping.hh>
 #include <osv/mem/vspace.hh>
 #include <osv/mempool.hh>
@@ -64,8 +65,8 @@ void frames_functional()
 
     section("a frame is in the linear map and round-trips to its address");
     {
-        mem::phys_addr pa = mem::frames::alloc();
-        CHECK(pa != mem::no_memory);
+        mem::frames::phys_addr pa = mem::frames::alloc();
+        CHECK(pa != mem::frames::no_memory);
         void *v = mem::frames::to_linear(pa);
         CHECK(mem::frames::from_linear(v) == pa);
         CHECK(mmu::is_linear_mapped(v, page));
@@ -93,7 +94,7 @@ void frames_functional()
             if (!p) {
                 continue;
             }
-            mmu::phys base = mmu::virt_to_phys(p);
+            mem::frames::phys_addr base = mmu::virt_to_phys(p);
             bool ok = true;
             for (size_t off = 0; off < size; off += page) {
                 ok = ok && mmu::virt_to_phys(static_cast<char *>(p) + off) == base + off;
@@ -169,7 +170,7 @@ void frames_perf()
     {
         for (unsigned t = 1; t <= n_cpus(); t *= 2) {
             double s = parallel(t, [&](unsigned) {
-                std::vector<mem::phys_addr> q(batch);
+                std::vector<mem::frames::phys_addr> q(batch);
                 for (int r = 0; r < rounds; r++) {
                     for (int i = 0; i < batch; i++) {
                         q[i] = mem::frames::alloc();
@@ -620,7 +621,7 @@ void mapping_functional()
     {
         scratch s(page);
         auto f = mem::frames::alloc();
-        CHECK(f != mem::no_memory);
+        CHECK(f != mem::frames::no_memory);
 
         map::attach(s.range(0, page), f, mem::perm_rw);
         auto e = map::find(s.start());
@@ -960,6 +961,113 @@ void mapping_perf()
     }
 }
 
+/* heap -------------------------------------------------------------------- */
+
+namespace heap = mem::heap;
+
+void heap_functional()
+{
+    group("heap");
+
+    section("a large allocation is huge-page aligned and writable throughout");
+    {
+        const size_t bytes = 5 * huge / 2;    // not a whole number of huge pages
+        void *p = heap::large_alloc(bytes);
+        CHECK(p != nullptr);
+        CHECK((reinterpret_cast<uintptr_t>(p) & (huge - 1)) == 0);
+        CHECK(heap::is_large(p));
+        CHECK(heap::large_size(p) == bytes);
+
+        // The last byte the caller was promised is as reachable as the first,
+        // which is what the rounding up to whole huge pages is for.
+        auto *c = static_cast<char*>(p);
+        memset(c, 0x3c, bytes);
+        CHECK(c[0] == 0x3c);
+        CHECK(c[bytes - 1] == 0x3c);
+
+        // Whole huge pages, so the mapping is one leaf each rather than 512.
+        auto e = map::find(reinterpret_cast<uintptr_t>(p));
+        CHECK(bool(e));
+        CHECK(e.level() == 1);
+
+        heap::large_free(p);
+        CHECK(!map::find(reinterpret_cast<uintptr_t>(p)));
+        CHECK(!heap::is_large(p));
+    }
+
+    section("large allocations are distinct, and the frames come back");
+    {
+        const size_t bytes = huge;
+        size_t before = mem::frames::free_bytes();
+        void *p[8];
+        for (auto &q : p) {
+            q = heap::large_alloc(bytes);
+            CHECK(q != nullptr);
+        }
+        for (unsigned i = 0; i < 8; i++) {
+            memset(p[i], char(i), bytes);
+        }
+        for (unsigned i = 0; i < 8; i++) {
+            CHECK(static_cast<char*>(p[i])[bytes - 1] == char(i));
+        }
+        CHECK(before - mem::frames::free_bytes() >= 8 * bytes);
+
+        for (auto q : p) {
+            heap::large_free(q);
+        }
+        // Each allocation also costs the page its record sits in, which is
+        // given back with it.
+        CHECK(mem::frames::free_bytes() >= before - page);
+    }
+
+    section("malloc of this size goes through the large path");
+    {
+        const size_t bytes = 3 * huge;
+        void *p = malloc(bytes);
+        CHECK(p != nullptr);
+        CHECK(heap::is_large(p));
+        CHECK(malloc_usable_size(p) == bytes);
+        memset(p, 0x11, bytes);
+        free(p);
+    }
+}
+
+void heap_perf()
+{
+    group("heap perf");
+
+    section("large_alloc + large_free");
+    {
+        struct { const char *label; size_t bytes; int n; } cases[] = {
+            {"2 MiB",   huge,      2000},
+            {"16 MiB",  8 * huge,   500},
+            {"128 MiB", 64 * huge,   60},
+        };
+        for (auto &c : cases) {
+            auto t0 = clk::now();
+            for (int i = 0; i < c.n; i++) {
+                void *p = heap::large_alloc(c.bytes);
+                escape(p);
+                heap::large_free(p);
+            }
+            report_ns(c.label, since(t0), c.n);
+        }
+    }
+
+    section("the first touch of a large allocation");
+    {
+        const size_t bytes = 64 * huge;
+        void *p = heap::large_alloc(bytes);
+        auto t0 = clk::now();
+        memset(p, 0x5a, bytes);
+        double s = since(t0);
+        escape(p);
+        printf("    %-46s %9.2f GiB/s\n", "memset over 128 MiB",
+               double(bytes) / s / (1ul << 30));
+        heap::large_free(p);
+    }
+}
+
 }
 
 int os_memory_primitives_main()
@@ -974,6 +1082,8 @@ int os_memory_primitives_main()
     vspace_perf();
     mapping_functional();
     mapping_perf();
+    heap_functional();
+    heap_perf();
 
     return summary("MEMORY PRIMITIVE");
 }

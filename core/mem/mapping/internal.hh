@@ -28,10 +28,10 @@ struct walk_result {
     bool split = false;       // a large leaf was broken up on the way
 
     static constexpr unsigned max_retired = 16;
-    phys_addr retired[max_retired];
+    frames::phys_addr retired[max_retired];
     unsigned count = 0;
 
-    void retire(phys_addr p);
+    void retire(frames::phys_addr p);
     void settle();
 };
 

@@ -53,7 +53,7 @@ bool anything_mapped(range r)
 
 // Check if the range contains any other addresses than 
 // the ones that would be mapped by the given physical address.
-bool conflicts_with_mapping(range r, phys_addr phys)
+bool conflicts_with_mapping(range r, frames::phys_addr phys)
 {
     bool clash = false;
     uintptr_t start = r.start;
@@ -72,7 +72,7 @@ bool conflicts_with_mapping(range r, phys_addr phys)
 } // namespace
 
 // Write a leaf for every address in "write", using the "phys" frames.
-static bool write_leaves(range write, uintptr_t origin, phys_addr phys,
+static bool write_leaves(range write, uintptr_t origin, frames::phys_addr phys,
                          unsigned perm, mattr ma, bool keep)
 {
     unsigned level = max_leaf_level;
@@ -91,7 +91,7 @@ static bool write_leaves(range write, uintptr_t origin, phys_addr phys,
     return res.complete;
 }
 
-bool attach(range r, phys_addr phys, unsigned perm, mattr ma)
+bool attach(range r, frames::phys_addr phys, unsigned perm, mattr ma)
 {
     r = page_align(r);
     if (r.empty()) {
@@ -103,7 +103,7 @@ bool attach(range r, phys_addr phys, unsigned perm, mattr ma)
     return write_leaves(r, r.start, phys, perm, ma, false);
 }
 
-bool attach_missing(range r, phys_addr phys, unsigned perm, size_t slop, mattr ma)
+bool attach_missing(range r, frames::phys_addr phys, unsigned perm, size_t slop, mattr ma)
 {
     r = page_align(r);
     if (r.empty()) {
@@ -122,7 +122,7 @@ void detach(range r)
 {
     pending_invalidation stale;
     walk_result res;
-    clear_range(page_align(r), res, true, [&](uintptr_t va, phys_addr, size_t) {
+    clear_range(page_align(r), res, true, [&](uintptr_t va, frames::phys_addr, size_t) {
         stale.add(va);
     });
     if (res.count) {
@@ -137,7 +137,7 @@ void detach(range r)
 void detach_deferred(range r, pending_invalidation &stale)
 {
     walk_result res;
-    clear_range(page_align(r), res, false, [&](uintptr_t a, phys_addr, size_t) {
+    clear_range(page_align(r), res, false, [&](uintptr_t a, frames::phys_addr, size_t) {
         stale.add(a);
     });
     stale.epoch = flush_epoch();
@@ -192,8 +192,8 @@ bool populate(range r, unsigned perm, size_t leaf_size, bool zero)
             return true;
         }
         size_t size = e.size();
-        phys_addr p = frames::alloc(size, size);
-        if (p == no_memory) {
+        frames::phys_addr p = frames::alloc(size, size);
+        if (p == frames::no_memory) {
             return false;
         }
         if (zero) {
@@ -218,7 +218,7 @@ void depopulate(range r)
 {
     pending_invalidation stale;
     struct {
-        phys_addr addr;
+        frames::phys_addr addr;
         size_t size;
     } frame[flush_batch];
     unsigned held = 0;
@@ -233,7 +233,7 @@ void depopulate(range r)
     };
 
     walk_result res;
-    clear_range(page_align(r), res, true, [&](uintptr_t va, phys_addr addr, size_t size) {
+    clear_range(page_align(r), res, true, [&](uintptr_t va, frames::phys_addr addr, size_t size) {
         if (held == flush_batch) {
             give_back();
         }

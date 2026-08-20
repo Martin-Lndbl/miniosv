@@ -103,6 +103,10 @@ struct page_range {
 
 void free_initial_memory_range(void* addr, size_t size);
 
+// Print the allocation-size histogram gathered under conf_memory_histogram.
+// A no-op when it is off.
+void histogram_dump();
+
 extern bool tracker_enabled;
 
 

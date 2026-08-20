@@ -75,12 +75,12 @@ inline bool pte_is_leaf(pte e, unsigned level)
     return level == 0 || (level <= max_leaf_level && !(e & pte_table));
 }
 
-inline phys_addr pte_addr(pte e, unsigned level)
+inline frames::phys_addr pte_addr(pte e, unsigned level)
 {
     return e & addr_mask(level > 0 && pte_is_leaf(e, level));
 }
 
-inline phys_addr pte_table_addr(pte e) { return e & addr_mask(false); }
+inline frames::phys_addr pte_table_addr(pte e) { return e & addr_mask(false); }
 
 inline unsigned pte_perm(pte e)
 {
@@ -91,12 +91,12 @@ inline unsigned pte_perm(pte e)
            ((e & pte_pxn) ? 0 : perm_exec);
 }
 
-inline pte pte_make_table(phys_addr p)
+inline pte pte_make_table(frames::phys_addr p)
 {
     return p | pte_valid | pte_table;
 }
 
-inline pte pte_make_leaf(phys_addr p, unsigned perm, unsigned level, mattr ma)
+inline pte pte_make_leaf(frames::phys_addr p, unsigned perm, unsigned level, mattr ma)
 {
     pte e = p | pte_af | pte_d | pte_sh |
             attr_index(ma == mattr::dev ? attr_device : attr_normal);
@@ -148,7 +148,7 @@ inline pte pte_set_sw_bit(pte e, unsigned n, bool v)
 // the permissions and the software bits are the same memory's.
 inline pte pte_demote(pte e, unsigned level, unsigned index)
 {
-    phys_addr a = pte_addr(e, level) + (phys_addr(index) << level_shift(level - 1));
+    frames::phys_addr a = pte_addr(e, level) + (frames::phys_addr(index) << level_shift(level - 1));
     pte flags = e & ~addr_mask(false) & ~pte_table;
     if (level - 1 == 0) {
         flags |= pte_table;

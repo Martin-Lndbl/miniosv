@@ -64,7 +64,7 @@ void gic_v2_dist::write_reg_grp(gicd_reg_irq2 reg, unsigned int irq, u8 value)
     mmio_setl(mmio_a((mmioaddr_t)_base, offset), old);
 }
 
-gic_v2_cpu::gic_v2_cpu(mmu::phys b, size_t l) : _base(b)
+gic_v2_cpu::gic_v2_cpu(mem::frames::phys_addr b, size_t l) : _base(b)
 {
     mmu::linear_map((void *)_base, _base, l, "gic_cpuif", mmu::page_size, mmu::mattr::dev);
 }

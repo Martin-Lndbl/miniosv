@@ -38,6 +38,9 @@
 #ifndef CONF_memory_pressure_percent
 #define CONF_memory_pressure_percent 10
 #endif
+#ifndef CONF_memory_histogram
+#define CONF_memory_histogram 0
+#endif
 #ifndef CONF_memory_tracker
 #define CONF_memory_tracker 0
 #endif

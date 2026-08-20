@@ -5,6 +5,7 @@
  * BSD license as described in the LICENSE file in the top-level directory.
  */
 
+#include <osv/mem/heap.hh>
 #include <osv/mempool.hh>
 #include <osv/ilog2.hh>
 #include "arch-setup.hh"
@@ -446,25 +447,20 @@ void oom(size_t bytes)
 
 
 
-static void* mapped_malloc_large(size_t size, size_t offset)
-{
-    //TODO: For now pre-populate the memory, in future consider doing lazy population
-    void* obj = mmu::map_anon(nullptr, size, mmu::mmap_populate, mmu::perm_read | mmu::perm_write);
-    size_t* ret_header = static_cast<size_t*>(obj);
-    *ret_header = size;
-    return static_cast<char*>(obj) + offset;
-}
-
-static void mapped_free_large(void *object)
-{
-    object = align_down(static_cast<char*>(object) - 1, mmu::page_size);
-    size_t* ret_header = static_cast<size_t*>(object);
-    mmu::munmap(object, *ret_header);
-}
-
 static void* malloc_large(size_t size, size_t alignment, bool block = true, bool contiguous = true)
 {
     auto requested_size = size;
+
+    // Large, and free to be scattered across physical memory: a reservation
+    // and huge-page frames of its own. The record lives beside it rather than
+    // in a header inside it, so the payload starts exactly at the reservation
+    // and is aligned to 2 MiB whatever was asked for.
+    if (!contiguous && size >= mem::heap::large_min) {
+        void *obj = mem::heap::large_alloc(size);
+        trace_memory_malloc_large(obj, requested_size, size, alignment);
+        return obj;
+    }
+
     size_t offset;
     if (alignment < page_size) {
         offset = align_up(sizeof(page_range), alignment);
@@ -482,17 +478,9 @@ static void* malloc_large(size_t size, size_t alignment, bool block = true, bool
         abort("malloc: alignment %zu above the page size is not supported\n", alignment);
     }
 
-    // Use mmap if requested memory greater than "huge page" size
-    // and does not need to be contiguous
-    if (size >= mmu::huge_page_size && !contiguous) {
-        void* obj = mapped_malloc_large(size, offset);
-        trace_memory_malloc_large(obj, requested_size, size, alignment);
-        return obj;
-    }
-
     // Contiguous physical memory, with the size recorded in a header so that
     // free() can give back exactly what was taken.
-    mem::phys_addr p = mem::frames::alloc(size, page_size);
+    mem::frames::phys_addr p = mem::frames::alloc(size, page_size);
     void* mem = p ? mem::frames::to_linear(p) : nullptr;
     if (mem) {
         auto ret_header = new (mem) page_range(size);
@@ -506,7 +494,7 @@ static void* malloc_large(size_t size, size_t alignment, bool block = true, bool
     }
 
     // Fall back to a mapping.
-    void* obj = mapped_malloc_large(size, offset);
+    void* obj = mem::heap::large_alloc(requested_size);
     trace_memory_malloc_large(obj, requested_size, size, alignment);
     return obj;
 }
@@ -734,6 +722,126 @@ extern "C" {
     size_t malloc_usable_size(void *object);
 }
 
+
+/*
+ * Where allocation sizes fall, and how many frees arrive knowing the size.
+ *
+ * The heap that replaces this one wants the size at free. C++ supplies it at
+ * every delete of a known type and libc++ throws it away; C's free(ptr) never
+ * has it. What the split actually looks like under a real workload decides
+ * whether the new heap can recover a size from an address, or must be told.
+ *
+ * Counts are per-cpu and unsynchronised: a thread migrating mid-increment can
+ * lose one, which does not matter for a distribution.
+ */
+#if CONF_memory_histogram
+namespace memory {
+
+constexpr unsigned hist_buckets = 40;
+
+struct alignas(64) hist_row {
+    uint64_t alloc[hist_buckets];
+    uint64_t freed_sized[hist_buckets];
+    uint64_t freed_total;
+};
+
+static hist_row hist[sched::max_cpus];
+
+static inline hist_row &hist_row_for()
+{
+    if (!smp_allocator) {
+        return hist[0];
+    }
+    auto *c = sched::cpu::current();
+    return hist[c && c->id < sched::max_cpus ? c->id : 0];
+}
+
+static inline unsigned hist_bucket(size_t n)
+{
+    unsigned b = n < 2 ? 0 : 63 - __builtin_clzll(n);
+    return b < hist_buckets ? b : hist_buckets - 1;
+}
+
+static inline void hist_alloc(size_t n)
+{
+    hist_row_for().alloc[hist_bucket(n)]++;
+}
+
+static inline void hist_freed_sized(size_t n)
+{
+    hist_row_for().freed_sized[hist_bucket(n)]++;
+}
+
+// Every free lands here, including the sized deletes below, which fall
+// through to free() once they have recorded their size.
+static inline void hist_freed()
+{
+    hist_row_for().freed_total++;
+}
+
+void histogram_dump()
+{
+    // Every exit route ends in poweroff(), and some of them arrive twice.
+    static std::atomic<bool> dumped;
+    if (dumped.exchange(true)) {
+        return;
+    }
+
+    uint64_t alloc[hist_buckets] = {}, sized[hist_buckets] = {}, freed = 0;
+    for (unsigned c = 0; c < sched::max_cpus; c++) {
+        for (unsigned b = 0; b < hist_buckets; b++) {
+            alloc[b] += hist[c].alloc[b];
+            sized[b] += hist[c].freed_sized[b];
+        }
+        freed += hist[c].freed_total;
+    }
+
+    uint64_t alloc_total = 0, sized_total = 0;
+    for (unsigned b = 0; b < hist_buckets; b++) {
+        alloc_total += alloc[b];
+        sized_total += sized[b];
+    }
+    if (!alloc_total) {
+        return;
+    }
+
+    printf("\n######## allocation histogram ########\n");
+    printf("%14s %14s %8s %14s\n", "size", "allocations", "share", "sized frees");
+    uint64_t cum = 0;
+    for (unsigned b = 0; b < hist_buckets; b++) {
+        if (!alloc[b] && !sized[b]) {
+            continue;
+        }
+        cum += alloc[b];
+        char label[24];
+        uint64_t lo = b ? (uint64_t(1) << b) : 0;
+        if (lo >= (1ul << 20)) {
+            snprintf(label, sizeof(label), "%lu MiB", lo >> 20);
+        } else if (lo >= (1ul << 10)) {
+            snprintf(label, sizeof(label), "%lu KiB", lo >> 10);
+        } else {
+            snprintf(label, sizeof(label), "%lu B", lo);
+        }
+        printf("%12s.. %14lu %7.2f%% %14lu\n", label, alloc[b],
+               100.0 * cum / alloc_total, sized[b]);
+    }
+    printf("\n  allocations     %lu\n", alloc_total);
+    printf("  frees           %lu\n", freed);
+    printf("  of them sized   %lu (%.2f%%)\n", sized_total,
+           100.0 * sized_total / (freed ? freed : 1));
+    printf("######## end allocation histogram ########\n");
+    fflush(stdout);
+}
+
+}
+#else
+namespace memory {
+static inline void hist_alloc(size_t) {}
+static inline void hist_freed() {}
+void histogram_dump() {}
+}
+#endif
+
 static inline void* std_malloc(size_t size, size_t alignment)
 {
     if ((ssize_t)size < 0)
@@ -766,6 +874,7 @@ static inline void* std_malloc(size_t size, size_t alignment)
 #if CONF_memory_tracker
     memory::tracker_remember(ret, size);
 #endif
+    memory::hist_alloc(size);
     return ret;
 }
 
@@ -786,9 +895,7 @@ void* calloc(size_t nmemb, size_t size)
 static size_t object_size(void *object)
 {
     if (!mmu::is_linear_mapped(object, 0)) {
-        size_t offset = memory::large_object_offset(object);
-        size_t* ret_header = static_cast<size_t*>(object);
-        return *ret_header - offset;
+        return mem::heap::large_size(object);
     }
 
     switch (mmu::get_mem_area(object)) {
@@ -837,12 +944,13 @@ void free(void* object)
     if (!object) {
         return;
     }
+    memory::hist_freed();
 #if CONF_memory_tracker
     memory::tracker_forget(object);
 #endif
 
     if (!mmu::is_linear_mapped(object, 0)) {
-        return memory::mapped_free_large(object);
+        return mem::heap::large_free(object);
     }
 
     switch (mmu::get_mem_area(object)) {
@@ -988,3 +1096,45 @@ extern "C" void free_contiguous_aligned(void* p, size_t size)
 {
     memory::free_phys_contiguous_aligned(p, size);
 }
+
+#if CONF_memory_histogram
+/*
+ * The sized forms of operator delete. libc++ defines these weakly as a plain
+ * free(), which drops the one thing the compiler went to the trouble of
+ * supplying. Defining them here overrides that and lets the size be counted --
+ * and is what a heap wanting sized free would hook.
+ */
+#include <new>
+
+void operator delete(void *p, size_t n) noexcept
+{
+    if (p) {
+        memory::hist_freed_sized(n);
+    }
+    free(p);
+}
+
+void operator delete[](void *p, size_t n) noexcept
+{
+    if (p) {
+        memory::hist_freed_sized(n);
+    }
+    free(p);
+}
+
+void operator delete(void *p, size_t n, std::align_val_t) noexcept
+{
+    if (p) {
+        memory::hist_freed_sized(n);
+    }
+    free(p);
+}
+
+void operator delete[](void *p, size_t n, std::align_val_t) noexcept
+{
+    if (p) {
+        memory::hist_freed_sized(n);
+    }
+    free(p);
+}
+#endif

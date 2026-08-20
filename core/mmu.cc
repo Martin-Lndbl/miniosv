@@ -40,12 +40,12 @@ extern "C" u64 kernel_vm_shift;
 
 // The linear map belongs to the frame allocator; these are what the drivers
 // and the boot code still call it by.
-void* phys_to_virt(phys pa)
+void* phys_to_virt(mem::frames::phys_addr pa)
 {
     return mem::frames::to_linear(pa);
 }
 
-phys virt_to_phys(void *virt)
+mem::frames::phys_addr virt_to_phys(void *virt)
 {
     return mem::frames::from_linear(virt);
 }
@@ -159,7 +159,7 @@ bool ismapped(const void *addr, size_t size)
     return mem::vspace::reserved({start, start + size});
 }
 
-void linear_map(void* _virt, phys addr, size_t size, const char* name,
+void linear_map(void* _virt, mem::frames::phys_addr addr, size_t size, const char* name,
                 size_t slop, mattr mem_attr)
 {
     uintptr_t virt = reinterpret_cast<uintptr_t>(_virt);

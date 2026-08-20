@@ -13,7 +13,7 @@
 
 namespace gic {
 
-gic_dist::gic_dist(mmu::phys b, size_t l) : _base(b)
+gic_dist::gic_dist(mem::frames::phys_addr b, size_t l) : _base(b)
 {
     mmu::linear_map((void *)_base, _base, l, "gic_dist", mmu::page_size, mmu::mattr::dev);
 }

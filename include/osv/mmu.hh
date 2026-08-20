@@ -23,7 +23,7 @@ struct exception_frame;
 namespace mmu {
 
 // when we know it was dynamically allocated
-inline phys virt_to_phys_dynamic_phys(void* virt)
+inline mem::frames::phys_addr virt_to_phys_dynamic_phys(void* virt)
 {
     return static_cast<char*>(virt) - phys_mem;
 }
@@ -50,10 +50,10 @@ error msync(const void* addr, size_t length, int flags);
 bool is_linear_mapped(const void *addr, size_t size);
 bool ismapped(const void *addr, size_t size);
 
-void* phys_to_virt(phys pa);
+void* phys_to_virt(mem::frames::phys_addr pa);
 
 template <typename T>
-T* phys_cast(phys pa)
+T* phys_cast(mem::frames::phys_addr pa)
 {
     return static_cast<T*>(phys_to_virt(pa));
 }
@@ -70,7 +70,7 @@ bool is_page_aligned(void* addr)
     return is_page_aligned(reinterpret_cast<intptr_t>(addr));
 }
 
-void linear_map(void* virt, phys addr, size_t size, const char* name,
+void linear_map(void* virt, mem::frames::phys_addr addr, size_t size, const char* name,
                 size_t slop = mmu::page_size,
                 mattr mem_attr = mmu::mattr_default);
 

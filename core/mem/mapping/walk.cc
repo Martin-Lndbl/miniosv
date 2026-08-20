@@ -15,7 +15,7 @@
 namespace mem {
 namespace mapping {
 
-void walk_result::retire(phys_addr p)
+void walk_result::retire(frames::phys_addr p)
 {
     if (count == max_retired) {
         flush_all();
@@ -36,8 +36,8 @@ void walk_result::settle()
 
 pte build_table(std::atomic<pte> *slot)
 {
-    phys_addr p = frames::alloc();
-    if (p == no_memory) {
+    frames::phys_addr p = frames::alloc();
+    if (p == frames::no_memory) {
         return 0;
     }
     memset(frames::to_linear(p), 0, page_size);
@@ -55,8 +55,8 @@ pte build_table(std::atomic<pte> *slot)
 
 pte break_leaf(std::atomic<pte> *slot, unsigned level, pte e)
 {
-    phys_addr p = frames::alloc();
-    if (p == no_memory) {
+    frames::phys_addr p = frames::alloc();
+    if (p == frames::no_memory) {
         return 0;
     }
     auto *child = static_cast<std::atomic<pte> *>(frames::to_linear(p));

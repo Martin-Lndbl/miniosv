@@ -44,11 +44,11 @@ public:
 
     bool empty() const { return pte_empty(read()); }
     bool present() const { return pte_present(read()); }
-    phys_addr addr() const { return pte_addr(read(), _level); }
+    frames::phys_addr addr() const { return pte_addr(read(), _level); }
     unsigned perm() const { return pte_perm(read()); }
 
     // The entry this slot needs to map that frame.
-    pte leaf_for(phys_addr p, unsigned perm, mattr ma = mattr::normal) const
+    pte leaf_for(frames::phys_addr p, unsigned perm, mattr ma = mattr::normal) const
     {
         return pte_make_leaf(p, perm, _level, ma);
     }
@@ -69,12 +69,12 @@ bool prepare(range r, size_t leaf_size = page_size);
 // Attach physical memory to a virtual range.
 // Assumes range and physical address are aligned to page_size.
 // Returns false if the range is already mapped.
-bool attach(range r, phys_addr phys, unsigned perm, mattr ma = mattr::normal);
+bool attach(range r, frames::phys_addr phys, unsigned perm, mattr ma = mattr::normal);
 
 // Attach physical memory to whatever part of the range is not attached yet.
 // Only used by callers whose ranges overlap by design, and who guarantee that 
 // the physical memory either side is their own and contiguous (ACPI driver).
-bool attach_missing(range r, phys_addr phys, unsigned perm, size_t slop = page_size,
+bool attach_missing(range r, frames::phys_addr phys, unsigned perm, size_t slop = page_size,
                     mattr ma = mattr::normal);
 
 /*

@@ -70,12 +70,12 @@ inline bool pte_is_leaf(pte e, unsigned level)
     return level == 0 || (level <= max_leaf_level && (e & pte_hp));
 }
 
-inline phys_addr pte_addr(pte e, unsigned level)
+inline frames::phys_addr pte_addr(pte e, unsigned level)
 {
     return e & addr_mask(level > 0 && pte_is_leaf(e, level));
 }
 
-inline phys_addr pte_table_addr(pte e) { return e & addr_mask(false); }
+inline frames::phys_addr pte_table_addr(pte e) { return e & addr_mask(false); }
 
 inline unsigned pte_perm(pte e)
 {
@@ -85,12 +85,12 @@ inline unsigned pte_perm(pte e)
     return perm_read | ((e & pte_w) ? perm_write : 0) | ((e & pte_nx) ? 0 : perm_exec);
 }
 
-inline pte pte_make_table(phys_addr p)
+inline pte pte_make_table(frames::phys_addr p)
 {
     return p | pte_p | pte_w | pte_u | pte_a;
 }
 
-inline pte pte_make_leaf(phys_addr p, unsigned perm, unsigned level, mattr)
+inline pte pte_make_leaf(frames::phys_addr p, unsigned perm, unsigned level, mattr)
 {
     pte e = p | pte_u | pte_a | pte_d;
     if (perm) {
@@ -141,7 +141,7 @@ inline pte pte_set_sw_bit(pte e, unsigned n, bool v)
 // attribute in a large one; nothing here uses page attributes on x86-64.
 inline pte pte_demote(pte e, unsigned level, unsigned index)
 {
-    phys_addr a = pte_addr(e, level) + (phys_addr(index) << level_shift(level - 1));
+    frames::phys_addr a = pte_addr(e, level) + (frames::phys_addr(index) << level_shift(level - 1));
     pte flags = (e & ~addr_mask(false)) & ~pte_hp;
     if (level - 1 > 0) {
         flags |= pte_hp;

@@ -235,7 +235,7 @@ class virtio_driver;
         void add_sg(void* vaddr, u32 len, vring_desc::flags desc_flags) {
             // Linear-mapped memory is contiguous in both address spaces, so
             // the buffer is always one physical run.
-            for_each_phys_run(vaddr, len, [this, desc_flags] (mmu::phys paddr, size_t len) {
+            for_each_phys_run(vaddr, len, [this, desc_flags] (mem::frames::phys_addr paddr, size_t len) {
                 _sg_vec.emplace_back(paddr, len, desc_flags);
             });
         }

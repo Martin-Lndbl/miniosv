@@ -127,7 +127,7 @@ static void smbios_decode(const char* p)
 
 void dmi_probe()
 {
-    constexpr mmu::phys dmi_base = 0xf0000;
+    constexpr mem::frames::phys_addr dmi_base = 0xf0000;
 
     u8* const dmi_virt = mmu::phys_cast<u8>(dmi_base);
 

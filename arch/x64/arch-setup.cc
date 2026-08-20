@@ -167,7 +167,7 @@ void arch_setup_free_memory()
     // and physical we need to take into account where kernel
     // is loaded in physical memory - elf_phys_start - and
     // where it is linked to start in virtual memory - elf_start
-    static mmu::phys elf_phys_start = reinterpret_cast<mmu::phys>(elf_header);
+    static mem::frames::phys_addr elf_phys_start = reinterpret_cast<mem::frames::phys_addr>(elf_header);
     // Publish the kernel image's physical base for the phys/virt helpers in
     // core/mmu.cc (the kernel is loaded at a firmware-chosen base, not a fixed
     // one). There is a simple invariant between elf_phys_start and elf_start as

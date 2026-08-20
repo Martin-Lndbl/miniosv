@@ -12,13 +12,16 @@
 #include <stdint.h>
 
 namespace mem {
+namespace frames {
 
 // A physical address. Not a pointer: physical memory is not
-// addressable until it is mapped, or reached through frames::to_linear().
+// addressable until it is mapped, or reached through to_linear().
 using phys_addr = uint64_t;
 
 // Nothing is allocated at physical 0, used to return "no memory" from alloc() and claim_run().
 constexpr phys_addr no_memory = 0;
+
+}
 
 // A half-open range of virtual addresses.
 struct range {

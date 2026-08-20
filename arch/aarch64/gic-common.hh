@@ -96,7 +96,7 @@ enum class irq_type : unsigned int {
 /* GIC Distributor Interface */
 class gic_dist {
 protected:
-    gic_dist(mmu::phys b, size_t l);
+    gic_dist(mem::frames::phys_addr b, size_t l);
 
 public:
     u32 read_reg(gicd_reg r);
@@ -110,7 +110,7 @@ public:
     unsigned int read_number_of_interrupts();
 
 protected:
-    mmu::phys _base;
+    mem::frames::phys_addr _base;
 };
 
 /* Base class with mostly virtual functions intended to provide

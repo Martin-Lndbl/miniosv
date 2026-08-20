@@ -8,12 +8,11 @@
 #ifndef VIRT_TO_PHYS_HH
 #define VIRT_TO_PHYS_HH
 
-#include <stdint.h>
+#include <osv/mem/types.hh>
 
 namespace mmu {
 
-typedef uint64_t phys;
-phys virt_to_phys(void *virt);
+mem::frames::phys_addr virt_to_phys(void *virt);
 
 };
 

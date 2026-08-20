@@ -209,7 +209,7 @@ void arch_setup_pci()
 
     pci::set_pci_ecam(true);
     pci::set_pci_cfg(ecam_base, ecam_len);
-    mmu::linear_map((void *)ecam_base, (mmu::phys)ecam_base, ecam_len,
+    mmu::linear_map((void *)ecam_base, (mem::frames::phys_addr)ecam_base, ecam_len,
                     "pci_cfg", mmu::page_size, mmu::mattr::dev);
 }
 #endif
@@ -225,7 +225,7 @@ void arch_setup_free_memory()
 
     // The kernel image (boot trampoline + DTB copy + ELF) occupies
     // [mem_addr, addr); everything else in the usable ranges is free RAM.
-    mmu::phys addr = (mmu::phys)elf_header + elf_size;
+    mem::frames::phys_addr addr = (mem::frames::phys_addr)elf_header + elf_size;
     const u64 kernel_start = mmu::mem_addr;
     const u64 kernel_end = addr;
 
@@ -281,12 +281,12 @@ void arch_setup_free_memory()
        PA +     0x0 - PA + 0x80000: boot
        PA + 0x80000 - PA + 0x90000: DTB copy
        PA + 0x90000 -       [addr]: kernel ELF */
-    mmu::linear_map((void *)(OSV_KERNEL_VM_BASE - 0x80000), (mmu::phys)mmu::mem_addr,
+    mmu::linear_map((void *)(OSV_KERNEL_VM_BASE - 0x80000), (mem::frames::phys_addr)mmu::mem_addr,
                     addr - mmu::mem_addr, "kernel");
 
     if (console::PL011_Console::active) {
         /* linear_map [TTBR0 - UART] */
-        addr = (mmu::phys)console::aarch64_console.pl011.get_base_addr();
+        addr = (mem::frames::phys_addr)console::aarch64_console.pl011.get_base_addr();
         mmu::linear_map((void *)addr, addr, 0x1000, "pl011", mmu::page_size,
                         mmu::mattr::dev);
     }
@@ -374,10 +374,10 @@ static void __attribute__((constructor(init_prio::gic))) init_gic_acpi()
     // separate and prefer the GICR subtables; fall back to the GICC form only
     // when no GICR subtable is present (the two are mutually exclusive in
     // practice, and a system using GICR subtables sets gicr_base_address to 0).
-    mmu::phys gicr_base[MAX_GICR_REGIONS];
+    mem::frames::phys_addr gicr_base[MAX_GICR_REGIONS];
     size_t    gicr_len[MAX_GICR_REGIONS];
     int       nr_gicr = 0;
-    mmu::phys gicc_redist_base[MAX_GICR_REGIONS];
+    mem::frames::phys_addr gicc_redist_base[MAX_GICR_REGIONS];
     int       nr_gicc_redist = 0;
 
     auto subtable = reinterpret_cast<const char*>(madt + 1);

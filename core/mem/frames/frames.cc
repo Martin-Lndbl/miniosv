@@ -216,10 +216,10 @@ void free(phys_addr addr, size_t bytes)
  */
 void *to_linear(phys_addr p)
 {
-    void *phys_addr = reinterpret_cast<void *>(p);
-    if (phys_addr >= mmu::elf_phys_start &&
-        phys_addr < static_cast<char *>(mmu::elf_phys_start) + elf_size) {
-        return static_cast<char *>(phys_addr) + kernel_vm_shift;
+    void *addr = reinterpret_cast<void *>(p);
+    if (addr >= mmu::elf_phys_start &&
+        addr < static_cast<char *>(mmu::elf_phys_start) + elf_size) {
+        return static_cast<char *>(addr) + kernel_vm_shift;
     }
     return mmu::phys_mem + p;
 }

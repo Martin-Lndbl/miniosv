@@ -85,7 +85,7 @@ void gic_v3_dist::enable()
     wait_for_write_complete();
 }
 
-gic_v3_redist::gic_v3_redist(const mmu::phys *bases, const size_t *lens, int count)
+gic_v3_redist::gic_v3_redist(const mem::frames::phys_addr *bases, const size_t *lens, int count)
     : _nr_regions(count)
 {
     assert(count > 0 && count <= MAX_GICR_REGIONS);
@@ -100,7 +100,7 @@ gic_v3_redist::gic_v3_redist(const mmu::phys *bases, const size_t *lens, int cou
 void gic_v3_redist::init_cpu_base(int smp_idx)
 {
     if (!smp_idx) {
-        _cpu_bases = new mmu::phys[sched::cpus.size()];
+        _cpu_bases = new mem::frames::phys_addr[sched::cpus.size()];
     }
 
     uint64_t mpidr = processor::read_mpidr();
@@ -110,7 +110,7 @@ void gic_v3_redist::init_cpu_base(int smp_idx)
     // one frame (per-CPU gicr_base_address, Azure) or many frames chained by the
     // LAST bit (a discovery range, QEMU/AWS). Bound the walk by the region size.
     for (int reg = 0; reg < _nr_regions; reg++) {
-        mmu::phys base = _region_base[reg];
+        mem::frames::phys_addr base = _region_base[reg];
         u64 offset = 0;
         u64 typer;
         do {
@@ -177,7 +177,7 @@ void gic_v3_redist::wait_for_write_complete(int smp_idx)
 void gic_v3_redist::init_rdbase(int smp_idx, bool pta)
 {
     if (!smp_idx) {
-        _rdbases = new mmu::phys[sched::cpus.size()];
+        _rdbases = new mem::frames::phys_addr[sched::cpus.size()];
     }
 
     if (pta) {
@@ -200,7 +200,7 @@ static uint32_t get_cpu_affinity(void)
     return (uint32_t)aff;
 }
 
-gic_v3_its::gic_v3_its(mmu::phys b, size_t l) : _base(b)
+gic_v3_its::gic_v3_its(mem::frames::phys_addr b, size_t l) : _base(b)
 {
     if (b && l) {
         mmu::linear_map((void *)_base, _base, l, "gic_its", mmu::page_size,
@@ -347,7 +347,7 @@ void gic_v3_its::cmd_discard(u32 dev_id, int vector)
 //See 6.3.14 in GIC3/4 spec
 //"Ensures all outstanding ITS operations associated with physical interrupts for the Redistributor
 // specified by RDbase are globally observed before any further ITS commands are executed."
-void gic_v3_its::cmd_sync(mmu::phys rdbase)
+void gic_v3_its::cmd_sync(mem::frames::phys_addr rdbase)
 {
     its_cmd cmd;
     cmd.data[0] = (u64)gic_its_cmd::ITS_CMD_SYNC;
@@ -358,7 +358,7 @@ void gic_v3_its::cmd_sync(mmu::phys rdbase)
 
 //See 6.3.8 in GIC3/4 spec
 //"Maps the Collection table entry defined by ICID to the target Redistributor, defined by RDbase"
-void gic_v3_its::cmd_mapc(int smp_idx, mmu::phys rdbase)
+void gic_v3_its::cmd_mapc(int smp_idx, mem::frames::phys_addr rdbase)
 {
     its_cmd cmd;
     cmd.data[0] = (u32)gic_its_cmd::ITS_CMD_MAPC;
@@ -608,7 +608,7 @@ void gic_v3_driver::init_its(int smp_idx)
 
     //Init on each cpu
     _gicrd.init_rdbase(smp_idx, _gits.is_typer_pta());
-    mmu::phys rdbase = _gicrd.rdbase(smp_idx);
+    mem::frames::phys_addr rdbase = _gicrd.rdbase(smp_idx);
 
     if (smp_idx == 0) {
         // Init on primary CPU
@@ -810,7 +810,7 @@ void gic_v3_driver::map_msi_vector(unsigned int vector, pci::function* dev, u32 
             _cpu_by_vector[index] = target_cpu + 1;
 
             //Sync redistributor
-            mmu::phys rdbase = _gicrd.rdbase(target_cpu);
+            mem::frames::phys_addr rdbase = _gicrd.rdbase(target_cpu);
             _gits.cmd_sync(rdbase);
         } else if ((vector_cpu - 1) != target_cpu) { //We need to move interrupt to different redistributor (cpu)
             //Read https://developer.arm.com/documentation/102923/0100/ITS/Migrating-interrupts-between-Redistributors
@@ -820,7 +820,7 @@ void gic_v3_driver::map_msi_vector(unsigned int vector, pci::function* dev, u32 
             _gits.cmd_inv(device_id, vector);
             //
             //Sync old redistributor
-            mmu::phys rdbase = _gicrd.rdbase(vector_cpu - 1);
+            mem::frames::phys_addr rdbase = _gicrd.rdbase(vector_cpu - 1);
             _gits.cmd_sync(rdbase);
 
             _cpu_by_vector[index] = target_cpu + 1;
@@ -842,7 +842,7 @@ void gic_v3_driver::unmap_msi_vector(unsigned int vector, pci::function* dev)
             _gits.cmd_inv(device_id, vector);
 
             //Sync redistributor
-            mmu::phys rdbase = _gicrd.rdbase(vector_cpu - 1);
+            mem::frames::phys_addr rdbase = _gicrd.rdbase(vector_cpu - 1);
             _gits.cmd_sync(rdbase);
         }
     }
