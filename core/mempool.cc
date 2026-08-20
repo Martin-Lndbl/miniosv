@@ -391,12 +391,6 @@ static inline void* std_malloc(size_t size, size_t alignment)
                                     alignment);
     } else if (!smp_allocator && mem::early::takes(size, alignment)) {
         ret = mem::early::alloc(size, alignment);
-        ret = translate_mem_area(mmu::mem_area::main, mmu::mem_area::mempool,
-                                 ret);
-    } else if (size <= mmu::page_size && alignment <= mmu::page_size) {
-        ret = mmu::translate_mem_area(mmu::mem_area::main, mmu::mem_area::page,
-                                       memory::alloc_page());
-        trace_memory_malloc_page(ret, size, mmu::page_size, alignment);
     } else {
         ret = memory::malloc_large(size, alignment);
     }
@@ -429,19 +423,10 @@ static size_t object_size(void *object)
     // Anything else came from before the heap existed, or from the contiguous
     // allocator, and both of those live in the linear map.
     assert(mem::frames::in_linear_map(object, 0));
-
-    switch (mmu::get_mem_area(object)) {
-    case mmu::mem_area::main:
-        return memory::large_object_size(object);
-    case mmu::mem_area::mempool:
-        object = mmu::translate_mem_area(mmu::mem_area::mempool,
-                                         mmu::mem_area::main, object);
+    if (mem::early::owns(object)) {
         return mem::early::size_of(object);
-    case mmu::mem_area::page:
-        return mmu::page_size;
-    default:
-        abort();
     }
+    return memory::large_object_size(object);
 }
 
 static inline void* std_realloc(void* object, size_t size)
@@ -485,21 +470,10 @@ static inline bool free_bookkeeping(void *object)
 static void free_foreign(void *object)
 {
     assert(mem::frames::in_linear_map(object, 0));
-
-    switch (mmu::get_mem_area(object)) {
-    case mmu::mem_area::page:
-        object = mmu::translate_mem_area(mmu::mem_area::page,
-                                         mmu::mem_area::main, object);
-        return memory::free_page(object);
-    case mmu::mem_area::main:
-         return memory::free_large(object);
-    case mmu::mem_area::mempool:
-        object = mmu::translate_mem_area(mmu::mem_area::mempool,
-                                         mmu::mem_area::main, object);
+    if (mem::early::owns(object)) {
         return mem::early::free(object);
-    default:
-        abort();
     }
+    return memory::free_large(object);
 }
 
 void free(void* object)

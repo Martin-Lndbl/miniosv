@@ -28,6 +28,9 @@ void free(void *p);
 // What alloc() was asked for.
 size_t size_of(void *p);
 
+// True if this address is one alloc() handed out.
+bool owns(void *p);
+
 }
 }
 

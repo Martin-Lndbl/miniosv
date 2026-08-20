@@ -46,10 +46,7 @@ void setup_temporary_phys_map()
     // duplicate 1:1 mapping into phys_mem
     u64 cr3 = processor::read_cr3();
     auto pt = reinterpret_cast<u64*>(cr3);
-    for (auto&& area : mmu::identity_mapped_areas) {
-        auto base = reinterpret_cast<void*>(get_mem_area_base(area));
-        pt[mmu::pt_index(base, 3)] = pt[0];
-    }
+    pt[mmu::pt_index(mmu::phys_mem, 3)] = pt[0];
 }
 
 // A copy of the UEFI memory map taken before we switch page tables. The map
@@ -155,13 +152,7 @@ void arch_setup_free_memory()
         }
         mmu::free_initial_memory_range(ent.addr, ent.size);
     });
-    for (auto&& area : mmu::identity_mapped_areas) {
-        auto base = reinterpret_cast<void*>(get_mem_area_base(area));
-        mmu::linear_map(base, 0, initial_map,
-            area == mmu::mem_area::main ? "main" :
-            area == mmu::mem_area::page ? "page" : "mempool",
-            initial_map);
-    }
+    mmu::linear_map(mmu::phys_mem, 0, initial_map, "linear", initial_map);
     // Map the core, loaded by the boot loader
     // In order to properly setup mapping between virtual
     // and physical we need to take into account where kernel
@@ -200,12 +191,7 @@ void arch_setup_free_memory()
         if (intersects(ent, initial_map)) {
             ent = truncate_below(ent, initial_map);
         }
-        for (auto&& area : mmu::identity_mapped_areas) {
-            auto base = reinterpret_cast<char*>(get_mem_area_base(area));
-            mmu::linear_map(base + ent.addr, ent.addr, ent.size,
-               area == mmu::mem_area::main ? "main" :
-               area == mmu::mem_area::page ? "page" : "mempool", ~0);
-        }
+        mmu::linear_map(mmu::phys_mem + ent.addr, ent.addr, ent.size, "linear", ~0);
         mmu::free_initial_memory_range(ent.addr, ent.size);
     });
 }

@@ -19,6 +19,7 @@
 #include <cstdint>
 
 #include <osv/align.hh>
+#include <osv/debug.hh>
 #include <osv/mem/early.hh>
 #include <osv/mem/frames.hh>
 #include <osv/mutex.h>
@@ -47,6 +48,11 @@ char *page = nullptr;
 size_t next_offset = 0;
 size_t previous_offset = 0;
 
+// Pages that this allocator holds
+constexpr unsigned max_pages = 64;
+page_header *held[max_pages];
+unsigned held_count;
+
 page_header *header_of(void *object)
 {
     return reinterpret_cast<page_header *>(
@@ -63,13 +69,25 @@ unsigned short *size_field(void *object)
 // own the memory. frames::alloc() picks whichever is current.
 void take_page()
 {
+    if (held_count == max_pages) {
+        abort("early: more than %u pages of small objects are live before the "
+              "heap exists.\n       Raise max_pages in core/mem/early.cc.\n",
+              max_pages);
+    }
     page = static_cast<char *>(frames::to_linear(frames::alloc()));
     header_of(page)->allocations_count = 0;
     next_offset = sizeof(page_header);
+    held[held_count++] = header_of(page);
 }
 
 void give_back(page_header *h)
 {
+    for (unsigned i = 0; i < held_count; i++) {
+        if (held[i] == h) {
+            held[i] = held[--held_count];
+            break;
+        }
+    }
     frames::free(frames::from_linear(h));
 }
 
@@ -134,6 +152,19 @@ void free(void *p)
 size_t size_of(void *p)
 {
     return *size_field(p);
+}
+
+bool owns(void *p)
+{
+    page_header *h = header_of(p);
+    WITH_LOCK(lock) {
+        for (unsigned i = 0; i < held_count; i++) {
+            if (held[i] == h) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 }

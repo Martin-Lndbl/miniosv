@@ -180,10 +180,7 @@ void setup_temporary_phys_map()
 {
     // duplicate 1:1 mapping into the lower part of phys_mem
     u64 *pt_ttbr0 = reinterpret_cast<u64*>(processor::read_ttbr0());
-    for (auto&& area : mmu::identity_mapped_areas) {
-        auto base = reinterpret_cast<void*>(get_mem_area_base(area));
-        pt_ttbr0[mmu::pt_index(base, 3)] = pt_ttbr0[0];
-    }
+    pt_ttbr0[mmu::pt_index(mmu::phys_mem, 3)] = pt_ttbr0[0];
     mmu::flush_tlb_all();
 }
 
@@ -263,17 +260,12 @@ void arch_setup_free_memory()
     // everything block-aligned, map_phys() only ever rewrites an identical block.
     // The extra reserved bytes pulled in by rounding are never freed (steps 1/3
     // free the exact ranges only).
-    for (auto&& area : mmu::identity_mapped_areas) {
-        auto base = reinterpret_cast<char*>(get_mem_area_base(area));
-        const char *name = area == mmu::mem_area::main ? "main" :
-                           area == mmu::mem_area::page ? "page" : "mempool";
-        for (unsigned i = 0; i < usable_range_count; i++) {
-            u64 rstart = usable_ranges[i].addr;
-            u64 rend = rstart + usable_ranges[i].size;
-            u64 mstart = rstart & ~(mmu::huge_page_size - 1);
-            u64 mend = (rend + mmu::huge_page_size - 1) & ~(mmu::huge_page_size - 1);
-            mmu::linear_map(base + mstart, mstart, mend - mstart, name);
-        }
+    for (unsigned i = 0; i < usable_range_count; i++) {
+        u64 rstart = usable_ranges[i].addr;
+        u64 rend = rstart + usable_ranges[i].size;
+        u64 mstart = rstart & ~(mmu::huge_page_size - 1);
+        u64 mend = (rend + mmu::huge_page_size - 1) & ~(mmu::huge_page_size - 1);
+        mmu::linear_map(mmu::phys_mem + mstart, mstart, mend - mstart, "linear");
     }
 
     /* linear_map [TTBR0 - boot, DTB and ELF] */

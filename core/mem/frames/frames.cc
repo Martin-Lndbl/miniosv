@@ -250,7 +250,7 @@ phys_addr from_linear(void *addr)
     // Anything else has to be in the linear map: there is nowhere else a
     // physical address can be recovered from.
     assert(addr >= mmu::phys_mem);
-    return reinterpret_cast<uintptr_t>(addr) & (mmu::mem_area_size - 1);
+    return reinterpret_cast<uintptr_t>(addr) & (mmu::linear_map_size - 1);
 }
 
 size_t total_available_bytes()

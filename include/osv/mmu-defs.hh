@@ -28,38 +28,11 @@ constexpr uintptr_t huge_page_size = mmu::page_size*pte_per_page; // 2 MB
 
 typedef uint64_t f_offset;
 
-enum class mem_area {
-    main,
-    page,
-    mempool,
-};
+// Where physical memory is mapped, and how far it can reach.
+constexpr uintptr_t linear_map_base = 0x400000000000;
+constexpr uintptr_t linear_map_size = uintptr_t(1) << 44;
 
-constexpr mem_area identity_mapped_areas[] = {
-    mem_area::main,
-    mem_area::page,
-    mem_area::mempool,
-};
-
-constexpr uintptr_t mem_area_size = uintptr_t(1) << 44;
-
-constexpr uintptr_t get_mem_area_base(mem_area area)
-{
-    return 0x400000000000 | uintptr_t(area) << 44;
-}
-
-static inline mem_area get_mem_area(void* addr)
-{
-    return mem_area(reinterpret_cast<uintptr_t>(addr) >> 44 & 3);
-}
-
-constexpr void* translate_mem_area(mem_area from, mem_area to, void* addr)
-{
-    return static_cast<void*>(static_cast<char*>(addr)
-                              - get_mem_area_base(from) + get_mem_area_base(to));
-}
-
-constexpr uintptr_t main_mem_area_base = get_mem_area_base(mem_area::main);
-static char* const phys_mem = reinterpret_cast<char*>(main_mem_area_base);
+static char* const phys_mem = reinterpret_cast<char*>(linear_map_base);
 
 enum {
     perm_read = mem::perm_read,
