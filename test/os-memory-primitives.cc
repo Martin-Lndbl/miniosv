@@ -26,6 +26,7 @@
 #include <osv/mempool.hh>
 #include <osv/mmu.hh>
 
+#include "core/mem/linear.hh"
 #include "mem-test.hh"
 
 using namespace memtest;
@@ -70,7 +71,7 @@ void frames_functional()
         CHECK(pa != mem::frames::no_memory);
         void *v = mem::frames::to_linear(pa);
         CHECK(mem::frames::from_linear(v) == pa);
-        CHECK(mmu::is_linear_mapped(v, page));
+        CHECK(mem::frames::in_linear_map(v, page));
         CHECK((pa & (page - 1)) == 0);
         mem::frames::free(pa);
     }
@@ -95,10 +96,10 @@ void frames_functional()
             if (!p) {
                 continue;
             }
-            mem::frames::phys_addr base = mmu::virt_to_phys(p);
+            mem::frames::phys_addr base = mem::mapping::to_phys(p);
             bool ok = true;
             for (size_t off = 0; off < size; off += page) {
-                ok = ok && mmu::virt_to_phys(static_cast<char *>(p) + off) == base + off;
+                ok = ok && mem::mapping::to_phys(static_cast<char *>(p) + off) == base + off;
             }
             CHECK(ok);
             memory::free_phys_contiguous_aligned(p, size);

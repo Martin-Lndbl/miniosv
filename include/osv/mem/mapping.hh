@@ -61,8 +61,12 @@ private:
 // Find the leaf (PTE or PDE) for "addr", if any.
 pte_ref find(uintptr_t addr);
 
-// The physical address "addr" resolves to, or no_memory if nothing is mapped.
+// The physical address "addr" resolves to, or no_memory if nothing is mapped
 frames::phys_addr to_phys(uintptr_t addr);
+frames::phys_addr to_phys(void *addr);
+
+// Whether [addr, addr + bytes) is one run of physical memory
+bool is_contiguous(const void *addr, size_t bytes);
 
 // Populate the table down to the level that can hold a leaf of "leaf_size",
 // and returns a pointer to that leaf.

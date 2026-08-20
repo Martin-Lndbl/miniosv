@@ -11,7 +11,6 @@
 #include <stdint.h>
 #include <osv/types.h>
 #include <osv/mem/types.hh>
-#include <osv/virt_to_phys.hh>
 
 #include <mem.hh>
 

@@ -24,6 +24,8 @@
 #include "drivers/nvme.hh"
 #include "drivers/nvme-queue.hh"
 #include "internal.hh"
+#include <osv/mem/frames.hh>
+#include <osv/mem/mapping.hh>
 
 namespace miniext {
 
@@ -242,7 +244,7 @@ int device::bounce(void *buf, uint64_t block, uint32_t count, bool write)
 
 int device::read(void *buf, uint64_t block, uint32_t count)
 {
-    if (!mmu::is_linear_mapped(buf, static_cast<size_t>(count) * _block_size)) {
+    if (!mem::mapping::is_contiguous(buf, static_cast<size_t>(count) * _block_size)) {
         return bounce(buf, block, count, false);
     }
     return submit(buf, block, count, false);
@@ -250,7 +252,7 @@ int device::read(void *buf, uint64_t block, uint32_t count)
 
 int device::write(const void *buf, uint64_t block, uint32_t count)
 {
-    if (!mmu::is_linear_mapped(buf, static_cast<size_t>(count) * _block_size)) {
+    if (!mem::mapping::is_contiguous(buf, static_cast<size_t>(count) * _block_size)) {
         return bounce(const_cast<void *>(buf), block, count, true);
     }
     return submit(const_cast<void *>(buf), block, count, true);

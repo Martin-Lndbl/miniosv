@@ -11,6 +11,7 @@
 #include <osv/mem/mapping.hh>
 #include <osv/mem/frames.hh>
 #include <osv/align.hh>
+#include "../linear.hh"
 
 namespace mem {
 namespace mapping {

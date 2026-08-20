@@ -22,6 +22,7 @@
 #include <osv/mem/early.hh>
 #include <osv/mem/frames.hh>
 #include <osv/mutex.h>
+#include "linear.hh"
 
 namespace mem {
 namespace early {

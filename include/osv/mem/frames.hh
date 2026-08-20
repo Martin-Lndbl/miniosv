@@ -29,10 +29,6 @@ constexpr size_t max_block_bytes = page_size << 9;   // 2 MiB
 phys_addr alloc(size_t bytes = page_size, size_t align = page_size);
 void free(phys_addr addr, size_t bytes = page_size);
 
-// Every frame is reachable through the kernel's linear map.
-void *to_linear(phys_addr p);
-phys_addr from_linear(void *addr);
-
 size_t free_bytes();
 
 // What the allocator holds (less than the RAM the firmware reported).
@@ -68,7 +64,7 @@ bool reclaim();
 
 // Boot. add_region() collects memory before there is an allocator to put it in;
 // init() builds llfree and hands it everything still unused.
-void add_region(void *base, size_t bytes);
+void add_region(phys_addr base, size_t bytes);
 void init(size_t cores);
 // Call once the scheduler runs everywhere: until then allocation uses core 0.
 void enable_percpu();

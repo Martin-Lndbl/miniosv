@@ -11,6 +11,7 @@
 #include <osv/rcu.hh>
 
 #include "internal.hh"
+#include "../linear.hh"
 
 namespace mem {
 namespace mapping {
@@ -96,13 +97,34 @@ pte_ref find(uintptr_t addr)
     }
 }
 
+frames::phys_addr to_phys(void *addr)
+{
+    return to_phys(reinterpret_cast<uintptr_t>(addr));
+}
+
 frames::phys_addr to_phys(uintptr_t addr)
 {
+    if (frames::in_linear_map(reinterpret_cast<void *>(addr))) {
+        return frames::from_linear(reinterpret_cast<void *>(addr));
+    }
     auto e = find(addr);
     if (!e) {
         return frames::no_memory;
     }
     return e.addr() + (addr & (e.size() - 1));
+}
+
+bool is_contiguous(const void *addr, size_t bytes)
+{
+    auto start = reinterpret_cast<uintptr_t>(addr);
+    if (frames::in_linear_map(addr, bytes)) {
+        return true;
+    }
+    auto e = find(start);
+    if (!e) {
+        return false;
+    }
+    return (start & (e.size() - 1)) + bytes <= e.size();
 }
 
 pte_ref prepare(uintptr_t addr, size_t leaf_size)

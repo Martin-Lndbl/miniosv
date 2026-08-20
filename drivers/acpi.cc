@@ -15,6 +15,8 @@
 #include "processor.hh"
 
 #include "acpi.hh"
+#include <osv/mem/frames.hh>
+#include <osv/mem/phys.hh>
 
 #define acpi_tag "acpi"
 #define acpi_w(...)   tprintf_w(acpi_tag, __VA_ARGS__)
@@ -106,13 +108,13 @@ static void *map_phys(uint64_t pa, size_t len)
             }
         }
         if (!already) {
-            mmu::linear_map(mmu::phys_to_virt(p), p, mmu::huge_page_size, "acpi");
+            mem::map_phys(p, mmu::huge_page_size);
             if (nmapped < 16) {
                 mapped[nmapped++] = p;
             }
         }
     }
-    return mmu::phys_to_virt(pa);
+    return mem::map_phys(pa, len);
 }
 
 #ifdef __x86_64__

@@ -17,6 +17,8 @@
 #include <osv/interrupt.hh>
 #include "osv/trace.hh"
 #include <osv/ilog2.hh>
+#include <osv/mem/mapping.hh>
+#include <osv/mem/frames.hh>
 
 using namespace memory;
 using sched::thread;
@@ -85,22 +87,22 @@ namespace virtio {
 
     u64 vring::get_paddr()
     {
-        return mmu::virt_to_phys(_vring_ptr);
+        return mem::mapping::to_phys(_vring_ptr);
     }
 
     u64 vring::get_desc_addr()
     {
-        return mmu::virt_to_phys(_desc);
+        return mem::mapping::to_phys(_desc);
     }
 
     u64 vring::get_avail_addr()
     {
-        return mmu::virt_to_phys(_avail);
+        return mem::mapping::to_phys(_avail);
     }
 
     u64 vring::get_used_addr()
     {
-        return mmu::virt_to_phys(_used);
+        return mem::mapping::to_phys(_used);
     }
 
     unsigned vring::get_size(unsigned int num, unsigned long align)
@@ -169,7 +171,7 @@ namespace virtio {
                 if (!indirect)
                     return false;
                 _desc[idx]._flags = vring_desc::VRING_DESC_F_INDIRECT;
-                _desc[idx]._paddr = mmu::virt_to_phys(indirect);
+                _desc[idx]._paddr = mem::mapping::to_phys(indirect);
                 _desc[idx]._len = (_sg_vec.size()) * sizeof(vring_desc);
 
                 descp = indirect;
@@ -221,8 +223,7 @@ namespace virtio {
                 int idx = elem._id;
 
                 if (_desc[idx]._flags & vring_desc::VRING_DESC_F_INDIRECT) {
-                    free_phys_contiguous_aligned(mmu::phys_to_virt(_desc[idx]._paddr),
-                                                 _desc[idx]._len);
+                    mem::frames::free(_desc[idx]._paddr, _desc[idx]._len);
                 } else
                     while (_desc[idx]._flags & vring_desc::VRING_DESC_F_NEXT) {
                         idx = _desc[idx]._next;

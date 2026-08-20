@@ -26,6 +26,7 @@
 #include <osv/interrupt.hh>
 #include <osv/sched.hh>
 #include <osv/trace.hh>
+#include <osv/mem/mapping.hh>
 
 using namespace memory;
 
@@ -287,7 +288,7 @@ int nvme_driver::identify_controller() {
   for (int attempt = 0;; attempt++) {
     setup_identify_cmd(&cmd, 0, CMD_IDENTIFY_CONTROLLER);
     auto res = _admin_queue->submit_and_return_on_completion(
-        &cmd, (void *)mmu::virt_to_phys(data), mmu::page_size);
+        &cmd, (void *)mem::mapping::to_phys(data), mmu::page_size);
 
     if (res.sc != 0 || res.sct != 0) {
       nvme_e("Identify controller failed nvme%d, sct=%d, sc=%d", _id, res.sct,
@@ -325,7 +326,7 @@ int nvme_driver::identify_namespace(u32 nsid) {
   for (int attempt = 0;; attempt++) {
     setup_identify_cmd(&cmd, nsid, CMD_IDENTIFY_NAMESPACE);
     auto res = _admin_queue->submit_and_return_on_completion(
-        &cmd, (void *)mmu::virt_to_phys(data.get()), mmu::page_size);
+        &cmd, (void *)mem::mapping::to_phys(data.get()), mmu::page_size);
     if (res.sc != 0 || res.sct != 0) {
       nvme_e("Identify namespace failed nvme%d nsid=%d, sct=%d, sc=%d", _id,
              nsid, res.sct, res.sc);

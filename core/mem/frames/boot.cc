@@ -16,6 +16,7 @@
 #include <osv/debug.hh>
 #include <osv/mem/frames.hh>
 #include <osv/mmu.hh>
+#include "../linear.hh"
 
 namespace mem {
 namespace frames {
@@ -42,10 +43,11 @@ size_t total;
 
 } // namespace
 
-void add_region(void *base, size_t bytes)
+void add_region(phys_addr base, size_t bytes)
 {
-    uintptr_t b = align_up(reinterpret_cast<uintptr_t>(base), mmu::page_size);
-    uintptr_t e = align_down(reinterpret_cast<uintptr_t>(base) + bytes, mmu::page_size);
+    auto linear = reinterpret_cast<uintptr_t>(to_linear(base));
+    uintptr_t b = align_up(linear, mmu::page_size);
+    uintptr_t e = align_down(linear + bytes, mmu::page_size);
     if (e <= b) {
         return;
     }

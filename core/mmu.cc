@@ -38,24 +38,6 @@ namespace mmu {
 void *elf_phys_start;
 extern "C" u64 kernel_vm_shift;
 
-// The linear map belongs to the frame allocator; these are what the drivers
-// and the boot code still call it by.
-void* phys_to_virt(mem::frames::phys_addr pa)
-{
-    return mem::frames::to_linear(pa);
-}
-
-mem::frames::phys_addr virt_to_phys(void *virt)
-{
-    if (is_linear_mapped(virt, 0)) {
-        return mem::frames::from_linear(virt);
-    }
-    // Not every address a driver hands to hardware is one of the linear map's
-    // any more: the heap maps its own pages, and the page table is the only
-    // thing that knows where they are.
-    return mem::mapping::to_phys(reinterpret_cast<uintptr_t>(virt));
-}
-
 static mem::range page_range(const void *addr, size_t size)
 {
     auto start = reinterpret_cast<uintptr_t>(addr);
@@ -150,14 +132,6 @@ static tracked_region *anon_at(const void *addr, size_t size)
     return t->kind == tracked_region::anon ? t : nullptr;
 }
 
-bool is_linear_mapped(const void *addr, size_t size)
-{
-    if ((addr >= elf_start) && (static_cast<const char*>(addr) + size <= static_cast<char*>(elf_start) + elf_size)) {
-        return true;
-    }
-    return addr >= phys_mem;
-}
-
 // Is every byte of this region reserved in the address space?
 bool ismapped(const void *addr, size_t size)
 {
@@ -207,7 +181,7 @@ void free_initial_memory_range(uintptr_t addr, size_t size)
         ++addr;
         --size;
     }
-    memory::free_initial_memory_range(phys_cast<void>(addr), size);
+    memory::free_initial_memory_range(addr, size);
 }
 
 // Permissions live in the page tables; the region records what was asked for.
@@ -330,9 +304,4 @@ void vm_fault(uintptr_t addr, exception_frame* ef)
     }
     trace_mmu_vm_fault_ret(addr, error);
 }
-}
-
-extern "C" bool is_linear_mapped(const void *addr)
-{
-    return addr >= mmu::phys_mem;
 }

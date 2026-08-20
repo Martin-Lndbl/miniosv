@@ -22,12 +22,6 @@ struct exception_frame;
  */
 namespace mmu {
 
-// when we know it was dynamically allocated
-inline mem::frames::phys_addr virt_to_phys_dynamic_phys(void* virt)
-{
-    return static_cast<char*>(virt) - phys_mem;
-}
-
 inline unsigned pt_index(void *virt, unsigned level)
 {
     return (reinterpret_cast<ulong>(virt) >> (page_size_shift + level * pte_per_page_shift)) & (pte_per_page - 1);
@@ -47,16 +41,7 @@ void* map_anon(const void* addr, size_t size, unsigned flags, unsigned perm);
 error munmap(const void* addr, size_t size);
 error mprotect(const void *addr, size_t size, unsigned int perm);
 error msync(const void* addr, size_t length, int flags);
-bool is_linear_mapped(const void *addr, size_t size);
 bool ismapped(const void *addr, size_t size);
-
-void* phys_to_virt(mem::frames::phys_addr pa);
-
-template <typename T>
-T* phys_cast(mem::frames::phys_addr pa)
-{
-    return static_cast<T*>(phys_to_virt(pa));
-}
 
 inline
 bool is_page_aligned(intptr_t addr)

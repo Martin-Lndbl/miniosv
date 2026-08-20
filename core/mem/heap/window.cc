@@ -18,6 +18,7 @@
 #include <cstring>
 
 #include "internal.hh"
+#include "../linear.hh"
 
 namespace mem {
 namespace heap {

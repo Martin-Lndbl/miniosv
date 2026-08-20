@@ -11,6 +11,7 @@
 #include <string.h>
 
 #include "internal.hh"
+#include "../linear.hh"
 
 namespace mem {
 namespace mapping {

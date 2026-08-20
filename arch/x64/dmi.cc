@@ -10,6 +10,8 @@
 #include <osv/debug.hh>
 #include <osv/mmu.hh>
 #include <string.h>
+#include <osv/mem/frames.hh>
+#include <osv/mem/phys.hh>
 
 std::string dmi_bios_vendor("Unknown");
 
@@ -51,9 +53,7 @@ static const char* dmi_string(dmi_header header, u8 idx)
 
 static void dmi_table(u32 base, u16 len, u16 num)
 {
-    u8* const table_virt = mmu::phys_cast<u8>(base);
-
-    mmu::linear_map(static_cast<void*>(table_virt), base, len, "smbios");
+    u8* const table_virt = static_cast<u8*>(mem::map_phys(base, len));
 
     auto start = reinterpret_cast<const char*>(table_virt);
 
@@ -129,7 +129,7 @@ void dmi_probe()
 {
     constexpr mem::frames::phys_addr dmi_base = 0xf0000;
 
-    u8* const dmi_virt = mmu::phys_cast<u8>(dmi_base);
+    u8* const dmi_virt = static_cast<u8*>(mem::map_phys(dmi_base, 0x10000));
 
     mmu::linear_map(static_cast<void*>(dmi_virt), dmi_base, 0x10000, "dmi");
 

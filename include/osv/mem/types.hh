@@ -14,8 +14,7 @@
 namespace mem {
 namespace frames {
 
-// A physical address. Not a pointer: physical memory is not
-// addressable until it is mapped, or reached through to_linear().
+// A physical address. Not a pointer: physical memory is not addressable until it is mapped.
 using phys_addr = uint64_t;
 
 // Nothing is allocated at physical 0, used to return "no memory" from alloc() and claim_run().

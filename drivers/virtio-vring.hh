@@ -15,12 +15,14 @@
 #include <osv/mmu.hh>
 #include <osv/sched.hh>
 #include <osv/trace.hh>
+#include <osv/mem/mapping.hh>
+#include <osv/mem/frames.hh>
 
 // Hand each physically contiguous run of [vaddr, vaddr+len) to "out".
 template <typename OutputFunc>
 static inline void for_each_phys_run(void *vaddr, size_t len, OutputFunc out)
 {
-    out(mmu::virt_to_phys(vaddr), len);
+    out(mem::mapping::to_phys(vaddr), len);
 }
 
 #define virtio_tag "virtio"

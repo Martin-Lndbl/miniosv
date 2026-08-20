@@ -15,6 +15,7 @@
 #include <osv/mem/vspace.hh>
 
 #include "internal.hh"
+#include "../linear.hh"
 
 namespace mem {
 namespace heap {

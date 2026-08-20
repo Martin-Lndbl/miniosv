@@ -19,6 +19,7 @@
 #include <osv/sched.hh>
 #include <mutex>
 #include <atomic>
+#include <osv/mem/mapping.hh>
 
 using namespace osv::clock;
 
@@ -60,7 +61,7 @@ kvmclock::kvmclock()
                      msr::KVM_WALL_CLOCK_NEW : msr::KVM_WALL_CLOCK;
     _wall = new pvclock_wall_clock;
     memset(_wall, 0, sizeof(*_wall));
-    _wall_phys = mmu::virt_to_phys(_wall);
+    _wall_phys = mem::mapping::to_phys(_wall);
     sync_wall_clock();
     //
     // Start a thread that will synchronize the wall clock with the host
@@ -81,7 +82,7 @@ void kvmclock::init_on_cpu()
     auto system_time_msr = (_new_kvmclock_msrs) ?
                            msr::KVM_SYSTEM_TIME_NEW : msr::KVM_SYSTEM_TIME;
     memset(&*_sys, 0, sizeof(*_sys));
-    processor::wrmsr(system_time_msr, mmu::virt_to_phys(&*_sys) | 1);
+    processor::wrmsr(system_time_msr, mem::mapping::to_phys(&*_sys) | 1);
 }
 
 bool kvmclock::probe()

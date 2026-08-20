@@ -692,6 +692,7 @@ objects += arch/$(arch)/mem/fault.o
 # The sub-page allocator. So far only the path for allocations big enough to
 # get a reservation of their own.
 objects += core/mem/early.o
+objects += core/mem/phys.o
 objects += core/mem/heap/large.o
 objects += core/mem/heap/objects.o
 objects += core/mem/heap/window.o

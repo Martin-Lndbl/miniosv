@@ -4,7 +4,7 @@
 #include <osv/nvme-structs.h>
 #include <lockfree/ring.hh>
 
-#include <osv/virt_to_phys.hh>
+#include <osv/mem/mapping.hh>
 #include <osv/mutex.h>
 #include <osv/sched.hh>
 #include <map>
@@ -97,8 +97,8 @@ public:
 
     virtual ~queue_pair();
 
-    u64 sq_phys_addr() { return (u64) mmu::virt_to_phys((void*) _sq._addr); }
-    u64 cq_phys_addr() { return (u64) mmu::virt_to_phys((void*) _cq._addr); }
+    u64 sq_phys_addr() { return (u64) mem::mapping::to_phys((void*) _sq._addr); }
+    u64 cq_phys_addr() { return (u64) mem::mapping::to_phys((void*) _cq._addr); }
 
     void enable_interrupts();
     void disable_interrupts();

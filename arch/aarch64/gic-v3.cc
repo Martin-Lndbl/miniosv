@@ -56,6 +56,8 @@
 #include "processor.hh"
 #include "gic-v3.hh"
 #include "arm-clock.hh"
+#include <osv/mem/mapping.hh>
+#include <osv/mem/frames.hh>
 
 extern class interrupt_table idt;
 
@@ -247,7 +249,7 @@ void gic_v3_its::initialize_cmd_queue()
     _cmd_queue = memory::alloc_phys_contiguous_aligned(GIC_ITS_CMD_QUEUE_SIZE, 0x10000);
     memset(_cmd_queue, 0, GIC_ITS_CMD_QUEUE_SIZE);
 
-    u64 cmd_queue_pa = mmu::virt_to_phys(_cmd_queue);
+    u64 cmd_queue_pa = mem::mapping::to_phys(_cmd_queue);
     u64 queue_size_in_pages = GIC_ITS_CMD_QUEUE_SIZE / mmu::page_size;
     //
     //Read https://developer.arm.com/documentation/ddi0601/2024-09/External-Registers/GITS-CBASER--ITS-Command-Queue-Descriptor
@@ -398,7 +400,7 @@ void gic_v3_driver::init_lpis(int smp_idx)
         _lpi_config_table = (u8*)config_table;
 
         u64 id_bits = ilog2_roundup<u64>(_msi_vector_num + GIC_LPI_INTS_START) - 1;
-        _lpi_prop_base = mmu::virt_to_phys(config_table) | id_bits;
+        _lpi_prop_base = mem::mapping::to_phys(config_table) | id_bits;
 
         //Allocate LPI pending table for each redistributor
         //From https://developer.arm.com/documentation/102923/0100/Redistributors:
@@ -409,7 +411,7 @@ void gic_v3_driver::init_lpis(int smp_idx)
             void *pending_table = memory::alloc_phys_contiguous_aligned(pending_table_size, 64 * 1024);
             memset(pending_table, 0, pending_table_size);
             //Read about PTZ here - https://developer.arm.com/documentation/ddi0601/2024-12/External-Registers/GICR-PENDBASER--Redistributor-LPI-Pending-Table-Base-Address-Register
-            _lpi_pend_bases[c] = mmu::virt_to_phys(pending_table) | GICR_PENDBASER_PTZ;
+            _lpi_pend_bases[c] = mem::mapping::to_phys(pending_table) | GICR_PENDBASER_PTZ;
         }
     }
 
@@ -578,7 +580,7 @@ void gic_v3_driver::init_its_device_or_collection_table(int idx)
     void *table = memory::alloc_phys_contiguous_aligned(table_size, table_size);
     memset(table, 0, table_size);
 
-    u64 table_pa = mmu::virt_to_phys(table);
+    u64 table_pa = mem::mapping::to_phys(table);
     base = (base & ~GITS_TABLE_BASE_PA_MASK) | table_pa;
     _gits.write_reg64_at_offset(gic_its_reg::GICITS_BASER, offset, GITS_BASER_VALID | base);
 }
@@ -782,7 +784,7 @@ void gic_v3_driver::allocate_msi_dev_mapping(pci::function* dev)
     memset(itt, 0, itt_size);
 
     //Register translation entry in ITS
-    u64 itt_pa = mmu::virt_to_phys(itt);
+    u64 itt_pa = mem::mapping::to_phys(itt);
     _irq_lock.lock();
     WITH_LOCK(_gic_lock) {
         _itt_by_device_id[itt_index] = std::make_pair(device_id, itt);

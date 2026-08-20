@@ -13,6 +13,7 @@
 #include <atomic>
 #include <algorithm>
 #include <string.h>
+#include "../linear.hh"
 
 namespace mem {
 namespace vspace {

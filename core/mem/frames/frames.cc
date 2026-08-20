@@ -13,6 +13,7 @@
 #include <osv/sched.hh>
 
 #include "internal.hh"
+#include "../linear.hh"
 
 extern void *elf_start;
 extern size_t elf_size;
@@ -67,12 +68,12 @@ uintptr_t linear_of(uint64_t frame)
 
 phys_addr phys_of(uint64_t frame)
 {
-    return mmu::virt_to_phys(reinterpret_cast<void *>(linear_of(frame)));
+    return from_linear(reinterpret_cast<void *>(linear_of(frame)));
 }
 
 uint64_t frame_of_phys(phys_addr p)
 {
-    return frame_of(reinterpret_cast<uintptr_t>(mmu::phys_to_virt(p)));
+    return frame_of(reinterpret_cast<uintptr_t>(to_linear(p)));
 }
 
 size_t total_frames()
@@ -229,6 +230,15 @@ void *to_linear(phys_addr p)
         return static_cast<char *>(addr) + kernel_vm_shift;
     }
     return mmu::phys_mem + p;
+}
+
+bool in_linear_map(const void *addr, size_t bytes)
+{
+    if (addr >= elf_start &&
+        static_cast<const char *>(addr) + bytes <= static_cast<char *>(elf_start) + elf_size) {
+        return true;
+    }
+    return addr >= mmu::phys_mem;
 }
 
 phys_addr from_linear(void *addr)

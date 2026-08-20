@@ -24,6 +24,7 @@
 #include <atomic>
 #include <osv/mmu.hh>
 #include <osv/mem/frames.hh>
+#include "mem/linear.hh"
 #include <osv/trace.hh>
 #include <osv/preempt-lock.hh>
 #include <osv/sched.hh>
@@ -240,7 +241,7 @@ void free_huge_page(void* v, size_t N)
     mem::frames::free(mem::frames::from_linear(v), N);
 }
 
-void free_initial_memory_range(void* addr, size_t size)
+void free_initial_memory_range(mem::frames::phys_addr addr, size_t size)
 {
     mem::frames::add_region(addr, size);
 }
@@ -427,7 +428,7 @@ static size_t object_size(void *object)
     }
     // Anything else came from before the heap existed, or from the contiguous
     // allocator, and both of those live in the linear map.
-    assert(mmu::is_linear_mapped(object, 0));
+    assert(mem::frames::in_linear_map(object, 0));
 
     switch (mmu::get_mem_area(object)) {
     case mmu::mem_area::main:
@@ -483,7 +484,7 @@ static inline bool free_bookkeeping(void *object)
 // which is what the alias in the address names.
 static void free_foreign(void *object)
 {
-    assert(mmu::is_linear_mapped(object, 0));
+    assert(mem::frames::in_linear_map(object, 0));
 
     switch (mmu::get_mem_area(object)) {
     case mmu::mem_area::page:

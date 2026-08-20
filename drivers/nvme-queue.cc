@@ -18,6 +18,9 @@
 #include <osv/mmu.hh>
 #include "nvme-queue.hh"
 #include "drivers/pci-device.hh"
+#include <osv/mem/mapping.hh>
+#include <osv/mem/frames.hh>
+#include <osv/mem/phys.hh>
 
 TRACEPOINT(trace_nvme_cq_wait, "nvme%d qid=%d, cq_head=%d", int, int, int);
 TRACEPOINT(trace_nvme_cq_woken, "nvme%d qid=%d, have_elements=%d", int, int, bool);
@@ -219,11 +222,11 @@ namespace nvme
     void io_queue_pair::map_prps(u32 nsid, nvme_sq_entry_t *cmd, void *payload, nvme_pending_req *pending_req, u64 datasize)
     {
         // u64 nvme_pagesize = _ns[1]->blocksize;
-        void *data = (void *)mmu::virt_to_phys(payload);
+        void *data = (void *)mem::mapping::to_phys(payload);
         pending_req->prp_list = nullptr;
 
         // The payload is a (possibly scattered, below-phys_mem) buffer-pool page;
-        // a wrong virt_to_phys here would DMA to the wrong physical memory and
+        // a wrong translation here would DMA to the wrong physical memory and
         // silently corrupt an unrelated BufferFrame. prp1 may be offset into a
         // page, but the in-page offset MUST survive translation.
         assert(data != nullptr);
@@ -250,7 +253,7 @@ namespace nvme
 
         if (num_of_pages == 2)
         {
-            cmd->rw.common.prp2 = align_down(mmu::virt_to_phys(static_cast<char*>(payload) + NVME_PAGESIZE), NVME_PAGESIZE); // 2nd page start
+            cmd->rw.common.prp2 = align_down(mem::mapping::to_phys(static_cast<char*>(payload) + NVME_PAGESIZE), NVME_PAGESIZE); // 2nd page start
             // PRP2 must be 4K-aligned, non-zero, a different physical page than
             // prp1, and must back the *next* virtual page (pool is not physically
             // contiguous, so it can't be assumed to be prp1_page + 4K).
@@ -258,7 +261,7 @@ namespace nvme
             assert((cmd->rw.common.prp2 & (NVME_PAGESIZE - 1)) == 0);
             assert(cmd->rw.common.prp2 != align_down(addr, NVME_PAGESIZE));
             assert(cmd->rw.common.prp2 ==
-                   mmu::virt_to_phys((void *)(align_down((u64)payload, NVME_PAGESIZE) + NVME_PAGESIZE)));
+                   mem::mapping::to_phys((void *)(align_down((u64)payload, NVME_PAGESIZE) + NVME_PAGESIZE)));
         }
         else if (num_of_pages > 2)
         {
@@ -275,7 +278,7 @@ namespace nvme
             }
 
             assert(prp_list != nullptr);
-            cmd->rw.common.prp2 = mmu::virt_to_phys(prp_list);
+            cmd->rw.common.prp2 = mem::mapping::to_phys(prp_list);
             // The PRP-list page itself must be 4K-aligned (it points at it).
             assert((cmd->rw.common.prp2 & (NVME_PAGESIZE - 1)) == 0);
 
@@ -292,7 +295,7 @@ namespace nvme
             for (int i = 0; i < num_of_pages - 1; i++)
             {
                 void *vaddr = (void *)(virt_page0 + (u64)(i + 1) * NVME_PAGESIZE);
-                prp_list[i] = mmu::virt_to_phys(vaddr);
+                prp_list[i] = mem::mapping::to_phys(vaddr);
                 // Each non-first PRP entry must be a valid, 4K-aligned physical page.
                 assert(prp_list[i] != 0);
                 assert((prp_list[i] & (NVME_PAGESIZE - 1)) == 0);
@@ -449,7 +452,7 @@ namespace nvme
                         // prp1 -> the leanstore Page (offset 512 in its frame).
                         // page[0]=GSN, page[2]=magic_debugging_number.
                         auto *page = reinterpret_cast<u64 *>(
-                            mmu::phys_to_virt(failed->rw.common.prp1));
+                            mem::map_phys(failed->rw.common.prp1, NVME_PAGESIZE));
                         printf("  page(phys->virt)=%p GSN=%lu magic=%lu "
                                "(in-page offset=0x%lx)\n",
                                (void *)page, (unsigned long)page[0],
