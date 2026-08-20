@@ -12,6 +12,7 @@
 #include "exceptions.hh"
 #include "cpuid.hh"
 #include "osv/pagealloc.hh"
+#include <osv/debug.hh>
 #include <xmmintrin.h>
 #include "msr.hh"
 #include <osv/kernel_config.h>
@@ -93,9 +94,17 @@ struct save_fpu {
 };
 
 struct fpu_state_alloc_page {
-    processor::fpu_state* s =
-            static_cast<processor::fpu_state*>(memory::alloc_page());
-    explicit fpu_state_alloc_page() { fpu_state_init(s); }
+    processor::fpu_state *s;
+    explicit fpu_state_alloc_page()
+        : s(static_cast<processor::fpu_state*>(memory::alloc_page()))
+    {
+        // A cpu cannot run without somewhere to save its floating-point state,
+        // so there is nothing to report this to.
+        if (!s) {
+            abort("fpu: no page for a cpu's floating-point save area\n");
+        }
+        fpu_state_init(s);
+    }
     processor::fpu_state *addr(){ return s; }
     ~fpu_state_alloc_page(){ memory::free_page(s); }
 };

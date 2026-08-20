@@ -117,19 +117,6 @@ struct addr_cmp {
 namespace bi = boost::intrusive;
 
 
-// Our notion of free memory is "whatever is in the page ranges". Therefore it
-// starts at 0, and increases as we add page ranges.
-//
-// There is nothing to reclaim: no page cache, no shrinkers, and the one client
-// that can give memory back registers with frames::watch_pressure() long before
-// it gets this far. So say what was asked for and stop, rather than block on a
-// wait that nobody will ever satisfy.
-void oom(size_t bytes)
-{
-    abort("Out of memory: %zu bytes requested, %zu MiB free of %zu MiB.\n",
-          bytes, mem::frames::free_bytes() >> 20, mem::frames::total_available_bytes() >> 20);
-}
-
 
 
 
@@ -195,10 +182,12 @@ static size_t large_object_size(void *obj)
 
 static void* untracked_alloc_page()
 {
-    void* ret = mem::frames::to_linear(mem::frames::alloc());
-    if (!ret) {
-        oom(page_size);
+    // Test the physical address, not the pointer
+    auto p = mem::frames::alloc();
+    if (p == mem::frames::no_memory) {
+        return nullptr;
     }
+    void* ret = mem::frames::to_linear(p);
     trace_memory_page_alloc(ret);
     return ret;
 }
@@ -233,7 +222,8 @@ void free_page(void* v)
  */
 void* alloc_huge_page(size_t N)
 {
-    return mem::frames::to_linear(mem::frames::alloc(N, N));
+    auto p = mem::frames::alloc(N, N);
+    return p == mem::frames::no_memory ? nullptr : mem::frames::to_linear(p);
 }
 
 void free_huge_page(void* v, size_t N)
