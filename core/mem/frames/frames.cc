@@ -158,6 +158,21 @@ void init(size_t cores)
     pressure_init(total);
 }
 
+static phys_addr try_alloc(size_t need, size_t align)
+{
+    // One block, which llfree hands out aligned to its own size. The common
+    // case, and the only one that does not search.
+    unsigned order = order_of(need);
+    if (order <= block_max && (page_size << order) >= align) {
+        llfree_result_t r = llfree_get(llf, current_core(), llflags(order));
+        return llfree_is_ok(r) ? phys_of(r.frame) : no_memory;
+    }
+
+    // Try to claim multiple contiguous blocks.
+    uint64_t frame = claim_run(need, align);
+    return frame == no_frame ? no_memory : phys_of(frame);
+}
+
 phys_addr alloc(size_t bytes, size_t align)
 {
     if (!bytes) {
@@ -173,25 +188,17 @@ phys_addr alloc(size_t bytes, size_t align)
         return p ? from_linear(p) : no_memory;
     }
 
-    // One block, which llfree hands out aligned to its own size. The common
-    // case, and the only one that does not search.
-    unsigned order = order_of(need);
-    if (order <= block_max && (page_size << order) >= align) {
-        llfree_result_t r = llfree_get(llf, current_core(), llflags(order));
-        if (!llfree_is_ok(r)) {
-            return no_memory;
-        }
+    phys_addr p = try_alloc(need, align);
+    // Clients hold memory they are willing to give back rather than handing it
+    // over the moment they stop using it, so running out is a question to ask
+    // them rather than an answer. Keep asking while they keep giving.
+    while (p == no_memory && reclaim()) {
+        p = try_alloc(need, align);
+    }
+    if (p != no_memory) {
         check_pressure();
-        return phys_of(r.frame);
     }
-
-    // Try to claim multiple contiguous blocks.
-    uint64_t frame = claim_run(need, align);
-    if (frame == no_frame) {
-        return no_memory;
-    }
-    check_pressure();
-    return phys_of(frame);
+    return p;
 }
 
 void free(phys_addr addr, size_t bytes)

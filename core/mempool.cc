@@ -5,6 +5,7 @@
  * BSD license as described in the LICENSE file in the top-level directory.
  */
 
+#include <osv/mem/early.hh>
 #include <osv/mem/heap.hh>
 #include <osv/mempool.hh>
 #include <osv/ilog2.hh>
@@ -13,7 +14,6 @@
 #include <cstdint>
 #include <new>
 #include <string.h>
-#include <lockfree/unordered-queue-mpsc.hh>
 #include "libc/libc.hh"
 #include <osv/align.hh>
 #include <osv/debug.hh>
@@ -25,7 +25,6 @@
 #include <osv/mmu.hh>
 #include <osv/mem/frames.hh>
 #include <osv/trace.hh>
-#include <osv/percpu-worker.hh>
 #include <osv/preempt-lock.hh>
 #include <osv/sched.hh>
 #include <algorithm>
@@ -81,340 +80,27 @@ static inline void tracker_forget(void *addr)
 }
 #endif
 
-//
-// Before smp_allocator=true, threads are not yet available. malloc and free
-// are used immediately after virtual memory is being initialized.
-// sched::cpu::current() uses TLS which is set only later on.
-//
+// Before smp_allocator, threads are not yet available: malloc and free are
+// used as soon as virtual memory is up, and sched::cpu::current() reads a TLS
+// slot that is only set later.
 
-static inline unsigned mempool_cpuid() {
-    return (smp_allocator ? sched::cpu::current()->id: 0);
-}
+// Hand the boot regions over to llfree. Still single-threaded here, which is
+// what that hand-over needs.
+struct start_frame_allocator {
+    start_frame_allocator() { mem::frames::init(sched::cpus.size()); }
+} s_start_frame_allocator __attribute__((init_priority((int)init_prio::frame_allocator)));
 
-static void garbage_collector_fn();
-PCPU_WORKERITEM(garbage_collector, garbage_collector_fn);
-
-//
-// Since the small pools are managed per-cpu, malloc() always access the correct
-// pool on the same CPU that it was issued from, free() on the other hand, may
-// happen from different CPUs, so for each CPU, we maintain an array of
-// lockless spsc rings, which combined are functioning as huge mpsc ring.
-//
-// A worker item is in charge of freeing the object from the original
-// CPU it was allocated on.
-//
-// As much as the producer is concerned (cpu who did free()) -
-// 1st index -> dest cpu
-// 2nd index -> local cpu
-//
-
-class garbage_sink {
-private:
-    static const int signal_threshold = 256;
-    lockfree::unordered_queue_mpsc<free_object> queue;
-    int pushed_since_last_signal {};
-public:
-    void free(unsigned obj_cpu, free_object* obj)
-    {
-        queue.push(obj);
-        if (++pushed_since_last_signal > signal_threshold) {
-            garbage_collector.signal(sched::cpus[obj_cpu]);
-            pushed_since_last_signal = 0;
-        }
-    }
-
-    free_object* pop()
-    {
-        return queue.pop();
-    }
-};
-
-static garbage_sink ***pcpu_free_list;
-
-void pool::collect_garbage()
-{
-    assert(!sched::preemptable());
-
-    unsigned cpu_id = mempool_cpuid();
-
-    for (unsigned i = 0; i < sched::cpus.size(); i++) {
-        auto sink = pcpu_free_list[cpu_id][i];
-        free_object* obj;
-        while ((obj = sink->pop())) {
-            memory::pool::from_object(obj)->free_same_cpu(obj, cpu_id);
-        }
-    }
-}
-
-static void garbage_collector_fn()
-{
-#if CONF_lazy_stack_invariant
-    assert(!sched::thread::current()->is_app());
-#endif
-    WITH_LOCK(preempt_lock) {
-        pool::collect_garbage();
-    }
-}
-
-// Memory allocation strategy
-//
-// Bits 44:46 of the virtual address are used to determine which memory
-// allocator was used for allocation and, therefore, which one should be used
-// to free the memory block.
-//
-// Small objects (< page size / 4) are stored in pages.  The beginning of the
-// page contains a header with a pointer to a pool, consisting of all free
-// objects of that size.  The pool maintains a singly linked list of free
-// objects, and adds or frees pages as needed.
-//
-// Objects which size is in range (page size / 4, page size] are given a whole
-// page from per-CPU page buffer.  Such objects don't need header they are
-// known to be not larger than a single page.  Page buffer is refilled by
-// allocating memory from large allocator.
-//
-// Large objects are rounded up to page size.  They have a header in front that
-// contains the page size.  There is gap between the header and the acutal
-// object to ensure proper alignment.  Unallocated page ranges are kept either
-// in one of 16 doubly linked lists or in a red-black tree sorted by their
-// size.  List k stores page ranges which page count is in range
-// [2^k, 2^(k + 1)).  The tree stores page ranges that are too big for any of
-// the lists.  Memory is allocated from the smallest, non empty list, that
-// contains page ranges large enough. If there is no such list then it is a
-// worst-fit allocation form the page ranges in the tree.
-
-pool::pool(unsigned size)
-    : _size(size)
-    , _free()
-{
-    assert(size + sizeof(page_header) <= page_size);
-}
-
-pool::~pool()
-{
-}
-
-const size_t pool::max_object_size = page_size / 4;
-const size_t pool::min_object_size = sizeof(free_object);
-
-pool::page_header* pool::to_header(free_object* object)
-{
-    return reinterpret_cast<page_header*>(
-                 reinterpret_cast<std::uintptr_t>(object) & ~(page_size - 1));
-}
-
-TRACEPOINT(trace_pool_alloc, "this=%p, obj=%p", void*, void*);
-TRACEPOINT(trace_pool_free, "this=%p, obj=%p", void*, void*);
-TRACEPOINT(trace_pool_free_same_cpu, "this=%p, obj=%p", void*, void*);
-TRACEPOINT(trace_pool_free_different_cpu, "this=%p, obj=%p, obj_cpu=%d", void*, void*, unsigned);
-
-void* pool::alloc()
-{
-    void * ret = nullptr;
-#if CONF_lazy_stack_invariant
-    assert(sched::preemptable() && arch::irq_enabled());
-#endif
-#if CONF_lazy_stack
-    arch::ensure_next_stack_page();
-#endif
-    WITH_LOCK(preempt_lock) {
-
-        // We enable preemption because add_page() may take a Mutex.
-        // this loop ensures we have at least one free page that we can
-        // allocate from, in from the context of the current cpu
-        while (_free->empty()) {
-            DROP_LOCK(preempt_lock) {
-                add_page();
-            }
-        }
-
-        // We have a free page, get one object and return it to the user
-        auto it = _free->begin();
-        page_header *header = &(*it);
-        free_object* obj = header->local_free;
-        ++header->nalloc;
-        header->local_free = obj->next;
-        if (!header->local_free) {
-            _free->erase(it);
-        }
-        ret = obj;
-    }
-
-    trace_pool_alloc(this, ret);
-    return ret;
-}
-
-unsigned pool::get_size()
-{
-    return _size;
-}
-
-static inline void* untracked_alloc_page();
-static inline void untracked_free_page(void *v);
-
-void pool::add_page()
-{
-    // FIXME: this function allocated a page and set it up but on rare cases
-    // we may add this page to the free list of a different cpu, due to the
-    // enablement of preemption
-    void* page = untracked_alloc_page();
-#if CONF_lazy_stack_invariant
-    assert(sched::preemptable() && arch::irq_enabled());
-#endif
-#if CONF_lazy_stack
-    arch::ensure_next_stack_page();
-#endif
-    WITH_LOCK(preempt_lock) {
-        page_header* header = new (page) page_header;
-        header->cpu_id = mempool_cpuid();
-        header->owner = this;
-        header->nalloc = 0;
-        header->local_free = nullptr;
-        for (auto p = static_cast<char*>(page) + page_size - _size; p >= reinterpret_cast<char*>(header + 1); p -= _size) {
-            auto obj = reinterpret_cast<free_object*>(p);
-            obj->next = header->local_free;
-            header->local_free = obj;
-        }
-        _free->push_back(*header);
-        if (_free->empty()) {
-            /* encountered when starting to enable TLS for AArch64 in mixed
-               LE / IE tls models */
-            abort();
-        }
-    }
-}
-
-inline bool pool::have_full_pages()
-{
-    return !_free->empty() && _free->back().nalloc == 0;
-}
-
-void pool::free_same_cpu(free_object* obj, unsigned cpu_id)
-{
-    void* object = static_cast<void*>(obj);
-    trace_pool_free_same_cpu(this, object);
-
-    page_header* header = to_header(obj);
-    if (!--header->nalloc && have_full_pages()) {
-        if (header->local_free) {
-            _free->erase(_free->iterator_to(*header));
-        }
-        DROP_LOCK(preempt_lock) {
-            untracked_free_page(header);
-        }
-    } else {
-        if (!header->local_free) {
-            if (header->nalloc) {
-                _free->push_front(*header);
-            } else {
-                // keep full pages on the back, so they're not fragmented
-                // early, and so we find them easily in have_full_pages()
-                _free->push_back(*header);
-            }
-        }
-        obj->next = header->local_free;
-        header->local_free = obj;
-    }
-}
-
-void pool::free_different_cpu(free_object* obj, unsigned obj_cpu, unsigned cur_cpu)
-{
-    trace_pool_free_different_cpu(this, obj, obj_cpu);
-    auto sink = memory::pcpu_free_list[obj_cpu][cur_cpu];
-    sink->free(obj_cpu, obj);
-}
-
-void pool::free(void* object)
-{
-    trace_pool_free(this, object);
-
-#if CONF_lazy_stack_invariant
-    assert(sched::preemptable() && arch::irq_enabled());
-#endif
-#if CONF_lazy_stack
-    arch::ensure_next_stack_page();
-#endif
-    WITH_LOCK(preempt_lock) {
-
-        free_object* obj = static_cast<free_object*>(object);
-        page_header* header = to_header(obj);
-        unsigned obj_cpu = header->cpu_id;
-        unsigned cur_cpu = mempool_cpuid();
-
-        if (obj_cpu == cur_cpu) {
-            // free from the same CPU this object has been allocated on.
-            free_same_cpu(obj, obj_cpu);
-        } else {
-            // free from a different CPU. we try to hand the buffer
-            // to the proper worker item that is pinned to the CPU that this buffer
-            // was allocated from, so it'll free it.
-            free_different_cpu(obj, obj_cpu, cur_cpu);
-        }
-    }
-}
-
-pool* pool::from_object(void* object)
-{
-    auto header = to_header(static_cast<free_object*>(object));
-    return header->owner;
-}
-
-class malloc_pool : public pool {
-public:
-    malloc_pool();
-private:
-    static size_t compute_object_size(unsigned pos);
-};
-
-malloc_pool malloc_pools[ilog2_roundup_constexpr(page_size) + 1]
-    __attribute__((init_priority((int)init_prio::malloc_pools)));
-
-struct mark_smp_allocator_intialized {
-    mark_smp_allocator_intialized() {
-        // FIXME: Handle CPU hot-plugging.
-        auto ncpus = sched::cpus.size();
-        // Still single-threaded here, which is what the hand-over from the boot
-        // regions to llfree needs.
-        mem::frames::init(ncpus);
-        // Our malloc() is very coarse so allocate all the queues in one large buffer.
-        // We allocate at least one page because current implementation of aligned_alloc()
-        // is not capable of ensuring aligned allocation for small allocations.
-        auto buf = aligned_alloc(alignof(garbage_sink),
-                    std::max(page_size, sizeof(garbage_sink) * ncpus * ncpus));
-        pcpu_free_list = new garbage_sink**[ncpus];
-        for (auto i = 0U; i < ncpus; i++) {
-            pcpu_free_list[i] = new garbage_sink*[ncpus];
-            for (auto j = 0U; j < ncpus; j++) {
-                static_assert(!(sizeof(garbage_sink) %
-                        alignof(garbage_sink)), "garbage_sink align");
-                auto p = pcpu_free_list[i][j] = reinterpret_cast<garbage_sink *>(
-                        static_cast<char*>(buf) + sizeof(garbage_sink) * (i * ncpus + j));
-                new (p) garbage_sink;
-            }
-        }
-    }
-} s_mark_smp_alllocator_initialized __attribute__((init_priority((int)init_prio::malloc_pools)));
-
-// The per-cpu malloc pools may only be used once every cpu is running.
+// The heap may only be used once every cpu is running.
 static sched::cpu::notifier smp_allocator_notifier([] () {
     if (++smp_allocator_cnt == sched::cpus.size()) {
         mem::frames::enable_percpu();
+        // The heap wants a per-cpu bump pointer and a reservation to fill, so
+        // it can only take over once every cpu is up and the layers under it
+        // are running. Everything before this came from the early allocator.
+        mem::heap::init();
         smp_allocator = true;
     }
 });
-
-malloc_pool::malloc_pool()
-    : pool(compute_object_size(this - malloc_pools))
-{
-}
-
-size_t malloc_pool::compute_object_size(unsigned pos)
-{
-    size_t size = 1 << pos;
-    if (size > max_object_size) {
-        size = max_object_size;
-    }
-    return size;
-}
 
 page_range::page_range(size_t _size)
     : size(_size)
@@ -447,20 +133,13 @@ void oom(size_t bytes)
 
 
 
-static void* malloc_large(size_t size, size_t alignment, bool block = true, bool contiguous = true)
+// Physically contiguous memory with its size in a header. What is left of the
+// old large allocator: the heap serves everything malloc asks for that does
+// not have to be contiguous, so this is reached only through
+// alloc_phys_contiguous_aligned() and by the alignments the heap refuses.
+static void* malloc_large(size_t size, size_t alignment)
 {
     auto requested_size = size;
-
-    // Large, and free to be scattered across physical memory: a reservation
-    // and huge-page frames of its own. The record lives beside it rather than
-    // in a header inside it, so the payload starts exactly at the reservation
-    // and is aligned to 2 MiB whatever was asked for.
-    if (!contiguous && size >= mem::heap::large_min) {
-        void *obj = mem::heap::large_alloc(size);
-        trace_memory_malloc_large(obj, requested_size, size, alignment);
-        return obj;
-    }
-
     size_t offset;
     if (alignment < page_size) {
         offset = align_up(sizeof(page_range), alignment);
@@ -488,15 +167,7 @@ static void* malloc_large(size_t size, size_t alignment, bool block = true, bool
         trace_memory_malloc_large(obj, requested_size, size, alignment);
         return obj;
     }
-    if (contiguous) {
-        // The caller needs physical contiguity; a mapping cannot provide it.
-        return nullptr;
-    }
-
-    // Fall back to a mapping.
-    void* obj = mem::heap::large_alloc(requested_size);
-    trace_memory_malloc_large(obj, requested_size, size, alignment);
-    return obj;
+    return nullptr;
 }
 
 
@@ -520,141 +191,6 @@ static size_t large_object_size(void *obj)
     return header->size - offset;
 }
 
-static void* early_alloc_page()
-{
-    // Not the boot allocator: by the time the pre-SMP object allocator needs a
-    // page, llfree may already own the memory. frames::alloc() picks whichever
-    // is current.
-    return mem::frames::to_linear(mem::frames::alloc());
-}
-
-static void early_free_page(void* v)
-{
-    mem::frames::free(mem::frames::from_linear(v));
-}
-
-//
-// Following variables and functions are used to implement simple
-// early (pre-SMP) memory allocation scheme.
-mutex early_alloc_lock;
-// early_object_pages holds a pointer to the beginning of the current page
-// intended to be used for next early object allocation
-static char* early_object_page = nullptr;
-// early_alloc_next_offset points to the 0-relative address of free
-// memory within a page pointed by early_object_page. Normally it is an
-// offset of the first byte right after last byte of the previously
-// allocated object in current page. Typically it is NOT an offset
-// of next object to be allocated as we need to account for proper
-// alignment and space for 2-bytes size field preceding every
-// allocated object.
-static size_t early_alloc_next_offset = 0;
-static size_t early_alloc_previous_offset = 0;
-
-static early_page_header* to_early_page_header(void* object)
-{
-    return reinterpret_cast<early_page_header*>(
-            reinterpret_cast<std::uintptr_t>(object) & ~(page_size - 1));
-}
-
-static void setup_early_alloc_page() {
-    early_object_page = static_cast<char*>(early_alloc_page());
-    early_page_header *page_header = to_early_page_header(early_object_page);
-    // Set the owner field to null so that functions that free objects
-    // or compute object size can differentiate between post-SMP malloc pool
-    // and early (pre-SMP) allocation
-    page_header->owner = nullptr;
-    page_header->allocations_count = 0;
-    early_alloc_next_offset = sizeof(early_page_header);
-}
-
-static bool will_fit_in_early_alloc_page(size_t size, size_t alignment)
-{
-    auto lowest_offset = align_up(sizeof(early_page_header) + sizeof(unsigned short), alignment);
-    return lowest_offset + size <= page_size;
-}
-
-//
-// This function implements simple but effective scheme
-// of allocating objects of size < 4096 before SMP is setup. It does so by
-// remembering where within current page free memory starts. Then it
-// calculates next closest offset matching specified alignment
-// and verifies there is enough space until end of the current
-// page to allocate from. If not it allocates next full page
-// to find enough requested space.
-static void* early_alloc_object(size_t size, size_t alignment)
-{
-    WITH_LOCK(early_alloc_lock) {
-        if (!early_object_page) {
-            setup_early_alloc_page();
-        }
-
-        // Each object is preceded by 2 bytes (unsigned short) of size
-        // so make sure there is enough room between new object and previous one
-        size_t offset = align_up(early_alloc_next_offset + sizeof(unsigned short), alignment);
-
-        if (offset + size > page_size) {
-            setup_early_alloc_page();
-            offset = align_up(early_alloc_next_offset + sizeof(unsigned short), alignment);
-        }
-
-        // Verify we have enough space to satisfy this allocation
-        assert(offset + size <= page_size);
-
-        auto ret = early_object_page + offset;
-        early_alloc_previous_offset = early_alloc_next_offset;
-        early_alloc_next_offset = offset + size;
-
-        // Save size of the allocated object 2 bytes before it address
-        *reinterpret_cast<unsigned short *>(ret - sizeof(unsigned short)) =
-                static_cast<unsigned short>(size);
-        to_early_page_header(early_object_page)->allocations_count++;
-        return ret;
-    }
-}
-
-//
-// This function fairly rarely actually frees previously
-// allocated memory. It does so only if all objects
-// have been freed in a page based on allocations_count or
-// if the object being freed is the last one that was allocated.
-static void early_free_object(void *object)
-{
-    WITH_LOCK(early_alloc_lock) {
-        early_page_header *page_header = to_early_page_header(object);
-        assert(!page_header->owner);
-        unsigned short *size_addr = reinterpret_cast<unsigned short*>(static_cast<char*>(object) - sizeof(unsigned short));
-        unsigned short size = *size_addr;
-        if (!size) {
-            return;
-        }
-
-        *size_addr = 0; // Reset size to 0 so that we know this object was freed and prevent from freeing again
-        page_header->allocations_count--;
-        if (page_header->allocations_count <= 0) { // Any early page
-            early_free_page(page_header);
-            if (early_object_page == reinterpret_cast<char*>(page_header)) {
-                early_object_page = nullptr;
-            }
-        }
-        else if(early_object_page == reinterpret_cast<char*>(page_header)) { // Current early page
-            // Assuming we are freeing the object that was the last one allocated,
-            // simply subtract its size from the early_alloc_next_offset to arrive at the previous
-            // value of early_alloc_next_offset it was when allocating last object
-            void *last_obj = reinterpret_cast<char*>(page_header) + (early_alloc_next_offset - size);
-            // Check if we are freeing last allocated object (free followed by malloc)
-            // and deallocate if so by moving the early_alloc_next_offset to the previous
-            // position
-            if (last_obj == object) {
-                early_alloc_next_offset = early_alloc_previous_offset;
-            }
-        }
-    }
-}
-
-static size_t early_object_size(void* v)
-{
-    return *reinterpret_cast<unsigned short*>(static_cast<char*>(v) - sizeof(unsigned short));
-}
 
 static void* untracked_alloc_page()
 {
@@ -837,6 +373,7 @@ void histogram_dump()
 #else
 namespace memory {
 static inline void hist_alloc(size_t) {}
+static inline void hist_freed_sized(size_t) {}
 static inline void hist_freed() {}
 void histogram_dump() {}
 }
@@ -847,29 +384,20 @@ static inline void* std_malloc(size_t size, size_t alignment)
     if ((ssize_t)size < 0)
         return libc_error_ptr<void *>(ENOMEM);
     void *ret;
-    size_t minimum_size = std::max(size, memory::pool::min_object_size);
-    if (smp_allocator && size <= memory::pool::max_object_size && alignment <= minimum_size) {
-        unsigned n = ilog2_roundup(minimum_size);
-        ret = memory::malloc_pools[n].alloc();
+    if (mem::heap::ready() && mem::heap::takes(size, alignment)) {
+        ret = mem::heap::alloc(size, alignment);
+        trace_memory_malloc_mempool(ret, size, ret ? mem::heap::size_of(ret) : 0,
+                                    alignment);
+    } else if (!smp_allocator && mem::early::takes(size, alignment)) {
+        ret = mem::early::alloc(size, alignment);
         ret = translate_mem_area(mmu::mem_area::main, mmu::mem_area::mempool,
                                  ret);
-        trace_memory_malloc_mempool(ret, size, 1 << n, alignment);
-    } else if (smp_allocator && alignment <= memory::pool::max_object_size && minimum_size <= alignment) {
-        unsigned n = ilog2_roundup(alignment);
-        ret = memory::malloc_pools[n].alloc();
-        ret = translate_mem_area(mmu::mem_area::main, mmu::mem_area::mempool,
-                                 ret);
-        trace_memory_malloc_mempool(ret, size, 1 << n, alignment);
-    } else if (!smp_allocator && memory::will_fit_in_early_alloc_page(size,alignment)) {
-        ret = memory::early_alloc_object(size, alignment);
-        ret = translate_mem_area(mmu::mem_area::main, mmu::mem_area::mempool,
-                                 ret);
-    } else if (minimum_size <= mmu::page_size && alignment <= mmu::page_size) {
+    } else if (size <= mmu::page_size && alignment <= mmu::page_size) {
         ret = mmu::translate_mem_area(mmu::mem_area::main, mmu::mem_area::page,
                                        memory::alloc_page());
         trace_memory_malloc_page(ret, size, mmu::page_size, alignment);
     } else {
-        ret = memory::malloc_large(size, alignment, true, false);
+        ret = memory::malloc_large(size, alignment);
     }
 #if CONF_memory_tracker
     memory::tracker_remember(ret, size);
@@ -894,9 +422,12 @@ void* calloc(size_t nmemb, size_t size)
 
 static size_t object_size(void *object)
 {
-    if (!mmu::is_linear_mapped(object, 0)) {
-        return mem::heap::large_size(object);
+    if (mem::heap::owns(object)) {
+        return mem::heap::size_of(object);
     }
+    // Anything else came from before the heap existed, or from the contiguous
+    // allocator, and both of those live in the linear map.
+    assert(mmu::is_linear_mapped(object, 0));
 
     switch (mmu::get_mem_area(object)) {
     case mmu::mem_area::main:
@@ -904,13 +435,7 @@ static size_t object_size(void *object)
     case mmu::mem_area::mempool:
         object = mmu::translate_mem_area(mmu::mem_area::mempool,
                                          mmu::mem_area::main, object);
-        {
-            auto pool = memory::pool::from_object(object);
-            if (pool)
-                return pool->get_size();
-            else
-                return memory::early_object_size(object);
-        }
+        return mem::early::size_of(object);
     case mmu::mem_area::page:
         return mmu::page_size;
     default:
@@ -938,20 +463,27 @@ static inline void* std_realloc(void* object, size_t size)
     return ptr;
 }
 
-void free(void* object)
+// Everything free() does before it decides who the object goes back to.
+// False if there is nothing to give back.
+static inline bool free_bookkeeping(void *object)
 {
     trace_memory_free(object);
     if (!object) {
-        return;
+        return false;
     }
     memory::hist_freed();
 #if CONF_memory_tracker
     memory::tracker_forget(object);
 #endif
+    return true;
+}
 
-    if (!mmu::is_linear_mapped(object, 0)) {
-        return mem::heap::large_free(object);
-    }
+// Where a pointer the heap does not own goes back to: the early allocator, a
+// whole page, or the contiguous allocator. All of them are in the linear map,
+// which is what the alias in the address names.
+static void free_foreign(void *object)
+{
+    assert(mmu::is_linear_mapped(object, 0));
 
     switch (mmu::get_mem_area(object)) {
     case mmu::mem_area::page:
@@ -963,16 +495,35 @@ void free(void* object)
     case mmu::mem_area::mempool:
         object = mmu::translate_mem_area(mmu::mem_area::mempool,
                                          mmu::mem_area::main, object);
-        {
-            auto pool = memory::pool::from_object(object);
-            if (pool)
-                return pool->free(object);
-            else
-                return memory::early_free_object(object);
-        }
+        return mem::early::free(object);
     default:
         abort();
     }
+}
+
+void free(void* object)
+{
+    if (!free_bookkeeping(object)) {
+        return;
+    }
+    if (mem::heap::owns(object)) {
+        return mem::heap::free(object);
+    }
+    free_foreign(object);
+}
+
+// The same with the size the caller kept, which is what operator delete has.
+static inline void free_sized(void *object, size_t bytes)
+{
+    if (!free_bookkeeping(object)) {
+        return;
+    }
+    memory::hist_freed_sized(bytes);
+    if (mem::heap::owns(object)) {
+        return mem::heap::free(object, bytes);
+    }
+    // Not the heap's, and nothing else here can use a size.
+    free_foreign(object);
 }
 
 void* malloc(size_t size)
@@ -1097,44 +648,31 @@ extern "C" void free_contiguous_aligned(void* p, size_t size)
     memory::free_phys_contiguous_aligned(p, size);
 }
 
-#if CONF_memory_histogram
 /*
  * The sized forms of operator delete. libc++ defines these weakly as a plain
  * free(), which drops the one thing the compiler went to the trouble of
- * supplying. Defining them here overrides that and lets the size be counted --
- * and is what a heap wanting sized free would hook.
+ * supplying: the compiler emits the size at every delete of a known type, and
+ * the histogram says that is 99.6% of the frees two real applications make.
+ * Defining them here keeps it and hands it to the heap.
  */
 #include <new>
 
 void operator delete(void *p, size_t n) noexcept
 {
-    if (p) {
-        memory::hist_freed_sized(n);
-    }
-    free(p);
+    free_sized(p, n);
 }
 
 void operator delete[](void *p, size_t n) noexcept
 {
-    if (p) {
-        memory::hist_freed_sized(n);
-    }
-    free(p);
+    free_sized(p, n);
 }
 
 void operator delete(void *p, size_t n, std::align_val_t) noexcept
 {
-    if (p) {
-        memory::hist_freed_sized(n);
-    }
-    free(p);
+    free_sized(p, n);
 }
 
 void operator delete[](void *p, size_t n, std::align_val_t) noexcept
 {
-    if (p) {
-        memory::hist_freed_sized(n);
-    }
-    free(p);
+    free_sized(p, n);
 }
-#endif

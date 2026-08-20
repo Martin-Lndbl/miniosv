@@ -7,6 +7,7 @@
  * underneath have their own suite in os-memory-primitives.cc.
  */
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -15,6 +16,7 @@
 #include <thread>
 #include <vector>
 
+#include <malloc.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -65,6 +67,159 @@ void heap_functional()
         for (void *q : p) {
             free(q);
         }
+    }
+
+    section("an allocation is usable to the size it reports");
+    {
+        // Every size class boundary the allocator might have, and the sizes
+        // either side of them. What is checked is the promise malloc makes:
+        // the block is at least as big as asked for, malloc_usable_size says
+        // how big, and all of that is writable.
+        bool ok = true;
+        for (size_t n = 1; n <= (4ul << 20); n = n + (n >> 2) + 1) {
+            auto *q = static_cast<unsigned char *>(malloc(n));
+            CHECK(q != nullptr);
+            if (!q) {
+                break;
+            }
+            size_t usable = malloc_usable_size(q);
+            ok = ok && usable >= n;
+            memset(q, 0xd7, usable);
+            ok = ok && q[usable - 1] == 0xd7;
+            // Aligned for any type, which is what malloc promises and what a
+            // size class rounded to a power of two gives for free.
+            ok = ok && (reinterpret_cast<uintptr_t>(q) & (alignof(max_align_t) - 1)) == 0;
+            free(q);
+        }
+        CHECK(ok);
+    }
+
+    section("an aligned allocation is aligned");
+    {
+        bool ok = true;
+        for (size_t align = sizeof(void *); align <= 2048; align *= 2) {
+            for (size_t n : {align / 2, align, align * 3, size_t(100000)}) {
+                void *q = nullptr;
+                ok = ok && posix_memalign(&q, align, n ? n : 1) == 0;
+                ok = ok && q != nullptr;
+                if (!q) {
+                    continue;
+                }
+                ok = ok && (reinterpret_cast<uintptr_t>(q) & (align - 1)) == 0;
+                free(q);
+            }
+        }
+        CHECK(ok);
+    }
+
+    section("delete gives back what new took, sized or not");
+    {
+        // The sized form of operator delete is what the compiler emits for a
+        // type it knows, and it is a different entry point from free(). Both
+        // have to reach the same allocator, or one of them corrupts it.
+        struct block { char c[200]; };
+        const int n = 20000;
+        std::vector<block *> p(n);
+        for (int i = 0; i < n; i++) {
+            p[i] = new block;          // NOLINT: the point is the delete below
+            p[i]->c[0] = char(i);
+        }
+        bool ok = true;
+        for (int i = 0; i < n; i++) {
+            ok = ok && p[i]->c[0] == char(i);
+        }
+        CHECK(ok);
+        for (int i = 0; i < n; i++) {
+            delete p[i];               // sized: the type is known here
+        }
+        // And the unsized form, through the array shape.
+        for (int i = 0; i < n; i++) {
+            p[i] = reinterpret_cast<block *>(new char[sizeof(block)]);
+        }
+        for (int i = 0; i < n; i++) {
+            delete[] reinterpret_cast<char *>(p[i]);
+        }
+    }
+
+    section("memory comes back when the objects do");
+    {
+        // Enough to need many pages of whatever the allocator carves, cycled
+        // so that each round can only be served from what the last gave back.
+        const int n = 8192;
+        const size_t size = 3000;
+        std::vector<void *> p(n);
+        auto cycle = [&] {
+            for (int i = 0; i < n; i++) {
+                p[i] = malloc(size);
+                escape(p[i]);
+            }
+            for (int i = 0; i < n; i++) {
+                free(p[i]);
+            }
+        };
+        cycle();                       // first round warms whatever is cached
+        size_t before = free_bytes();
+        for (int r = 0; r < 20; r++) {
+            cycle();
+        }
+        long drift = long(before) - long(free_bytes());
+        // 20 rounds of 24 MiB: an allocator that never reused a page would be
+        // half a gigabyte down, so the bar is loose and still decisive. It is
+        // also free memory of the whole system, which nothing here controls.
+        CHECK(drift < long(64ul << 20));
+        printf("      %d x %zu B, %d rounds: drift %ld KiB\n", n, size, 20, drift >> 10);
+    }
+
+    section("a working set too big to cache is recycled correctly");
+    {
+        // Big enough that the emptied pages cannot all be held back, so their
+        // addresses are handed out again rather than simply reused. That is
+        // where an allocator that recycles an address before the hardware has
+        // forgotten the old translation goes wrong, and it goes wrong across
+        // cpus: the thread that writes sees its own store either way, and only
+        // another one reading the same address sees the wrong frame.
+        const size_t size = 64ul << 10;
+        size_t budget = free_bytes() / 8 / n_cpus() / size;
+        size_t each = std::min(std::max(budget, size_t(16)), size_t(2048));
+
+        std::atomic<int> bad{0};
+        size_t before = free_bytes();
+        for (int round = 0; round < 8; round++) {
+            parallel(n_cpus(), [&](unsigned id) {
+                std::vector<char *> q(each);
+                for (size_t i = 0; i < each; i++) {
+                    q[i] = static_cast<char *>(malloc(size));
+                    if (!q[i]) {
+                        bad.fetch_add(1);
+                        continue;
+                    }
+                    // One mark per 4 KiB, so a page recycled underneath the
+                    // block shows up wherever the seam falls.
+                    for (size_t off = 0; off < size; off += page) {
+                        q[i][off] = char(id * 31 + i);
+                    }
+                }
+                for (size_t i = 0; i < each; i++) {
+                    if (!q[i]) {
+                        continue;
+                    }
+                    for (size_t off = 0; off < size; off += page) {
+                        if (q[i][off] != char(id * 31 + i)) {
+                            bad.fetch_add(1);
+                        }
+                    }
+                    free(q[i]);
+                }
+            });
+        }
+        CHECK(bad.load() == 0);
+        // What is still out is whatever the allocator caches -- a fraction of
+        // memory, by design. The bar is a quarter of it, which a leak of even
+        // one round's working set would clear.
+        long drift = long(before) - long(free_bytes());
+        CHECK(drift < long(before / 4));
+        printf("      %zu x %zu KiB per cpu, 8 rounds: drift %ld KiB of %ld MiB\n",
+               each, size >> 10, drift >> 10, long(before >> 20));
     }
 
     section("realloc preserves contents, calloc zeroes");

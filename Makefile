@@ -142,6 +142,9 @@ conf_core_dynamic_percpu_size=65536
 
 # --- memory ----------------------------------------------------------------
 conf_memory_pressure_percent=10
+# Count allocation sizes and how many frees arrive knowing the size. For
+# deciding what the heap can recover from an address; off in a normal build.
+conf_memory_histogram=0
 
 # --- filesystem ------------------------------------------------------------
 # miniext is a minimal ext4-compatible filesystem the application calls
@@ -352,7 +355,8 @@ $(out)/libc/%.o: source-dialects =
 # do not hide symbols in libc because it has its own hiding mechanism
 
 kernel-defines = -D_KERNEL $(source-dialects) \
-	-DCONF_fs_miniext=$(conf_fs_miniext)
+	-DCONF_fs_miniext=$(conf_fs_miniext) \
+	-DCONF_memory_histogram=$(conf_memory_histogram)
 
 # This play the same role as "_KERNEL", but _KERNEL unfortunately is too
 # overloaded. A lot of files will expect it to be set no matter what, specially
@@ -684,6 +688,13 @@ objects += core/mem/mapping/mapping.o
 objects += core/mem/mapping/flush.o
 objects += arch/$(arch)/mem/hw.o
 objects += arch/$(arch)/mem/fault.o
+
+# The sub-page allocator. So far only the path for allocations big enough to
+# get a reservation of their own.
+objects += core/mem/early.o
+objects += core/mem/heap/large.o
+objects += core/mem/heap/objects.o
+objects += core/mem/heap/window.o
 
 # Not ours: llfree is vendored C, and does not build under the kernel's -Werror.
 $(out)/external/llfree/%.o: CFLAGS += -w -Wno-error -I external/llfree

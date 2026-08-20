@@ -96,6 +96,15 @@ pte_ref find(uintptr_t addr)
     }
 }
 
+frames::phys_addr to_phys(uintptr_t addr)
+{
+    auto e = find(addr);
+    if (!e) {
+        return frames::no_memory;
+    }
+    return e.addr() + (addr & (e.size() - 1));
+}
+
 pte_ref prepare(uintptr_t addr, size_t leaf_size)
 {
     unsigned target = level_of(leaf_size);

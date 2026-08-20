@@ -4,7 +4,7 @@
  * Subsystems that can relinquish memory register a callback here and are notified
  * when free memory falls below a threshold. 
  * 
- * Callbacks runs on the allocation path, so must not block or allocate.
+ * Callbacks run on the allocation path, so must not block or allocate.
  */
 
 #include <atomic>
@@ -39,22 +39,32 @@ void watch_pressure(pressure_watcher &w, pressure_fn cb)
     }
 }
 
-void check_pressure()
+bool reclaim()
 {
     pressure_watcher *head = watchers.load(std::memory_order_acquire);
-    if (!head || !threshold || free_bytes() >= threshold) {
-        return;
+    if (!head) {
+        return false;
     }
     // One responder at a time: the callbacks free memory, and re-entering from
     // inside one would recurse.
     bool expected = false;
     if (!in_callback.compare_exchange_strong(expected, true)) {
-        return;
+        return false;
     }
+    bool gave = false;
     for (pressure_watcher *w = head; w; w = w->next) {
-        w->fn();
+        gave |= w->fn();
     }
     in_callback.store(false);
+    return gave;
+}
+
+void check_pressure()
+{
+    if (!threshold || free_bytes() >= threshold) {
+        return;
+    }
+    reclaim();
 }
 
 } // namespace frames

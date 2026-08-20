@@ -61,6 +61,9 @@ private:
 // Find the leaf (PTE or PDE) for "addr", if any.
 pte_ref find(uintptr_t addr);
 
+// The physical address "addr" resolves to, or no_memory if nothing is mapped.
+frames::phys_addr to_phys(uintptr_t addr);
+
 // Populate the table down to the level that can hold a leaf of "leaf_size",
 // and returns a pointer to that leaf.
 pte_ref prepare(uintptr_t addr, size_t leaf_size = page_size);

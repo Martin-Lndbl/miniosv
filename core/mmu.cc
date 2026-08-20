@@ -47,7 +47,13 @@ void* phys_to_virt(mem::frames::phys_addr pa)
 
 mem::frames::phys_addr virt_to_phys(void *virt)
 {
-    return mem::frames::from_linear(virt);
+    if (is_linear_mapped(virt, 0)) {
+        return mem::frames::from_linear(virt);
+    }
+    // Not every address a driver hands to hardware is one of the linear map's
+    // any more: the heap maps its own pages, and the page table is the only
+    // thing that knows where they are.
+    return mem::mapping::to_phys(reinterpret_cast<uintptr_t>(virt));
 }
 
 static mem::range page_range(const void *addr, size_t size)

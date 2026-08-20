@@ -41,9 +41,15 @@ size_t total_available_bytes();
 // Total usable RAM as the firmware reported it. Set during arch setup.
 extern size_t phys_mem_size;
 
-// Called when free memory falls below conf_memory_pressure_percent of the
-// total. Callbacks run on the freeing path, so they must not block.
-using pressure_fn = void (*)();
+/*
+ * Clients that hold memory they could give back.
+ *
+ * A callback returns whether it actually gave something, so that a caller with
+ * nothing left to allocate can keep asking until the answer is no. They run
+ * inside alloc(), so they must not wait for anything -- not a mutex a
+ * allocating thread could hold, and not a tlb shootdown.
+ */
+using pressure_fn = bool (*)();
 
 struct pressure_watcher {
     pressure_fn fn = nullptr;
@@ -51,7 +57,14 @@ struct pressure_watcher {
 };
 
 void watch_pressure(pressure_watcher &w, pressure_fn cb);
+
+// One pass over the watchers when free memory is below
+// conf_memory_pressure_percent of the total.
 void check_pressure();
+
+// One pass regardless, for a caller that has just failed to allocate. False if
+// nothing was given back, so a retry loop terminates.
+bool reclaim();
 
 // Boot. add_region() collects memory before there is an allocator to put it in;
 // init() builds llfree and hands it everything still unused.

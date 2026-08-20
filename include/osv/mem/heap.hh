@@ -1,10 +1,5 @@
 /*
- * The sub-page allocator.
- *
- * Objects are packed into pages that are reclaimed whole when the last object
- * in them dies, so fragmentation is handled by the mmu rather than by
- * coalescing. Allocations too big for that get a reservation and frames of
- * their own, which is what is here so far.
+ * The heap allocator.
  *
  * This work is open source software, licensed under the terms of the
  * BSD license as described in the LICENSE file in the top-level directory.
@@ -18,22 +13,28 @@
 namespace mem {
 namespace heap {
 
-// From here up, an allocation is worth a reservation of its own: the frames
-// behind it are a whole number of huge pages and the mapping is one leaf each.
-constexpr size_t large_min = 2ul << 20;
+// Reserve the window and the page descriptors.
+void init();
+bool ready();
 
-// Reserve, allocate and map `bytes`, or null if any of the three fails.
-// The result is aligned to large_min, so it satisfies any alignment up to it.
-void *large_alloc(size_t bytes);
+// Check if the heap can satisfy an allocation of "bytes" with at least "alignment".
+bool takes(size_t bytes, size_t alignment);
 
-// Give back what large_alloc returned. The pointer must be one of its results.
-void large_free(void *p);
+// Take an object of "bytes", aligned to at least "alignment".
+void *alloc(size_t bytes, size_t alignment);
 
-// What large_alloc was asked for, which is less than what it mapped.
-size_t large_size(void *p);
+// Give back an object alloc() returned.
+void free(void *p);
 
-// True if this address is one large_alloc handed out.
-bool is_large(void *p);
+// The same from a caller that knows the size, which C++ supplies at every
+// delete of a known type.
+void free(void *p, size_t bytes);
+
+// The size class of an object.
+size_t size_of(void *p);
+
+// True if this address is one alloc() handed out.
+bool owns(void *p);
 
 }
 }

@@ -29,7 +29,7 @@ enum {
     sched,
     clock,
     tracepoint_base,
-    malloc_pools,
+    frame_allocator,
     idt,
 };
 }

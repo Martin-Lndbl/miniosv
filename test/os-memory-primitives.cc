@@ -15,6 +15,7 @@
 #include <thread>
 #include <vector>
 
+#include <malloc.h>
 #include <sys/mman.h>
 
 #include <osv/contiguous_alloc.hh>
@@ -963,108 +964,90 @@ void mapping_perf()
 
 /* heap -------------------------------------------------------------------- */
 
-namespace heap = mem::heap;
-
+/*
+ * Only what needs to see inside. How the heap behaves as an allocator is in
+ * os-memory.cc, through malloc, so that the same checks run on Linux and OSv;
+ * what is here is the part of its design that is invisible from there -- that
+ * a big allocation is one huge leaf rather than 512 small ones.
+ */
 void heap_functional()
 {
     group("heap");
 
-    section("a large allocation is huge-page aligned and writable throughout");
+    section("a large allocation is backed by huge pages");
     {
         const size_t bytes = 5 * huge / 2;    // not a whole number of huge pages
-        void *p = heap::large_alloc(bytes);
+        auto *p = static_cast<char *>(malloc(bytes));
         CHECK(p != nullptr);
-        CHECK((reinterpret_cast<uintptr_t>(p) & (huge - 1)) == 0);
-        CHECK(heap::is_large(p));
-        CHECK(heap::large_size(p) == bytes);
+        CHECK(malloc_usable_size(p) >= bytes);
 
-        // The last byte the caller was promised is as reachable as the first,
-        // which is what the rounding up to whole huge pages is for.
-        auto *c = static_cast<char*>(p);
-        memset(c, 0x3c, bytes);
-        CHECK(c[0] == 0x3c);
-        CHECK(c[bytes - 1] == 0x3c);
-
-        // Whole huge pages, so the mapping is one leaf each rather than 512.
+        // One entry per 2 MiB, over a frame aligned to it. This is the whole
+        // reason the heap asks for huge pages: 512 times fewer entries, and a
+        // TLB that can cover the allocation.
         auto e = map::find(reinterpret_cast<uintptr_t>(p));
         CHECK(bool(e));
         CHECK(e.level() == 1);
+        CHECK((e.addr() & (huge - 1)) == 0);
 
-        heap::large_free(p);
-        CHECK(!map::find(reinterpret_cast<uintptr_t>(p)));
-        CHECK(!heap::is_large(p));
-    }
-
-    section("large allocations are distinct, and the frames come back");
-    {
-        const size_t bytes = huge;
-        size_t before = mem::frames::free_bytes();
-        void *p[8];
-        for (auto &q : p) {
-            q = heap::large_alloc(bytes);
-            CHECK(q != nullptr);
-        }
-        for (unsigned i = 0; i < 8; i++) {
-            memset(p[i], char(i), bytes);
-        }
-        for (unsigned i = 0; i < 8; i++) {
-            CHECK(static_cast<char*>(p[i])[bytes - 1] == char(i));
-        }
-        CHECK(before - mem::frames::free_bytes() >= 8 * bytes);
-
-        for (auto q : p) {
-            heap::large_free(q);
-        }
-        // Each allocation also costs the page its record sits in, which is
-        // given back with it.
-        CHECK(mem::frames::free_bytes() >= before - page);
-    }
-
-    section("malloc of this size goes through the large path");
-    {
-        const size_t bytes = 3 * huge;
-        void *p = malloc(bytes);
-        CHECK(p != nullptr);
-        CHECK(heap::is_large(p));
-        CHECK(malloc_usable_size(p) == bytes);
-        memset(p, 0x11, bytes);
+        // The last byte promised is as reachable as the first, which is what
+        // rounding the mapping up to whole huge pages is for.
+        memset(p, 0x3c, bytes);
+        CHECK(p[bytes - 1] == 0x3c);
         free(p);
     }
-}
 
-void heap_perf()
-{
-    group("heap perf");
-
-    section("large_alloc + large_free");
+    section("the heap gives its pages back when there is nothing else left");
     {
-        struct { const char *label; size_t bytes; int n; } cases[] = {
-            {"2 MiB",   huge,      2000},
-            {"16 MiB",  8 * huge,   500},
-            {"128 MiB", 64 * huge,   60},
-        };
-        for (auto &c : cases) {
-            auto t0 = clk::now();
-            for (int i = 0; i < c.n; i++) {
-                void *p = heap::large_alloc(c.bytes);
-                escape(p);
-                heap::large_free(p);
+        // The heap keeps a page that empties, however many there are, because
+        // taking it again is not free and nothing has said the memory is
+        // wanted elsewhere. What makes that safe is frames::alloc() asking for
+        // it before it fails, and this is the only thing that asks.
+        const size_t size = 64ul << 10;
+        size_t before = mem::frames::free_bytes();
+        size_t n = before / 2 / size;
+        std::vector<void *> p(n);
+        for (size_t i = 0; i < n; i++) {
+            p[i] = malloc(size);
+        }
+        for (size_t i = 0; i < n; i++) {
+            free(p[i]);
+        }
+        size_t held = before - mem::frames::free_bytes();
+        CHECK(held > before / 8);      // it really is holding it
+
+        // Ask for more than is free but not for all of what it holds, so that
+        // the rest of the kernel is never actually out of memory.
+        size_t want = mem::frames::free_bytes() + held / 2;
+        std::vector<mem::frames::phys_addr> blocks;
+        blocks.reserve(want / huge + 1);
+        bool ok = true;
+        for (size_t got = 0; got < want && ok; got += huge) {
+            auto f = mem::frames::alloc(huge, huge);
+            ok = f != mem::frames::no_memory;
+            if (ok) {
+                blocks.push_back(f);
             }
-            report_ns(c.label, since(t0), c.n);
+        }
+        CHECK(ok);
+        printf("      heap held %zu MiB, then gave up %zu MiB of it\n",
+               held >> 20, (blocks.size() * huge - (want - held / 2)) >> 20);
+        for (auto f : blocks) {
+            mem::frames::free(f, huge);
         }
     }
 
-    section("the first touch of a large allocation");
+    section("the pages under an allocation are given back");
     {
-        const size_t bytes = 64 * huge;
-        void *p = heap::large_alloc(bytes);
-        auto t0 = clk::now();
+        const size_t bytes = 8 * huge;
+        size_t before = mem::frames::free_bytes();
+        void *p = malloc(bytes);
+        CHECK(p != nullptr);
         memset(p, 0x5a, bytes);
-        double s = since(t0);
-        escape(p);
-        printf("    %-46s %9.2f GiB/s\n", "memset over 128 MiB",
-               double(bytes) / s / (1ul << 30));
-        heap::large_free(p);
+        CHECK(before - mem::frames::free_bytes() >= bytes);
+        free(p);
+        // The mapping goes with the frames, so nothing can be reached there.
+        CHECK(!map::find(reinterpret_cast<uintptr_t>(p)));
+        CHECK(mem::frames::free_bytes() >= before - huge);
     }
 }
 
@@ -1083,7 +1066,6 @@ int os_memory_primitives_main()
     mapping_functional();
     mapping_perf();
     heap_functional();
-    heap_perf();
 
     return summary("MEMORY PRIMITIVE");
 }
