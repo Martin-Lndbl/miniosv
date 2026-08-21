@@ -17,7 +17,7 @@
 #include <list>
 #include <stdio.h>
 
-#include <osv/mmu.hh>
+#include <osv/mem/heap.hh>
 
 #include <osv/debug.hh>
 #include <osv/prio.hh>
@@ -142,13 +142,11 @@ namespace pthread_private {
             return {attr.stack_begin, attr.stack_size};
         }
         size_t size = attr.stack_size;
-#if CONF_lazy_stack
-        unsigned stack_flags = 0;
-#else
-        unsigned stack_flags = mmu::mmap_populate;
-#endif
-        void *addr = mmu::map_anon(nullptr, size, stack_flags, mmu::perm_rw);
-        mmu::mprotect(addr, attr.guard_size, 0);
+        void *addr = mem::heap::alloc_pages(size, mem::perm_rw);
+        if (!addr) {
+            throw std::bad_alloc();
+        }
+        mem::heap::protect(addr, attr.guard_size, mem::perm_none);
         sched::thread::stack_info si{addr, size};
         si.deleter = free_stack;
         return si;
@@ -156,7 +154,7 @@ namespace pthread_private {
 
     void pthread::free_stack(sched::thread::stack_info si)
     {
-        mmu::munmap(si.begin, si.size);
+        mem::heap::free(si.begin);
     }
 
     int pthread::join(void** retval)

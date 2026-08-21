@@ -24,7 +24,6 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <osv/clock.hh>
-#include <osv/mempool.hh>
 #include <osv/version.h>
 #include <osv/stubbing.hh>
 
