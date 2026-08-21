@@ -23,6 +23,9 @@
 #if CONF_drivers_acpi
 #include "drivers/acpi.hh"
 #endif
+#if CONF_drivers_ena
+#include "drivers/enav2/ena.hh"
+#endif
 #if CONF_drivers_nvme
 #include "drivers/nvme.hh"
 #endif
@@ -241,6 +244,9 @@ void arch_init_drivers()
 
     // Initialize all drivers
     hw::driver_manager* drvman = hw::driver_manager::instance();
+#if CONF_drivers_ena
+    drvman->register_driver(aws::ena::probe);
+#endif
 #if CONF_drivers_nvme
     drvman->register_driver(nvme::nvme_driver::probe);
 #endif

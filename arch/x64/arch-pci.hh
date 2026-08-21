@@ -21,6 +21,11 @@ using processor::outb;
 using processor::outw;
 using processor::outl;
 
+// Bounds of arch_add_bar's MMIO pool; the bridge driver needs them to
+// widen its memory windows to cover any BAR we hand out from here.
+u64 get_pci_mem_base();
+u64 get_pci_mem_end();
+
 } /* namespace pci */
 
 class pci_interrupt : public gsi_level_interrupt {

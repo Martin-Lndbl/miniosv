@@ -5,7 +5,9 @@
  * BSD license as described in the LICENSE file in the top-level directory.
  */
 
-#include <osv/debug.hh>
+#include <algorithm>
+
+#include <osv/align.hh>
 #include <osv/pci.hh>
 #include "drivers/pci-function.hh"
 
@@ -72,12 +74,50 @@ void write_pci_config_byte(u8 bus, u8 slot, u8 func, u8 offset, u8 val)
     outb(val, PCI_CONFIG_DATA + (offset & 0x03));
 }
 
+// MMIO pool for BARs that platform firmware left unassigned. Classic
+// QEMU/KVM x86 (c5.large etc.) programs every BAR up front so this pool
+// stays unused; AWS Nitro Gen 5 (c7i.large) leaves the downstream ENA VF
+// at zero. 0xE000_0000+ sits above where firmware usually packs BARs but
+// well below the IOAPIC (0xFEC0_0000) and LAPIC (0xFEE0_0000).
+static constexpr u64 pci_mem_pool_base = 0xE0000000ull;
+static constexpr u64 pci_mem_pool_end  = 0xF0000000ull;
+static u64 pci_mem_next = pci_mem_pool_base;
+
+u64 get_pci_mem_base() { return pci_mem_pool_base; }
+u64 get_pci_mem_end()  { return pci_mem_pool_end; }
+
 u32 pci::function::arch_add_bar(u32 val, u32 pos, bool is_mmio, bool is_64, u64 addr_size)
 {
-    /* nothing to do on X86 since firmware already sets to sane values.
-     * why is this not available on other archs (ARM) as well? Damn.
-     */
-    return val;
+    // Firmware pre-assigned an address? Keep it.
+    u64 addr = val & (is_mmio ? function::PCI_BAR_MEM_ADDR_LO_MASK
+                              : function::PCI_BAR_PIO_ADDR_MASK);
+    if (is_64) {
+        addr |= ((u64)pci_readl(pos + 4)) << 32;
+    }
+    if (addr != 0) {
+        return val;
+    }
+    // PIO isn't managed here — the 64 KiB space is firmware's, and no
+    // device we care about (ENA VF is MMIO-only) needs an allocation.
+    if (!is_mmio) {
+        return val;
+    }
+
+    // Naturally-aligned bump-alloc (same rule as arch/aarch64/pci.cc).
+    u64 align = std::max<u64>(16, addr_size);
+    u64 alloc = align_up(pci_mem_next, align);
+    if (alloc + addr_size > pci_mem_pool_end) {
+        return val;
+    }
+    pci_mem_next = alloc + addr_size;
+
+    u32 lo = (val & ~function::PCI_BAR_MEM_ADDR_LO_MASK)
+             | ((u32)alloc & function::PCI_BAR_MEM_ADDR_LO_MASK);
+    pci_writel(pos, lo);
+    if (is_64) {
+        pci_writel(pos + 4, (u32)(alloc >> 32));
+    }
+    return lo;
 }
 
 } /* namespace pci */
