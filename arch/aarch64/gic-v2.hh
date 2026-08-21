@@ -1,3 +1,4 @@
+#include <osv/mem/phys.hh>
 /*
  * Copyright (C) 2014 Huawei Technologies Duesseldorf GmbH
  * Copyright (C) 2024 Waldemar Kozaczuk
@@ -10,6 +11,8 @@
 #define GIC_V2_HH
 
 #include "gic-common.hh"
+#include <osv/mem/mapping.hh>
+#include <osv/mem/frames.hh>
 
 namespace gic {
 
@@ -64,8 +67,8 @@ public:
         _gicd(d, d_len), _gicc(c, c_len), _v2m_base(v2m)
     {
         if (v2m && v2m_len) {
-            mmu::linear_map((void *)_v2m_base, _v2m_base, v2m_len, "gic_v2m",
-                            mmu::page_size, mmu::mattr::dev);
+            mem::map_phys_at((void *)_v2m_base, _v2m_base, v2m_len,
+                            mem::mapping::page_size, mem::mattr::dev);
         }
     }
 

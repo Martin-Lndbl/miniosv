@@ -20,9 +20,6 @@
 #include <osv/align.hh>
 #include <osv/debug.hh>
 #include <osv/kernel_config.h>
-#if CONF_memory_tracker
-#include <osv/alloctracker.hh>
-#endif
 #include <atomic>
 #include <osv/trace.hh>
 #include <osv/sched.hh>
@@ -35,9 +32,7 @@
 
 TRACEPOINT(trace_memory_malloc, "buf=%p, len=%d, align=%d", void *, size_t,
            size_t);
-TRACEPOINT(trace_memory_malloc_mempool, "buf=%p, req_len=%d, alloc_len=%d,"
-           " align=%d", void*, size_t, size_t, size_t);
-TRACEPOINT(trace_memory_malloc_large, "buf=%p, req_len=%d, alloc_len=%d,"
+TRACEPOINT(trace_memory_malloc_heap, "buf=%p, req_len=%d, alloc_len=%d,"
            " align=%d", void*, size_t, size_t, size_t);
 TRACEPOINT(trace_memory_free, "buf=%p", void *);
 TRACEPOINT(trace_memory_realloc, "in=%p, newlen=%d, out=%p", void *, size_t, void *);
@@ -52,27 +47,6 @@ extern "C" {
     size_t malloc_usable_size(void *object);
 }
 
-namespace memory {
-
-#if CONF_memory_tracker
-alloc_tracker tracker;
-bool tracker_enabled = false;
-static inline void tracker_remember(void *addr, size_t size)
-{
-    if (__builtin_expect(tracker_enabled, false)) {
-        tracker.remember(addr, size);
-    }
-}
-static inline void tracker_forget(void *addr)
-{
-    if (__builtin_expect(tracker_enabled, false)) {
-        tracker.forget(addr);
-    }
-}
-#endif
-
-}
-
 static inline void* std_malloc(size_t size, size_t alignment)
 {
     if ((ssize_t)size < 0)
@@ -80,14 +54,11 @@ static inline void* std_malloc(size_t size, size_t alignment)
     void *ret;
     if (mem::heap::ready() && mem::heap::takes(size, alignment)) {
         ret = mem::heap::alloc(size, alignment);
-        trace_memory_malloc_mempool(ret, size, ret ? mem::heap::size_of(ret) : 0,
-                                    alignment);
+        trace_memory_malloc_heap(ret, size, ret ? mem::heap::size_of(ret) : 0,
+                                 alignment);
     } else {
         ret = mem::early::alloc(size, alignment);
     }
-#if CONF_memory_tracker
-    memory::tracker_remember(ret, size);
-#endif
     mem::heap::hist_alloc(size);
     return ret;
 }
@@ -144,19 +115,9 @@ static inline bool free_bookkeeping(void *object)
         return false;
     }
     mem::heap::hist_freed();
-#if CONF_memory_tracker
-    memory::tracker_forget(object);
-#endif
     return true;
 }
 
-// Where a pointer the heap does not own goes back to: the early allocator, a
-// whole page, or the contiguous allocator. All of them are in the linear map,
-// which is what the alias in the address names.
-static void free_foreign(void *object)
-{
-    mem::early::free(object);
-}
 
 void free(void* object)
 {
@@ -166,7 +127,8 @@ void free(void* object)
     if (mem::heap::owns(object)) {
         return mem::heap::free(object);
     }
-    free_foreign(object);
+    // Anything else came from before the heap existed.
+    mem::early::free(object);
 }
 
 // The same with the size the caller kept, which is what operator delete has.
@@ -179,8 +141,7 @@ static inline void free_sized(void *object, size_t bytes)
     if (mem::heap::owns(object)) {
         return mem::heap::free(object, bytes);
     }
-    // Not the heap's, and nothing else here can use a size.
-    free_foreign(object);
+    mem::early::free(object);
 }
 
 void* malloc(size_t size)
@@ -269,19 +230,6 @@ OSV_LIBC_API
 void *memalign(size_t alignment, size_t size)
 {
     return aligned_alloc(alignment, size);
-}
-
-// Straight to the frame allocator: the caller passes the size back at free
-// time, so there is no header, and therefore no need for the allocation to be
-// offset to keep a header out of the payload's way.
-extern "C" void* alloc_contiguous_aligned(size_t size, size_t align)
-{
-    return memory::alloc_phys_contiguous_aligned(size, align, true);
-}
-
-extern "C" void free_contiguous_aligned(void* p, size_t size)
-{
-    memory::free_phys_contiguous_aligned(p, size);
 }
 
 /*

@@ -4,7 +4,8 @@
 #include <cstring>
 
 #if CONF_drivers_nvme
-#include <osv/contiguous_alloc.hh>
+#include <osv/mem/frames.hh>
+#include <osv/mem/phys.hh>
 #include <osv/sched.hh>
 
 #include "drivers/nvme.hh"
@@ -81,11 +82,11 @@ std::string read_bootargs()
 #if CONF_drivers_nvme
     // The read has to land in DMA-capable memory, so it cannot go straight
     // into a stack buffer.
-    auto *buf = static_cast<uint8_t *>(
-        memory::alloc_phys_contiguous_aligned(512, 512));
-    if (!buf) {
+    mem::frames::phys_addr pa = mem::frames::alloc(512, 512);
+    if (pa == mem::frames::no_memory) {
         return {};
     }
+    auto *buf = static_cast<uint8_t *>(mem::map_phys(pa, 512));
     memset(buf, 0, 512);
 
     std::string out;
@@ -100,7 +101,7 @@ std::string read_bootargs()
             out.assign(blk->args, len);
         }
     }
-    memory::free_phys_contiguous_aligned(buf, 512);
+    mem::frames::free(pa, 512);
     return out;
 #else
     return {};

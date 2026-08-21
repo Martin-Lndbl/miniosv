@@ -19,15 +19,15 @@
 #include <malloc.h>
 #include <sys/mman.h>
 
-#include <osv/contiguous_alloc.hh>
+#include <osv/align.hh>
+#include <osv/mem/early.hh>
 #include <osv/mem/frames.hh>
 #include <osv/mem/heap.hh>
 #include <osv/mem/mapping.hh>
 #include <osv/mem/pagecache.hh>
+#include <osv/mem/phys.hh>
 #include <osv/mem/store.hh>
 #include <osv/mem/vspace.hh>
-#include <osv/mempool.hh>
-#include <osv/mmu.hh>
 
 #include "core/mem/linear.hh"
 #include "mem-test.hh"
@@ -37,7 +37,7 @@ using namespace memtest;
 namespace {
 
 const size_t page = mem::frames::page_size;
-const size_t huge = mmu::huge_page_size;
+const size_t huge = mem::mapping::huge_page_size;
 
 using resa = mem::vspace::resa_result;
 
@@ -52,9 +52,9 @@ void frames_functional()
         const int n = 64;
         void *p[n];
         for (int i = 0; i < n; i++) {
-            p[i] = memory::alloc_page();
+            p[i] = mem::frames::to_linear(mem::frames::alloc());
             CHECK(p[i] != nullptr);
-            CHECK(mmu::is_page_aligned(p[i]));
+            CHECK((reinterpret_cast<uintptr_t>(p[i]) % page) == 0);
             memset(p[i], 0xa5, page);
         }
         for (int i = 0; i < n; i++) {
@@ -64,7 +64,7 @@ void frames_functional()
         }
         for (int i = 0; i < n; i++) {
             CHECK(static_cast<unsigned char *>(p[i])[page - 1] == 0xa5);
-            memory::free_page(p[i]);
+            mem::frames::free(mem::frames::from_linear(p[i]));
         }
     }
 
@@ -81,12 +81,12 @@ void frames_functional()
 
     section("a 2 MiB frame is 2 MiB aligned");
     {
-        void *h = memory::alloc_huge_page(huge);
+        void *h = mem::frames::to_linear(mem::frames::alloc(huge, huge));
         CHECK(h != nullptr);
         if (h) {
             CHECK((reinterpret_cast<uintptr_t>(h) & (huge - 1)) == 0);
             memset(h, 0x5a, huge);
-            memory::free_huge_page(h, huge);
+            mem::frames::free(mem::frames::from_linear(h), huge);
         }
     }
 
@@ -94,7 +94,8 @@ void frames_functional()
     {
         const size_t sizes[] = {1ul << 20, 8ul << 20};
         for (size_t size : sizes) {
-            void *p = memory::alloc_phys_contiguous_aligned(size, page);
+            mem::frames::phys_addr pa = mem::frames::alloc(size, page);
+            void *p = pa ? mem::map_phys(pa, size) : nullptr;
             CHECK(p != nullptr);
             if (!p) {
                 continue;
@@ -105,26 +106,40 @@ void frames_functional()
                 ok = ok && mem::mapping::to_phys(static_cast<char *>(p) + off) == base + off;
             }
             CHECK(ok);
-            memory::free_phys_contiguous_aligned(p, size);
+            mem::frames::free(pa, size);
         }
+    }
+
+    section("a pressure watcher registered by the application is asked");
+    {
+        // The list keeps the watcher forever, so it must not live on the stack.
+        static std::atomic<int> asked{0};
+        static mem::frames::pressure_watcher w;
+        mem::frames::watch_pressure(w, [] {
+            asked.fetch_add(1);
+            return false;
+        }, 99);
+        int before = asked.load();
+        mem::frames::reclaim();
+        CHECK(asked.load() > before);
     }
 
     section("free memory falls while frames are out and returns after");
     {
-        // The per-cpu page pools sit between alloc_page and the accounting, so
-        // the counter lags by up to a pool's worth. The drift is printed rather
-        // than asserted tightly.
+        // The per-cpu pools sit between frames::alloc and the accounting, so the
+        // counter lags by up to a pool's worth. The drift is printed rather than
+        // asserted tightly.
         const size_t slack = 64ul << 20;
         size_t before = mem::frames::free_bytes();
         const int n = 4096;
         std::vector<void *> p(n);
         for (int i = 0; i < n; i++) {
-            p[i] = memory::alloc_page();
+            p[i] = mem::frames::to_linear(mem::frames::alloc());
         }
         size_t during = mem::frames::free_bytes();
         CHECK(during <= before);
         for (int i = 0; i < n; i++) {
-            memory::free_page(p[i]);
+            mem::frames::free(mem::frames::from_linear(p[i]));
         }
         size_t after = mem::frames::free_bytes();
         CHECK(after >= during);
@@ -141,38 +156,19 @@ void frames_perf()
 
     const int batch = 512;
     const int rounds = 100;
-    std::vector<void *> p(batch);
 
     section("4 KiB, scaling");
     {
         // Warm the per-cpu pools so the first measurement is not the only one
         // paying for a refill.
+        std::vector<mem::frames::phys_addr> p(batch);
         for (int i = 0; i < batch; i++) {
-            p[i] = memory::alloc_page();
+            p[i] = mem::frames::alloc();
         }
         for (int i = 0; i < batch; i++) {
-            memory::free_page(p[i]);
+            mem::frames::free(p[i]);
         }
 
-        for (unsigned t = 1; t <= n_cpus(); t *= 2) {
-            double s = parallel(t, [&](unsigned) {
-                std::vector<void *> q(batch);
-                for (int r = 0; r < rounds; r++) {
-                    for (int i = 0; i < batch; i++) {
-                        q[i] = memory::alloc_page();
-                        escape(q[i]);
-                    }
-                    for (int i = 0; i < batch; i++) {
-                        memory::free_page(q[i]);
-                    }
-                }
-            });
-            report_scale("alloc_page + free_page", t, 2.0 * batch * rounds * t, s);
-        }
-    }
-
-    section("4 KiB through mem::frames, no pool in the way");
-    {
         for (unsigned t = 1; t <= n_cpus(); t *= 2) {
             double s = parallel(t, [&](unsigned) {
                 std::vector<mem::frames::phys_addr> q(batch);
@@ -215,14 +211,14 @@ void frames_perf()
             const int n = share(hbatch * rounds, t, 8);
             double s = parallel(t, [&](unsigned) {
                 for (int i = 0; i < n; i++) {
-                    void *h = memory::alloc_huge_page(huge);
+                    void *h = mem::frames::to_linear(mem::frames::alloc(huge, huge));
                     escape(h);
                     if (h) {
-                        memory::free_huge_page(h, huge);
+                        mem::frames::free(mem::frames::from_linear(h), huge);
                     }
                 }
             });
-            report_scale("alloc_huge_page + free", t, 2.0 * n * t, s);
+            report_scale("frames::alloc(2 MiB) + free", t, 2.0 * n * t, s);
         }
     }
 
@@ -233,16 +229,17 @@ void frames_perf()
             auto t0 = clk::now();
             int got = 0;
             for (int i = 0; i < n; i++) {
-                void *q = memory::alloc_phys_contiguous_aligned(size, page);
+                mem::frames::phys_addr qa = mem::frames::alloc(size, page);
+                void *q = qa ? mem::map_phys(qa, size) : nullptr;
                 if (!q) {
                     break;
                 }
                 escape(q);
-                memory::free_phys_contiguous_aligned(q, size);
+                mem::frames::free(qa, size);
                 got++;
             }
             char label[64];
-            snprintf(label, sizeof(label), "alloc_phys_contiguous %zu MiB + free", size >> 20);
+            snprintf(label, sizeof(label), "frames::alloc %zu MiB + map + free", size >> 20);
             if (got) {
                 report_ns(label, since(t0), got);
             } else {
@@ -254,9 +251,46 @@ void frames_perf()
 
 /* vspace ------------------------------------------------------------------ */
 
+// A region whose faults the test answers itself: one page per fault, counted.
+struct probe_region {
+    mem::vspace::region r;
+    std::atomic<int> faults{0};
+};
+
+bool probe_fault(mem::vspace::region &r, uintptr_t addr, unsigned)
+{
+    auto *pr = reinterpret_cast<probe_region *>(&r);
+    pr->faults.fetch_add(1);
+    uintptr_t s = align_down(addr, uintptr_t(page));
+    return mem::mapping::populate({s, s + page}, r.perm) ||
+           mem::mapping::find(s);
+}
+
+const mem::vspace::region_ops probe_ops = { probe_fault };
+
 void vspace_functional()
 {
     group("vspace");
+
+    section("a fault in a region goes to the handler its owner plugged in");
+    {
+        probe_region pr;
+        pr.r.ops = &probe_ops;
+        pr.r.perm = mem::perm_rw;
+        CHECK(mem::vspace::reserve(pr.r, 16 * page, page) == resa::success);
+
+        auto *p = reinterpret_cast<volatile char *>(pr.r.span.start);
+        p[0] = 1;
+        p[3 * page] = 3;
+        CHECK(pr.faults.load() == 2);
+        CHECK(p[0] == 1);
+        CHECK(p[3 * page] == 3);
+        // The pages the handler did not map are still absent.
+        CHECK(!mem::mapping::find(pr.r.span.start + page));
+
+        mem::mapping::depopulate({pr.r.span.start, pr.r.span.end});
+        mem::vspace::release(pr.r);
+    }
 
     section("reserving costs no physical memory");
     {
@@ -788,6 +822,61 @@ void mapping_functional()
         mem::frames::free(f);
     }
 
+    section("to_phys translates a mapped address and refuses an empty one");
+    {
+        scratch s(4 * page);
+        mem::frames::phys_addr pa = mem::frames::alloc();
+        CHECK(map::attach(s.range(0, page), pa, mem::perm_rw));
+        CHECK(map::to_phys(s.start()) == pa);
+        CHECK(map::to_phys(s.start() + 100) == pa + 100);
+        CHECK(map::to_phys(s.start() + page) == mem::frames::no_memory);
+        CHECK(map::to_phys(mem::frames::to_linear(pa)) == pa);
+        map::detach(s.range(0, page));
+        mem::frames::free(pa);
+    }
+
+    section("is_contiguous tells one run of memory from a seam");
+    {
+        // The same frame at two neighbouring addresses: bytes flow across the
+        // boundary virtually, but physically the second page starts over.
+        scratch s(4 * page);
+        mem::frames::phys_addr pa = mem::frames::alloc();
+        CHECK(map::attach(s.range(0, page), pa, mem::perm_rw));
+        CHECK(map::attach(s.range(page, page), pa, mem::perm_rw));
+        auto *p = reinterpret_cast<const void *>(s.start());
+        CHECK(map::is_contiguous(p, page));
+        CHECK(!map::is_contiguous(p, 2 * page));
+        CHECK(map::is_contiguous(mem::frames::to_linear(pa), page));
+        map::detach(s.range(0, 2 * page));
+        mem::frames::free(pa);
+    }
+
+    section("the entry records reads and writes, and clearing starts over");
+    {
+        scratch s(4 * page);
+        CHECK(map::populate(s.range(0, page), mem::perm_rw));
+        mem::range v = s.range(0, page);
+
+        map::clear_accessed(v);
+        map::clear_dirty(v);
+        // A cpu holding the old entry never sets the bits again.
+        map::flush_all();
+        CHECK(!map::accessed(v));
+        if (map::tracks_writes) {
+            CHECK(!map::dirty(v));
+        }
+
+        (void)*reinterpret_cast<volatile char *>(s.start());
+        CHECK(map::accessed(v));
+        if (map::tracks_writes) {
+            CHECK(!map::dirty(v));
+        }
+
+        *reinterpret_cast<volatile char *>(s.start()) = 1;
+        CHECK(map::dirty(v));
+        map::depopulate(v);
+    }
+
     section("the software bits of an entry survive a round trip");
     {
         scratch s(page);
@@ -966,6 +1055,65 @@ void mapping_perf()
     }
 }
 
+/* early ------------------------------------------------------------------- */
+
+void early_functional()
+{
+    group("early");
+
+    section("an early object round-trips, before the heap and after");
+    {
+        CHECK(mem::early::takes(64, 8));
+        void *p = mem::early::alloc(64, 8);
+        CHECK(p != nullptr);
+        CHECK(mem::early::owns(p));
+        CHECK(!mem::heap::owns(p));
+        CHECK(mem::early::size_of(p) == 64);
+        memset(p, 0x77, 64);
+        CHECK(static_cast<unsigned char *>(p)[63] == 0x77);
+        mem::early::free(p);
+    }
+
+    section("alignment is honoured");
+    {
+        void *p = mem::early::alloc(100, 256);
+        CHECK((reinterpret_cast<uintptr_t>(p) & 255) == 0);
+        mem::early::free(p);
+    }
+
+    section("what no page can hold gets frames of its own");
+    {
+        CHECK(!mem::early::takes(3 * page, 64));
+        auto *p = static_cast<char *>(mem::early::alloc(3 * page, 64));
+        CHECK(p != nullptr);
+        CHECK(mem::early::owns(p));
+        CHECK(mem::early::size_of(p) >= 3 * page);
+        memset(p, 0x2f, 3 * page);
+        CHECK(static_cast<unsigned char>(p[3 * page - 1]) == 0x2f);
+        mem::early::free(p);
+    }
+}
+
+/* phys -------------------------------------------------------------------- */
+
+void phys_functional()
+{
+    group("phys");
+
+    section("map_phys hands back a pointer to the frames it was given");
+    {
+        mem::frames::phys_addr pa = mem::frames::alloc();
+        auto *v = static_cast<char *>(mem::map_phys(pa, page));
+        CHECK(v != nullptr);
+        v[0] = 0x5c;
+        v[page - 1] = 0x5d;
+        auto *l = static_cast<char *>(mem::frames::to_linear(pa));
+        CHECK(l[0] == 0x5c);
+        CHECK(static_cast<unsigned char>(l[page - 1]) == 0x5d);
+        mem::frames::free(pa);
+    }
+}
+
 /* heap -------------------------------------------------------------------- */
 
 /*
@@ -977,6 +1125,24 @@ void mapping_perf()
 void heap_functional()
 {
     group("heap");
+
+    section("the heap answers for what it owns");
+    {
+        CHECK(mem::heap::takes(16, 16));
+        CHECK(mem::heap::takes(1ul << 20, 4096));
+        CHECK(!mem::heap::takes(100, 4ul << 20));
+
+        void *p = mem::heap::alloc(100, 16);
+        CHECK(p != nullptr);
+        CHECK(mem::heap::owns(p));
+        CHECK(mem::heap::size_of(p) >= 100);
+        mem::heap::free(p);
+
+        // The sized form, which is what operator delete supplies.
+        void *q = mem::heap::alloc(64, 16);
+        CHECK(q != nullptr);
+        mem::heap::free(q, 64);
+    }
 
     section("a large allocation is backed by huge pages");
     {
@@ -1142,6 +1308,130 @@ size_t fault_ragged(void *, uint64_t) { return ragged_span; }
 // inside every buffer.
 const uint64_t big_span = (5ull << 20) + 12345;
 size_t fault_big(void *, uint64_t) { return big_span; }
+
+/* store ------------------------------------------------------------------- */
+
+void store_functional()
+{
+    group("store");
+
+    section("a store moves bytes both ways and says when it is done");
+    {
+        pattern_store s(1ul << 20);
+        s.record = true;
+        std::vector<uint8_t> buf(3 * page);
+
+        CHECK(s.read_now(buf.data(), 8192, buf.size()) == (int64_t)buf.size());
+        bool ok = true;
+        for (size_t i = 0; i + 8 <= buf.size(); i += 8) {
+            uint64_t w;
+            memcpy(&w, buf.data() + i, 8);
+            ok = ok && w == pattern_store::word(8192 + i);
+        }
+        CHECK(ok);
+
+        uint64_t magic = 0x1122334455667788ull;
+        memcpy(buf.data(), &magic, 8);
+        CHECK(s.write_now(buf.data(), 4096, 8) == 8);
+        CHECK(s.written[4096] == magic);
+
+        // The split form: start, ask, wait.
+        mem::io *req = s.read(buf.data(), 0, page);
+        CHECK(req != nullptr);
+        CHECK(s.done(req));
+        CHECK(s.wait(req) == (int64_t)page);
+    }
+}
+
+/*
+ * A policy that records everything the cache tells it, so every hook and every
+ * buffer accessor is checked from the policy's side of the contract. Victims
+ * are kept on a stack threaded through policy_data.
+ */
+struct spy_state {
+    uint64_t created_size = 0;
+    std::atomic<int> faults{0}, evicted{0};
+    std::atomic<bool> accessors_ok{true};
+    mutex lock;
+    mem::pagecache::buffer *top = nullptr;
+};
+
+spy_state g_spy;
+std::atomic<bool> g_spy_destroyed{false};
+
+void *spy_create(uint64_t store_size)
+{
+    g_spy.created_size = store_size;
+    g_spy.faults = 0;
+    g_spy.evicted = 0;
+    g_spy.accessors_ok = true;
+    g_spy.top = nullptr;
+    g_spy_destroyed = false;
+    return &g_spy;
+}
+
+void spy_destroy(void *p)
+{
+    g_spy_destroyed = p == &g_spy;
+}
+
+void spy_on_fault(void *p, mem::pagecache::buffer &b)
+{
+    namespace pc = mem::pagecache;
+    auto *st = static_cast<spy_state *>(p);
+    st->faults.fetch_add(1);
+    bool ok = pc::size(b) > 0 && pc::size(b) <= ragged_span &&
+              pc::offset(b) + pc::size(b) <= st->created_size &&
+              pc::data(b) != nullptr;
+    // The contents are there before the policy hears of the buffer.
+    if (ok && pc::size(b) >= 8 && pc::offset(b) % 8 == 0) {
+        ok = *static_cast<uint64_t *>(pc::data(b)) == pattern_store::word(pc::offset(b));
+    }
+    if (!ok) {
+        st->accessors_ok = false;
+    }
+    WITH_LOCK(st->lock) {
+        *static_cast<pc::buffer **>(pc::policy_data(b)) = st->top;
+        st->top = &b;
+    }
+}
+
+void spy_evict(void *p, size_t bytes, mem::pagecache::buffer_list &victims)
+{
+    namespace pc = mem::pagecache;
+    auto *st = static_cast<spy_state *>(p);
+    size_t got = 0;
+    WITH_LOCK(st->lock) {
+        while (st->top && got < bytes && !victims.full()) {
+            pc::buffer *b = st->top;
+            st->top = *static_cast<pc::buffer **>(pc::policy_data(*b));
+            victims.add(b);
+            got += pc::size(*b);
+        }
+    }
+}
+
+void spy_on_evicted(void *p, mem::pagecache::buffer &)
+{
+    static_cast<spy_state *>(p)->evicted.fetch_add(1);
+}
+
+bool spy_is_dirty(void *, mem::pagecache::buffer &)
+{
+    return false;
+}
+
+const mem::pagecache::policy spy_policy = {
+    .bytes_per_buffer = sizeof(void *),
+    .create = spy_create,
+    .destroy = spy_destroy,
+    .fault_size = fault_ragged,
+    .prefetch = nullptr,
+    .evict = spy_evict,
+    .on_fault = spy_on_fault,
+    .on_evicted = spy_on_evicted,
+    .is_dirty = spy_is_dirty,
+};
 
 void pagecache_functional()
 {
@@ -1466,6 +1756,52 @@ void pagecache_functional()
         pc::unmap(m);
     }
 
+    section("a policy of the application's own sees the life of every buffer");
+    {
+        const uint64_t bytes = 64ul << 20;
+        pattern_store s(bytes);
+        s.record = true;
+        void *m = pc::map(s, spy_policy, 8ul << 20);
+        CHECK(m != nullptr);
+        CHECK(g_spy.created_size == bytes);
+
+        auto *b = static_cast<char *>(m);
+        b[0] = 0x55;                    // written, so write-back would show
+        bool ok = true;
+        for (uint64_t off = page; off < bytes; off += ragged_span) {
+            uint64_t o = off & ~uint64_t(7);
+            ok &= *reinterpret_cast<volatile uint64_t *>(b + o) ==
+                  pattern_store::word(o);
+        }
+        CHECK(ok);
+        CHECK(g_spy.accessors_ok.load());
+        CHECK(g_spy.faults.load() >= int(bytes / ragged_span) / 2);
+        CHECK(g_spy.evicted.load() > 0);
+
+        pc::unmap(m);
+        // unmap drains through the policy, so everything it was ever handed
+        // has come back, and its is_dirty verdict held: nothing was written.
+        CHECK(g_spy.evicted.load() == g_spy.faults.load());
+        CHECK(g_spy_destroyed.load());
+        CHECK(s.writes.load() == 0);
+    }
+
+    section("two caches live side by side and die separately");
+    {
+        pattern_store s1(4 * huge), s2(4 * huge);
+        char *m1 = static_cast<char *>(pc::map(s1));
+        char *m2 = static_cast<char *>(pc::map(s2));
+        CHECK(m1 != nullptr);
+        CHECK(m2 != nullptr);
+        CHECK(m1 != m2);
+        CHECK(*reinterpret_cast<volatile uint64_t *>(m1) == pattern_store::word(0));
+        CHECK(*reinterpret_cast<volatile uint64_t *>(m2 + 8) == pattern_store::word(8));
+        pc::unmap(m1);
+        CHECK(*reinterpret_cast<volatile uint64_t *>(m2 + 16) == pattern_store::word(16));
+        CHECK(pc::resident(m2));
+        pc::unmap(m2);
+    }
+
     section("ragged buffers survive eviction, from many threads");
     {
         // Buffers that share edge pages, a limit small enough that eviction
@@ -1545,7 +1881,10 @@ int os_memory_primitives_main()
     vspace_perf();
     mapping_functional();
     mapping_perf();
+    early_functional();
+    phys_functional();
     heap_functional();
+    store_functional();
     pagecache_functional();
 
     return summary("MEMORY PRIMITIVE");

@@ -9,11 +9,12 @@
 
 #include <osv/debug.hh>
 #include <osv/mem/frames.hh>
-#include <osv/mmu.hh>
 #include <osv/sched.hh>
 
 #include "internal.hh"
 #include "../linear.hh"
+#include <osv/mem/mapping.hh>
+#include <osv/mem/phys.hh>
 
 extern void *elf_start;
 extern size_t elf_size;
@@ -26,7 +27,7 @@ namespace frames {
 // ever holds: the kernel image's own pages are never handed to it.
 size_t phys_mem_size;
 
-static_assert(page_size == mmu::page_size, "frames::page_size disagrees with mmu");
+static_assert(page_size == mem::mapping::page_size, "frames::page_size disagrees with mmu");
 
 namespace {
 
@@ -58,12 +59,12 @@ llfree_t *allocator()
 
 uint64_t frame_of(uintptr_t linear)
 {
-    return (linear - base_linear) >> mmu::page_size_shift;
+    return (linear - base_linear) >> mem::mapping::page_size_shift;
 }
 
 uintptr_t linear_of(uint64_t frame)
 {
-    return base_linear + (frame << mmu::page_size_shift);
+    return base_linear + (frame << mem::mapping::page_size_shift);
 }
 
 phys_addr phys_of(uint64_t frame)
@@ -122,7 +123,7 @@ void init(size_t cores)
 
     // llfree wants its region aligned to the largest block it serves.
     base_linear = align_down(lowest, static_cast<uintptr_t>(LLFREE_ALIGN));
-    frame_count = (highest - base_linear) >> mmu::page_size_shift;
+    frame_count = (highest - base_linear) >> mem::mapping::page_size_shift;
 
     llfree_meta_size_t sizes = llfree_metadata_size(cores, frame_count);
     llfree_meta_t meta = {
@@ -185,7 +186,7 @@ phys_addr alloc(size_t bytes, size_t align)
     size_t need = frames_for(bytes);
 
     if (!llf) {
-        void *p = boot_alloc(need << mmu::page_size_shift, align);
+        void *p = boot_alloc(need << mem::mapping::page_size_shift, align);
         return p ? from_linear(p) : no_memory;
     }
 
@@ -225,11 +226,11 @@ void free(phys_addr addr, size_t bytes)
 void *to_linear(phys_addr p)
 {
     void *addr = reinterpret_cast<void *>(p);
-    if (addr >= mmu::elf_phys_start &&
-        addr < static_cast<char *>(mmu::elf_phys_start) + elf_size) {
+    if (addr >= elf_phys_start &&
+        addr < static_cast<char *>(elf_phys_start) + elf_size) {
         return static_cast<char *>(addr) + kernel_vm_shift;
     }
-    return mmu::phys_mem + p;
+    return mem::linear + p;
 }
 
 bool in_linear_map(const void *addr, size_t bytes)
@@ -238,7 +239,7 @@ bool in_linear_map(const void *addr, size_t bytes)
         static_cast<const char *>(addr) + bytes <= static_cast<char *>(elf_start) + elf_size) {
         return true;
     }
-    return addr >= mmu::phys_mem;
+    return addr >= mem::linear;
 }
 
 phys_addr from_linear(void *addr)
@@ -249,8 +250,8 @@ phys_addr from_linear(void *addr)
     }
     // Anything else has to be in the linear map: there is nowhere else a
     // physical address can be recovered from.
-    assert(addr >= mmu::phys_mem);
-    return reinterpret_cast<uintptr_t>(addr) & (mmu::linear_map_size - 1);
+    assert(addr >= mem::linear);
+    return reinterpret_cast<uintptr_t>(addr) & (mem::linear_size - 1);
 }
 
 size_t total_available_bytes()
@@ -264,7 +265,7 @@ size_t free_bytes()
     if (!llf) {
         return boot_total();
     }
-    return llfree_free_frames(llf) << mmu::page_size_shift;
+    return llfree_free_frames(llf) << mem::mapping::page_size_shift;
 }
 
 } // namespace frames

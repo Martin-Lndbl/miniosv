@@ -535,7 +535,6 @@ COMMON += $(wno-extern-c-compat) $(wno-ignored-attributes) $(wno-sometimes-unini
 
 
 drivers :=
-drivers += core/mmu.o
 drivers += arch/$(arch)/early-console.o
 drivers += drivers/console.o
 drivers += drivers/console-multiplexer.o
@@ -661,10 +660,6 @@ objects += core/semaphore.o
 objects += core/condvar.o
 objects += core/debug.o
 objects += core/rcu.o
-objects += core/mempool.o
-ifeq ($(conf_memory_tracker),1)
-objects += core/alloctracker.o
-endif
 
 # Physical frame allocator: llfree (external/llfree, MIT) behind core/mem/frames.
 objects += external/llfree/bitfield.o
@@ -691,8 +686,11 @@ objects += arch/$(arch)/mem/fault.o
 
 # The sub-page allocator. So far only the path for allocations big enough to
 # get a reservation of their own.
+objects += core/mem/boot.o
 objects += core/mem/early.o
 objects += core/mem/phys.o
+objects += core/mem/fault.o
+objects += core/mem/heap/histogram.o
 objects += core/mem/heap/large.o
 objects += core/mem/heap/objects.o
 objects += core/mem/heap/window.o
@@ -734,6 +732,7 @@ objects += core/demangle.o
 #include $(src)/libc/build.mk:
 libc =
 
+libc += malloc.o
 libc += internal/libc.o
 
 

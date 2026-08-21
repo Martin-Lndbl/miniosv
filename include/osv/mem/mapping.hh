@@ -16,6 +16,10 @@ namespace mapping {
 
 constexpr size_t page_size = level_size(0);
 constexpr size_t huge_page_size = level_size(1);
+constexpr unsigned page_size_shift = level_shift(0);
+
+// Widths the hardware reports, for whoever has to build an address by hand.
+extern uint8_t phys_bits, virt_bits;
 
 constexpr unsigned level_of(size_t leaf_size)
 {

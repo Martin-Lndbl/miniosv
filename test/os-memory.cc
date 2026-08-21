@@ -1,5 +1,5 @@
 /*
- * Memory as an application sees it: malloc, mmap, page faults.
+ * Memory as an application sees it: malloc and mmap.
  *
  * Everything here goes through interfaces that exist on Linux and on OSv as
  * well as on miniOSv, so the numbers can be compared against either and the
@@ -17,6 +17,8 @@
 #include <vector>
 
 #include <malloc.h>
+
+extern "C" void *reallocarray(void *ptr, size_t nmemb, size_t size);
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -110,6 +112,35 @@ void heap_functional()
             }
         }
         CHECK(ok);
+    }
+
+    section("the odd corners of the malloc family hold");
+    {
+        void *z = malloc(0);
+        free(z);
+
+        void *p = realloc(nullptr, 100);
+        CHECK(p != nullptr);
+        memset(p, 1, 100);
+        free(realloc(p, 0));
+
+        CHECK(reallocarray(nullptr, SIZE_MAX / 2, 4) == nullptr);
+        // Through a volatile pointer, or the compiler folds the builtin's
+        // null-check away on the assumption that allocation succeeds.
+        void *(*volatile vcalloc)(size_t, size_t) = calloc;
+        CHECK(vcalloc(SIZE_MAX / 2, 4) == nullptr);
+        CHECK(malloc_usable_size(nullptr) == 0);
+
+        void *a = aligned_alloc(256, 512);
+        CHECK(a != nullptr);
+        CHECK((reinterpret_cast<uintptr_t>(a) & 255) == 0);
+        free(a);
+
+        // memalign does not require the size to be a multiple.
+        void *m = memalign(512, 100);
+        CHECK(m != nullptr);
+        CHECK((reinterpret_cast<uintptr_t>(m) & 511) == 0);
+        free(m);
     }
 
     section("delete gives back what new took, sized or not");
@@ -429,18 +460,24 @@ void mmap_functional()
         CHECK(rc == 0);
     }
 
-    section("mapping reserves address space, touching spends memory");
+    section("a mapping that needs a file is refused");
+    {
+        // There is no filesystem behind mmap here, and even where there is
+        // one, fd -1 without MAP_ANONYMOUS can never be served.
+        void *p = mmap(nullptr, page, PROT_READ | PROT_WRITE, MAP_PRIVATE, -1, 0);
+        CHECK(p == MAP_FAILED);
+    }
+
+    section("mapping spends the memory at once, and gives it back");
     {
         const size_t size = 64ul << 20;
         size_t before = free_bytes();
         char *p = static_cast<char *>(map(size));
         CHECK(p != nullptr);
-        size_t reserved = free_bytes();
-        CHECK(before - reserved < size / 8);
+        CHECK(before - free_bytes() >= size);
         for (size_t off = 0; off < size; off += page) {
             p[off] = 1;
         }
-        CHECK(reserved - free_bytes() >= size / 2);
         CHECK(munmap(p, size) == 0);
         CHECK(free_bytes() + (size / 4) >= before);
     }
@@ -469,16 +506,18 @@ void mmap_functional()
         CHECK(munmap(p, size) == 0);
     }
 
-    section("MADV_DONTNEED gives the memory back and the range stays usable");
+    // The frames under a mapping belong to it until it is unmapped, so this
+    // is accepted and keeps them.
+    section("MADV_DONTNEED is accepted and changes nothing");
     {
         const size_t size = 8ul << 20;
         char *p = static_cast<char *>(map(size, MAP_POPULATE));
         memset(p, 9, size);
         size_t populated = free_bytes();
         CHECK(madvise(p, size, MADV_DONTNEED) == 0);
-        CHECK(free_bytes() - populated >= size / 2);
-        CHECK(p[0] == 0);
-        CHECK(p[size - 1] == 0);
+        CHECK(free_bytes() == populated);
+        CHECK(p[0] == 9);
+        CHECK(p[size - 1] == 9);
         CHECK(munmap(p, size) == 0);
     }
 
@@ -552,9 +591,9 @@ void mmap_perf()
 
 void fault_functional()
 {
-    group("page faults");
+    group("mapped memory");
 
-    section("a faulted page arrives zeroed and keeps what is written");
+    section("a fresh mapping is zeroed and keeps what is written");
     {
         const size_t size = 4ul << 20;
         char *p = static_cast<char *>(map(size));
@@ -575,7 +614,7 @@ void fault_functional()
         CHECK(munmap(p, size) == 0);
     }
 
-    section("threads faulting one mapping at once each get their own pages");
+    section("threads touching one mapping at once each get their own pages");
     {
         const size_t size = 16ul << 20;
         char *p = static_cast<char *>(map(size));

@@ -38,6 +38,16 @@ void tlb_flush_local();
 void tlb_flush_all();
 void tlb_flush_pages_all(const uintptr_t *va, size_t count);
 
+// Index into the table at "level" for "va".
+inline unsigned pt_index(void *va, unsigned level)
+{
+    return (reinterpret_cast<uintptr_t>(va) >> level_shift(level)) &
+           (entries_per_table - 1);
+}
+
+// Leave the boot tables behind for the ones the kernel built.
+void switch_to_runtime_page_tables();
+
 // Fault handling helpers.
 bool is_page_fault_insn(unsigned int err);
 bool is_page_fault_write(unsigned int err);
@@ -46,11 +56,13 @@ bool fast_sigsegv_check(uintptr_t addr, exception_frame *ef);
 }
 }
 
-namespace mmu {
+namespace mem {
+namespace frames {
 
 // Where the kernel ELF image is loaded.
 extern void *elf_phys_start;
 
+}
 }
 
 #endif /* ARCH_COMMON_MEM_HH */

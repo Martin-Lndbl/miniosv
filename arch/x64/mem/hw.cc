@@ -13,7 +13,6 @@
 #include <osv/interrupt.hh>
 #include <osv/mem/mapping.hh>
 #include <osv/migration-lock.hh>
-#include <osv/mmu.hh>
 #include <osv/sched.hh>
 
 #include "arch-cpu.hh"
@@ -146,27 +145,22 @@ void tlb_flush_pages_all(const uintptr_t *va, size_t count)
 }
 }
 
-namespace mmu {
-
-uint8_t phys_bits = max_phys_bits, virt_bits = 52;
+namespace mem {
+namespace mapping {
 
 void switch_to_runtime_page_tables()
 {
-    auto root = mem::mapping::root_slot(0)->load(std::memory_order_acquire);
-    processor::write_cr3(mem::mapping::pte_table_addr(root));
+    auto root = root_slot(0)->load(std::memory_order_acquire);
+    processor::write_cr3(pte_table_addr(root));
 }
 
-void flush_tlb_local()
-{
-    mem::mapping::tlb_flush_local();
+}
 }
 
-void flush_tlb_all()
-{
-    mem::mapping::flush_all();
+namespace mem {
+namespace mapping {
+
+uint8_t phys_bits = max_phys_bits, virt_bits = 52;
+
 }
-
-// x64 architectures have coherent caches, so we don't need to do anything here.
-void synchronize_cpu_caches(void *v, size_t size) {}
-
 }

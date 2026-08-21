@@ -46,9 +46,10 @@
 
 #include <osv/mmio.hh>
 #include <osv/sched.hh>
-#include <osv/contiguous_alloc.hh>
+#include <osv/mem/frames.hh>
+#include <osv/mem/phys.hh>
 #include <osv/ilog2.hh>
-#include <osv/mmu.hh>
+#include <osv/mem/phys.hh>
 #include <drivers/pci-function.hh>
 
 #include <algorithm>
@@ -94,8 +95,8 @@ gic_v3_redist::gic_v3_redist(const mem::frames::phys_addr *bases, const size_t *
     for (int i = 0; i < count; i++) {
         _region_base[i] = bases[i];
         _region_len[i] = lens[i];
-        mmu::linear_map((void *)bases[i], bases[i], lens[i], "gic_redist",
-                        mmu::page_size, mmu::mattr::dev);
+        mem::map_phys_at((void *)bases[i], bases[i], lens[i],
+                        mem::mapping::page_size, mem::mattr::dev);
     }
 }
 
@@ -205,8 +206,8 @@ static uint32_t get_cpu_affinity(void)
 gic_v3_its::gic_v3_its(mem::frames::phys_addr b, size_t l) : _base(b)
 {
     if (b && l) {
-        mmu::linear_map((void *)_base, _base, l, "gic_its", mmu::page_size,
-                        mmu::mattr::dev);
+        mem::map_phys_at((void *)_base, _base, l, mem::mapping::page_size,
+                        mem::mattr::dev);
     }
 }
 
@@ -246,11 +247,11 @@ void gic_v3_its::read_type_register()
 void gic_v3_its::initialize_cmd_queue()
 {
     //Queue needs to be 64KB aligned
-    _cmd_queue = memory::alloc_phys_contiguous_aligned(GIC_ITS_CMD_QUEUE_SIZE, 0x10000);
+    _cmd_queue = mem::map_phys(mem::frames::alloc(GIC_ITS_CMD_QUEUE_SIZE, 0x10000), GIC_ITS_CMD_QUEUE_SIZE);
     memset(_cmd_queue, 0, GIC_ITS_CMD_QUEUE_SIZE);
 
     u64 cmd_queue_pa = mem::mapping::to_phys(_cmd_queue);
-    u64 queue_size_in_pages = GIC_ITS_CMD_QUEUE_SIZE / mmu::page_size;
+    u64 queue_size_in_pages = GIC_ITS_CMD_QUEUE_SIZE / mem::mapping::page_size;
     //
     //Read https://developer.arm.com/documentation/ddi0601/2024-09/External-Registers/GITS-CBASER--ITS-Command-Queue-Descriptor
     write_reg64(gic_its_reg::GICITS_CBASER, GITS_CBASER_VALID | cmd_queue_pa | (queue_size_in_pages - 1));
@@ -395,7 +396,7 @@ void gic_v3_driver::init_lpis(int smp_idx)
         _msi_vector_num = std::max(_msi_vector_num, (u16)4096);
 
         //Allocate common LPI configuration table
-        void *config_table = memory::alloc_phys_contiguous_aligned(_msi_vector_num, 4096);
+        void *config_table = mem::map_phys(mem::frames::alloc(_msi_vector_num, 4096), _msi_vector_num);
         memset(config_table, 0, _msi_vector_num);
         _lpi_config_table = (u8*)config_table;
 
@@ -408,7 +409,7 @@ void gic_v3_driver::init_lpis(int smp_idx)
         _lpi_pend_bases = new u64[sched::cpus.size()];
         size_t pending_table_size = (_msi_vector_num + GIC_LPI_INTS_START) / 8;
         for (unsigned c = 0; c < sched::cpus.size(); c++) {
-            void *pending_table = memory::alloc_phys_contiguous_aligned(pending_table_size, 64 * 1024);
+            void *pending_table = mem::map_phys(mem::frames::alloc(pending_table_size, 64 * 1024), pending_table_size);
             memset(pending_table, 0, pending_table_size);
             //Read about PTZ here - https://developer.arm.com/documentation/ddi0601/2024-12/External-Registers/GICR-PENDBASER--Redistributor-LPI-Pending-Table-Base-Address-Register
             _lpi_pend_bases[c] = mem::mapping::to_phys(pending_table) | GICR_PENDBASER_PTZ;
@@ -577,7 +578,7 @@ void gic_v3_driver::init_its_device_or_collection_table(int idx)
     //    //TODO: Calculate maximum devices count and save it somewhere
     //}
 
-    void *table = memory::alloc_phys_contiguous_aligned(table_size, table_size);
+    void *table = mem::map_phys(mem::frames::alloc(table_size, table_size), table_size);
     memset(table, 0, table_size);
 
     u64 table_pa = mem::mapping::to_phys(table);
@@ -780,7 +781,7 @@ void gic_v3_driver::allocate_msi_dev_mapping(pci::function* dev)
 
     //We explicitly allocate memory below to make sure it happens
     //when interrupts are enabled
-    void *itt = memory::alloc_phys_contiguous_aligned(itt_size, 256);
+    void *itt = mem::map_phys(mem::frames::alloc(itt_size, 256), itt_size);
     memset(itt, 0, itt_size);
 
     //Register translation entry in ITS

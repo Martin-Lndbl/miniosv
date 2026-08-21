@@ -10,12 +10,9 @@
 
 #include <cassert>
 
-#include <osv/contiguous_alloc.hh>
 #include <osv/trace.hh>
-#include <osv/mempool.hh>
 #include <osv/mmio.hh>
 #include <osv/align.hh>
-#include <osv/mmu.hh>
 #include "nvme-queue.hh"
 #include "drivers/pci-device.hh"
 #include <osv/mem/mapping.hh>
@@ -53,7 +50,6 @@ TRACEPOINT(trace_nvme_op_resread, "payload=%d cid=%d", int, int);
 
 TRACEPOINT(trace_nvme_op_write, "nvme%d addr=%d len=%d", int, void *, int);
 
-using namespace memory;
 
 namespace nvme
 {
@@ -71,24 +67,24 @@ namespace nvme
         : _id(id), _driver_id(did), _qsize(qsize), _dev(&dev), _sq(sq_doorbell), _sq_full(false), _cq(cq_doorbell), _cq_phase_tag(1), _ns(ns)
     {
         _sq_buf_size = qsize * sizeof(nvme_sq_entry_t);
-        size_t sq_buf_size = _sq_buf_size;
-        _sq._addr = (nvme_sq_entry_t *)alloc_phys_contiguous_aligned(sq_buf_size, mmu::page_size);
-        assert(_sq._addr);
-        memset(_sq._addr, 0, sq_buf_size);
+        auto sq_pa = mem::frames::alloc(_sq_buf_size, mem::mapping::page_size);
+        assert(sq_pa);
+        _sq._addr = (nvme_sq_entry_t *)mem::map_phys(sq_pa, _sq_buf_size);
+        memset(_sq._addr, 0, _sq_buf_size);
 
         _cq_buf_size = qsize * sizeof(nvme_cq_entry_t);
-        size_t cq_buf_size = _cq_buf_size;
-        _cq._addr = (nvme_cq_entry_t *)alloc_phys_contiguous_aligned(cq_buf_size, mmu::page_size);
-        assert(_cq._addr);
-        memset(_cq._addr, 0, cq_buf_size);
+        auto cq_pa = mem::frames::alloc(_cq_buf_size, mem::mapping::page_size);
+        assert(cq_pa);
+        _cq._addr = (nvme_cq_entry_t *)mem::map_phys(cq_pa, _cq_buf_size);
+        memset(_cq._addr, 0, _cq_buf_size);
 
         assert(!completion_queue_not_empty());
     }
 
     queue_pair::~queue_pair()
     {
-        free_phys_contiguous_aligned(_sq._addr, _sq_buf_size);
-        free_phys_contiguous_aligned(_cq._addr, _cq_buf_size);
+        mem::frames::free(mem::mapping::to_phys(_sq._addr), _sq_buf_size);
+        mem::frames::free(mem::mapping::to_phys(_cq._addr), _cq_buf_size);
     }
 
     inline void queue_pair::advance_sq_tail()
@@ -273,7 +269,7 @@ namespace nvme
             _free_prp_lists.pop(prp_list);
             if (!prp_list)
             { // No free pre-allocated ones, so allocate new one
-                prp_list = (u64 *)alloc_page();
+                prp_list = (u64 *)mem::map_phys(mem::frames::alloc(), 4096);
                 trace_nvme_prp_alloc(_driver_id, _id, prp_list);
             }
 
@@ -488,7 +484,8 @@ namespace nvme
                 {
                     if (!_free_prp_lists.push((u64 *)pending_callback.prp_list))
                     {
-                        free_page(pending_callback.prp_list); //_free_prp_lists is full so free the page
+                        //_free_prp_lists is full so free the page
+                        mem::frames::free(mem::mapping::to_phys(pending_callback.prp_list));
                     }
                 }
 

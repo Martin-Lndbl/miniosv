@@ -5,7 +5,7 @@
  * BSD license as described in the LICENSE file in the top-level directory.
  */
 
-#include <osv/mempool.hh>
+#include "core/mem/heap/histogram.hh"
 #include <osv/drivers_config.h>
 #include <osv/power.hh>
 #include <osv/debug.hh>
@@ -29,7 +29,7 @@ void halt(void)
 
 void poweroff(void)
 {
-    memory::histogram_dump();
+    mem::heap::histogram_dump();
 
 #if CONF_drivers_acpi
     // Power off cleanly via ACPI S5 when the firmware describes it. This does

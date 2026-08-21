@@ -10,9 +10,9 @@
 #define GIC_COMMON_HH
 
 #include <osv/types.h>
-#include <osv/mmu-defs.hh>
 #include <osv/spinlock.h>
 #include <osv/irqlock.hh>
+#include <osv/mem/frames.hh>
 
 #define GIC_MAX_IRQ  1019
 #define GIC_SPI_BASE 32

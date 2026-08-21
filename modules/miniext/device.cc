@@ -17,8 +17,6 @@
 #include <cstring>
 #include <map>
 
-#include <osv/contiguous_alloc.hh>
-#include <osv/mmu.hh>
 #include <osv/sched.hh>
 
 #include "drivers/nvme.hh"

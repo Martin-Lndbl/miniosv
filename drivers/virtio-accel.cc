@@ -31,12 +31,12 @@
 #include <cstring>
 #include <vector>
 
-#include <osv/contiguous_alloc.hh>
 #include <cstdio>
 
 #include <osv/debug.hh>
-#include <osv/mmu.hh>
 #include <osv/sched.hh>
+#include <osv/mem/frames.hh>
+#include <osv/mem/phys.hh>
 
 #include "drivers/virtio-device.hh"
 
@@ -61,9 +61,9 @@ class staging {
 public:
     explicit staging(size_t size)
         : _size(size)
-        , _p(static_cast<uint8_t *>(
-              memory::alloc_phys_contiguous_aligned(size, ARG_ALIGN)))
+        , _pa(mem::frames::alloc(size, ARG_ALIGN))
     {
+        _p = _pa ? static_cast<uint8_t *>(mem::map_phys(_pa, size)) : nullptr;
         if (_p) {
             memset(_p, 0, size);
         }
@@ -71,7 +71,7 @@ public:
     ~staging()
     {
         if (_p) {
-            memory::free_phys_contiguous_aligned(_p, _size);
+            mem::frames::free(_pa, _size);
         }
     }
     staging(const staging &) = delete;
@@ -93,6 +93,7 @@ public:
 
 private:
     size_t _size;
+    mem::frames::phys_addr _pa;
     size_t _used = 0;
     uint8_t *_p;
 };

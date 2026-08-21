@@ -5,10 +5,10 @@
  * BSD license as described in the LICENSE file in the top-level directory.
  */
 
+#include <osv/types.h>
 #include "dmi.hh"
 
 #include <osv/debug.hh>
-#include <osv/mmu.hh>
 #include <string.h>
 #include <osv/mem/frames.hh>
 #include <osv/mem/phys.hh>
@@ -131,7 +131,7 @@ void dmi_probe()
 
     u8* const dmi_virt = static_cast<u8*>(mem::map_phys(dmi_base, 0x10000));
 
-    mmu::linear_map(static_cast<void*>(dmi_virt), dmi_base, 0x10000, "dmi");
+    mem::map_phys_at(static_cast<void*>(dmi_virt), dmi_base, 0x10000);
 
     auto start = reinterpret_cast<const char*>(dmi_virt);
 

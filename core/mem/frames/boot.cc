@@ -15,8 +15,8 @@
 #include <osv/align.hh>
 #include <osv/debug.hh>
 #include <osv/mem/frames.hh>
-#include <osv/mmu.hh>
 #include "../linear.hh"
+#include <osv/mem/mapping.hh>
 
 namespace mem {
 namespace frames {
@@ -43,11 +43,19 @@ size_t total;
 
 } // namespace
 
+void *elf_phys_start;
+
 void add_region(phys_addr base, size_t bytes)
 {
+    if (!base) {
+        // Nothing may be handed out at physical zero: that is how alloc() says
+        // it has nothing.
+        ++base;
+        --bytes;
+    }
     auto linear = reinterpret_cast<uintptr_t>(to_linear(base));
-    uintptr_t b = align_up(linear, mmu::page_size);
-    uintptr_t e = align_down(linear + bytes, mmu::page_size);
+    uintptr_t b = align_up(linear, mem::mapping::page_size);
+    uintptr_t e = align_down(linear + bytes, mem::mapping::page_size);
     if (e <= b) {
         return;
     }
@@ -65,7 +73,7 @@ void add_region(phys_addr base, size_t bytes)
 
 void *boot_alloc(size_t bytes, size_t align, size_t offset)
 {
-    bytes = align_up(bytes, mmu::page_size);
+    bytes = align_up(bytes, mem::mapping::page_size);
     for (unsigned i = 0; i < region_count; i++) {
         region &r = regions[i];
         // Same contract as frames::alloc(): it is start + offset that comes out
@@ -87,7 +95,7 @@ void *boot_alloc_page()
         free_list_count--;
         return p;
     }
-    return boot_alloc(mmu::page_size, mmu::page_size);
+    return boot_alloc(mem::mapping::page_size, mem::mapping::page_size);
 }
 
 void boot_free_page(void *addr)
@@ -109,7 +117,7 @@ void boot_for_each_free(void (*fn)(uintptr_t start, uintptr_t end))
         free_list = *static_cast<void **>(p);
         free_list_count--;
         uintptr_t a = reinterpret_cast<uintptr_t>(p);
-        fn(a, a + mmu::page_size);
+        fn(a, a + mem::mapping::page_size);
     }
     for (unsigned i = 0; i < region_count; i++) {
         region &r = regions[i];

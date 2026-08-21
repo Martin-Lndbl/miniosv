@@ -6,8 +6,6 @@
  */
 
 #include <string.h>
-#include <osv/mempool.hh>
-#include <osv/mmu.hh>
 
 #include "virtio.hh"
 #include "drivers/virtio-vring.hh"
@@ -19,8 +17,8 @@
 #include <osv/ilog2.hh>
 #include <osv/mem/mapping.hh>
 #include <osv/mem/frames.hh>
+#include <osv/mem/phys.hh>
 
-using namespace memory;
 using sched::thread;
 
 TRACEPOINT(trace_virtio_enable_interrupts, "vring=%p", void*);
@@ -48,7 +46,8 @@ namespace virtio {
         size_t alignment = driver->get_vring_alignment();
         size_t sz = VIRTIO_ALIGN(vring::get_size(num, alignment), alignment);
         _vring_size = sz;
-        _vring_ptr = memory::alloc_phys_contiguous_aligned(sz, 4096);
+        _vring_pa = mem::frames::alloc(sz, 4096);
+        _vring_ptr = mem::map_phys(_vring_pa, sz);
         memset(_vring_ptr, 0, sz);
         
         // Set up pointers        
@@ -81,7 +80,7 @@ namespace virtio {
 
     vring::~vring()
     {
-        memory::free_phys_contiguous_aligned(_vring_ptr, _vring_size);
+        mem::frames::free(_vring_pa, _vring_size);
         delete [] _cookie;
     }
 
@@ -167,12 +166,14 @@ namespace virtio {
             vring_desc* descp = _desc;
 
             if (indirect) {
-                vring_desc* indirect = reinterpret_cast<vring_desc*>(alloc_phys_contiguous_aligned((_sg_vec.size())*sizeof(vring_desc), 8));
-                if (!indirect)
+                size_t ind_bytes = _sg_vec.size() * sizeof(vring_desc);
+                auto ind_pa = mem::frames::alloc(ind_bytes, mem::mapping::page_size);
+                if (!ind_pa)
                     return false;
+                vring_desc* indirect = static_cast<vring_desc*>(mem::map_phys(ind_pa, ind_bytes));
                 _desc[idx]._flags = vring_desc::VRING_DESC_F_INDIRECT;
-                _desc[idx]._paddr = mem::mapping::to_phys(indirect);
-                _desc[idx]._len = (_sg_vec.size()) * sizeof(vring_desc);
+                _desc[idx]._paddr = ind_pa;
+                _desc[idx]._len = ind_bytes;
 
                 descp = indirect;
                 //initialize the next pointers

@@ -7,6 +7,8 @@
 
 #include <new>
 
+#include <algorithm>
+
 #include <osv/align.hh>
 #include <osv/debug.hh>
 #include <osv/mem/frames.hh>
@@ -40,12 +42,15 @@ record *record_at(void *p)
 
 } // namespace
 
-void *large_alloc(size_t bytes)
+void *large_alloc(size_t bytes, size_t alignment)
 {
     if (!bytes) {
         return nullptr;
     }
-    size_t mapped = align_up(bytes, large_min);
+    // Huge leaves once there is enough to fill one.
+    size_t leaf = bytes >= large_min ? large_min : mapping::page_size;
+    size_t mapped = align_up(bytes, leaf);
+    size_t align = std::max(leaf, alignment);
 
     frames::phys_addr hp = frames::alloc();
     if (hp == frames::no_memory) {
@@ -55,13 +60,13 @@ void *large_alloc(size_t bytes)
     rec->bytes = bytes;
     rec->r.perm = perm_rw;
 
-    if (vspace::reserve(rec->r, mapped, large_min) != vspace::resa_result::success) {
+    if (vspace::reserve(rec->r, mapped, align) != vspace::resa_result::success) {
         frames::free(hp);
         return nullptr;
     }
     // Not zeroed: malloc does not promise it, and at this size the memset is
     // the whole cost of the call.
-    if (!mapping::populate(rec->r.span, perm_rw, large_min, false)) {
+    if (!mapping::populate(rec->r.span, perm_rw, leaf, false)) {
         mapping::depopulate(rec->r.span);
         vspace::release(rec->r);
         frames::free(hp);

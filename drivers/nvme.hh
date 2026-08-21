@@ -16,7 +16,6 @@
 #include <memory>
 #include <osv/aligned_new.hh>
 #include <osv/interrupt.hh>
-#include <osv/mempool.hh>
 #include <osv/msi.hh>
 #include <osv/nvme-structs.h>
 #include <vector>

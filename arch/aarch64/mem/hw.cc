@@ -8,7 +8,6 @@
  */
 
 #include <osv/mem/mapping.hh>
-#include <osv/mmu.hh>
 
 namespace mem {
 namespace mapping {
@@ -60,38 +59,33 @@ void tlb_flush_pages_all(const uintptr_t *va, size_t count)
 }
 }
 
-namespace mmu {
-
-u64 mem_addr;
-
 extern "C" { /* see boot.S */
     extern u64 smpboot_ttbr0;
     extern u64 smpboot_ttbr1;
 }
 
+namespace mem {
+namespace frames {
+
+u64 ram_base;
+
+}
+
+}
+
+namespace mem {
+namespace mapping {
+
 void switch_to_runtime_page_tables()
 {
-    auto low = mem::mapping::root_slot(0)->load(std::memory_order_acquire);
-    auto high = mem::mapping::root_slot(~uintptr_t(0))->load(std::memory_order_acquire);
-    auto pt_ttbr0 = smpboot_ttbr0 = mem::mapping::pte_table_addr(low);
-    auto pt_ttbr1 = smpboot_ttbr1 = mem::mapping::pte_table_addr(high);
+    auto low = root_slot(0)->load(std::memory_order_acquire);
+    auto high = root_slot(~uintptr_t(0))->load(std::memory_order_acquire);
+    auto pt_ttbr0 = smpboot_ttbr0 = pte_table_addr(low);
+    auto pt_ttbr1 = smpboot_ttbr1 = pte_table_addr(high);
     asm volatile("msr ttbr0_el1, %0; isb;" ::"r" (pt_ttbr0));
     asm volatile("msr ttbr1_el1, %0; isb;" ::"r" (pt_ttbr1));
-    flush_tlb_all();
+    flush_all();
 }
 
-void flush_tlb_local()
-{
-    mem::mapping::tlb_flush_local();
 }
-
-void flush_tlb_all()
-{
-    mem::mapping::flush_all();
-}
-
-void synchronize_cpu_caches(void *v, size_t size) {
-    __builtin___clear_cache((char*)v, (char*)v + size);
-}
-
 }

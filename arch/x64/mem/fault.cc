@@ -8,7 +8,7 @@
 #include <osv/debug.hh>
 #include <osv/irqlock.hh>
 #include <osv/mem/mapping.hh>
-#include <osv/mmu.hh>
+#include <osv/mem/fault.hh>
 #include <osv/sched.hh>
 
 #include "arch-cpu.hh"
@@ -34,7 +34,7 @@ void page_fault(exception_frame *ef)
 
     // And since we may sleep, make sure interrupts are enabled.
     DROP_LOCK(irq_lock) { // irq_lock is acquired by HW
-        mmu::vm_fault(addr, ef);
+        mem::vm_fault(addr, ef);
     }
 }
 

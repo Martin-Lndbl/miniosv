@@ -41,9 +41,6 @@
 #ifndef CONF_memory_histogram
 #define CONF_memory_histogram 0
 #endif
-#ifndef CONF_memory_tracker
-#define CONF_memory_tracker 0
-#endif
 #ifndef CONF_preempt
 #define CONF_preempt 1
 #endif

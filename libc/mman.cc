@@ -6,10 +6,11 @@
  */
 
 #include <sys/mman.h>
-#include <osv/mem/frames.hh>
-#include <osv/mem/heap.hh>
+#include <osv/align.hh>
 #include <osv/mem/mapping.hh>
+#include <osv/mem/vspace.hh>
 #include <memory>
+#include <new>
 #include <osv/debug.hh>
 #include "osv/trace.hh"
 #include <osv/stubbing.hh>
@@ -49,6 +50,50 @@ static bool page_aligned(const void *p)
     return !(reinterpret_cast<uintptr_t>(p) & (mem::mapping::page_size - 1));
 }
 
+// Anonymous memory: a reservation of its own, mapped eagerly. The ops mark
+// tells these apart from every other reservation.
+static const mem::vspace::region_ops anon_ops = { .fault = nullptr };
+
+static mem::vspace::region *anon_at(const void *addr)
+{
+    auto *r = mem::vspace::lookup(reinterpret_cast<uintptr_t>(addr));
+    return r && r->ops == &anon_ops ? r : nullptr;
+}
+
+static void *anon_map(size_t length, unsigned perm)
+{
+    // Huge leaves once there is enough to fill one.
+    size_t leaf = length >= mem::mapping::huge_page_size ?
+                  mem::mapping::huge_page_size : mem::mapping::page_size;
+    auto *r = new (std::nothrow) mem::vspace::region();
+    if (!r) {
+        return nullptr;
+    }
+    r->perm = perm;
+    r->ops = &anon_ops;
+    if (mem::vspace::reserve(*r, align_up(length, leaf), leaf) !=
+        mem::vspace::resa_result::success) {
+        delete r;
+        return nullptr;
+    }
+    if (!mem::mapping::populate(r->span, perm, leaf)) {
+        mem::mapping::depopulate(r->span);
+        mem::vspace::release(*r);
+        delete r;
+        return nullptr;
+    }
+    return reinterpret_cast<void *>(r->span.start);
+}
+
+// depopulate invalidates before the frames go back, so the addresses this is
+// giving up cannot be reached through a stale translation.
+static void anon_unmap(mem::vspace::region *r)
+{
+    mem::mapping::depopulate(r->span);
+    mem::vspace::release(*r);
+    delete r;
+}
+
 OSV_LIBC_API
 int mprotect(void *addr, size_t len, int prot)
 {
@@ -64,10 +109,13 @@ int mprotect(void *addr, size_t len, int prot)
     }
 
     len = align_up(len, mem::mapping::page_size);
-    if (!mem::heap::protect(addr, len, libc_prot_to_perm(prot))) {
+    uintptr_t start = reinterpret_cast<uintptr_t>(addr);
+    auto *r = anon_at(addr);
+    if (!r || !r->span.contains({start, start + len})) {
         errno = ENOMEM;
         return -1;
     }
+    mem::mapping::protect({start, start + len}, libc_prot_to_perm(prot));
     return 0;
 }
 
@@ -121,14 +169,14 @@ void *mmap(void *addr, size_t length, int prot, int flags,
         trace_memory_mmap_err(errno);
         return MAP_FAILED;
     }
-    // Anonymous memory is heap memory: whole pages with a reservation of
-    // their own. MAP_FIXED has no answer here, since the heap picks addresses.
+    // MAP_FIXED has no answer here, since the address space manager picks
+    // addresses.
     if (flags & MAP_FIXED) {
         errno = ENOTSUP;
         trace_memory_mmap_err(errno);
         return MAP_FAILED;
     }
-    ret = mem::heap::alloc_pages(length, mmap_perm);
+    ret = anon_map(length, mmap_perm);
     if (!ret) {
         errno = ENOMEM;
         trace_memory_mmap_err(errno);
@@ -157,8 +205,10 @@ int munmap(void *addr, size_t length)
         return -1;
     }
     int ret = 0;
-    if (mem::heap::owns(addr)) {
-        mem::heap::free(addr);
+    // A mapping is given back whole, at the address mmap() returned.
+    auto *r = anon_at(addr);
+    if (r && r->span.start == reinterpret_cast<uintptr_t>(addr)) {
+        anon_unmap(r);
     } else {
         errno = EINVAL;
         ret = -1;
@@ -173,27 +223,27 @@ int munmap(void *addr, size_t length)
 OSV_LIBC_API
 int msync(void *addr, size_t length, int flags)
 {
-    if (!mem::heap::owns(addr)) {
+    if (!anon_at(addr)) {
         errno = ENOMEM;
         return -1;
     }
     return 0;
 }
 
-// Nothing is given back: the frames under an allocation belong to it until it
-// is freed. MADV_DONTNEED is accepted and does nothing.
+// Nothing is given back: the frames under a mapping belong to it until it is
+// unmapped. MADV_DONTNEED is accepted and does nothing.
 OSV_LIBC_API
 int madvise(void *addr, size_t length, int advice)
 {
-    if (!mem::heap::owns(addr)) {
+    if (!anon_at(addr)) {
         errno = ENOMEM;
         return -1;
     }
     return 0;
 }
 
-// brk/sbrk are not supported: nothing asks for them, and a program break
-// wants a lazily backed region, which anonymous memory here is not.
+// brk/sbrk are not supported: nothing asks for them, and a program break wants
+// a lazily backed region, which anonymous memory here is not.
 OSV_LIBC_API
 int brk(void *)
 {
@@ -210,5 +260,5 @@ void *sbrk(intptr_t)
 
 OSV_LIBC_API
 int posix_madvise(void *addr, size_t len, int advice) {
-    return mem::heap::owns(addr) ? 0 : ENOMEM;
+    return anon_at(addr) ? 0 : ENOMEM;
 }

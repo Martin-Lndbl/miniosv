@@ -9,7 +9,7 @@
 #include <osv/irqlock.hh>
 #include <osv/kernel_config.h>
 #include <osv/mem/mapping.hh>
-#include <osv/mmu.hh>
+#include <osv/mem/fault.hh>
 #include <osv/sched.hh>
 #include <osv/trace.hh>
 
@@ -76,7 +76,7 @@ void page_fault(exception_frame *ef)
     assert(!(ef->spsr & processor::daif_i));
 
     DROP_LOCK(irq_lock) {
-        mmu::vm_fault(addr, ef);
+        mem::vm_fault(addr, ef);
     }
 
 #if CONF_logger_debug

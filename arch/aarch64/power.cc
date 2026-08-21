@@ -5,7 +5,7 @@
  * BSD license as described in the LICENSE file in the top-level directory.
  */
 
-#include <osv/mempool.hh>
+#include "core/mem/heap/histogram.hh"
 #include <smp.hh>
 #include <osv/power.hh>
 #include <osv/debug.hh>
@@ -28,7 +28,7 @@ void halt(void)
 
 void poweroff(void)
 {
-    memory::histogram_dump();
+    mem::heap::histogram_dump();
 
     int ret = psci::_psci.system_off();
     debug_early("power: poweroff failed: ");

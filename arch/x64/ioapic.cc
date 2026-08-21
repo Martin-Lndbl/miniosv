@@ -7,7 +7,6 @@
 
 #include <osv/interrupt.hh>
 #include "exceptions.hh"
-#include <osv/mmu.hh>
 #include <osv/mutex.h>
 #include <osv/mem/frames.hh>
 #include <osv/mem/phys.hh>

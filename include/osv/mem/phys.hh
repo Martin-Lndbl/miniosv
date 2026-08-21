@@ -12,6 +12,12 @@
 
 namespace mem {
 
+// Linear map
+constexpr uintptr_t linear_base = 0x400000000000;
+constexpr uintptr_t linear_size = uintptr_t(1) << 44;
+
+inline char *const linear = reinterpret_cast<char *>(linear_base);
+
 /*
  * A pointer to [pa, pa+bytes). Range is rounded out to whole page.
  * Mapping twice is allowed if the frames correspond (drivers do this).
@@ -19,6 +25,10 @@ namespace mem {
  * Never unmapped: everything mapped with this function shares the lifetime of the kernel.
  */
 void *map_phys(frames::phys_addr pa, size_t bytes, mattr ma = mattr::normal);
+
+// Same but can also be outside of the linear map (mostly used by drivers).
+void map_phys_at(void *virt, frames::phys_addr pa, size_t bytes,
+                 size_t slop = 4096, mattr ma = mattr::normal);
 
 }
 

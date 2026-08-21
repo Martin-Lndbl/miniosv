@@ -9,9 +9,13 @@
 
 #include <osv/align.hh>
 #include <osv/mem/frames.hh>
-#include <osv/mmu.hh>
+#include <cassert>
+#include <osv/ilog2.hh>
+
+#include "../linear.hh"
 
 #include "internal.hh"
+#include <osv/mem/mapping.hh>
 
 namespace mem {
 namespace frames {
@@ -30,7 +34,7 @@ unsigned order_of(size_t frames)
 // which is what lets free() work from the size alone.
 size_t frames_for(size_t bytes)
 {
-    size_t need = align_up(bytes, size_t(mmu::page_size)) >> mmu::page_size_shift;
+    size_t need = align_up(bytes, size_t(mem::mapping::page_size)) >> mem::mapping::page_size_shift;
     unsigned order = order_of(need);
     return order <= block_max ? (size_t(1) << order) : need;
 }
@@ -77,7 +81,7 @@ uint64_t claim_run(size_t need, size_t align)
 {
     // Frame 0 is never handed out, so a physical address of 0 can mean "no
     // memory"; start the search above it.
-    uint64_t step = align >> mmu::page_size_shift;
+    uint64_t step = align >> mem::mapping::page_size_shift;
     uint64_t first = step;
     if (need >= (size_t(1) << block_max) && step < (uint64_t(1) << block_max)) {
         step = uint64_t(1) << block_max;

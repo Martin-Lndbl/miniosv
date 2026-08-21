@@ -15,7 +15,6 @@
 #include <osv/preempt-lock.hh>
 #include <osv/migration-lock.hh>
 #include <osv/wait_record.hh>
-#include <osv/mempool.hh>
 #include <osv/kernel_config.h>
 
 namespace osv {

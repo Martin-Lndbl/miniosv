@@ -171,12 +171,13 @@ constexpr bool tlb_is_broadcast = true;
 }
 }
 
-// boot time memory layout and limits, set up by arch_setup_free_memory().
-namespace mmu {
+namespace mem {
+namespace frames {
 
 // Base of physical RAM, rounded down to 2 MiB. Set by uefi_memory_setup().
-extern u64 mem_addr;
+extern u64 ram_base;
 
+}
 }
 
 #endif /* ARCH_MEM_HW_HH */

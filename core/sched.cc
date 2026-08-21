@@ -7,7 +7,6 @@
 
 #include <osv/sched.hh>
 #include <osv/mem/mapping.hh>
-#include <osv/mmu.hh>
 #include <list>
 #include <osv/mutex.h>
 #include <osv/rwlock.h>

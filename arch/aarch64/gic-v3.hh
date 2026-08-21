@@ -49,6 +49,7 @@
 
 #include "gic-common.hh"
 #include <osv/spinlock.h>
+#include <osv/mem/frames.hh>
 
 #define GICD_CTLR_WRITE_COMPLETE   (1UL << 31)
 #define GICD_CTLR_ARE_NS           (1U << 4)

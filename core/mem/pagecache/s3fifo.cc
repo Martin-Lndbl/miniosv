@@ -27,7 +27,8 @@ constexpr size_t small_share = 10;
 // Buffers one call to evict() looks at before giving up on finding a cold one.
 constexpr unsigned steps_max = 4096;
 
-constexpr int64_t ring_cap0 = 1024;
+constexpr int64_t ring_cap_min = 1024;
+constexpr int64_t ring_cap_max = 1 << 20;
 constexpr unsigned retired_max = 40;
 
 struct ring {
@@ -178,6 +179,12 @@ void *create(uint64_t store_size)
     s->n = sched::cpus.size();
     s->at = static_cast<shard *>(std::calloc(s->n, sizeof(shard)));
 
+    // Avoid allocating when we are growing the queue.
+    uint64_t capacity = std::min<uint64_t>(store_size, frames::phys_mem_size) / page_size;
+    int64_t cap = int64_t(1) << ilog2_roundup(
+        std::min<uint64_t>(std::max<uint64_t>(capacity / s->n, ring_cap_min),
+                           ring_cap_max));
+
     uint64_t want = std::min<uint64_t>(
         std::max<uint64_t>(store_size / page_size / 8, 1024), 1u << 20);
     s->ghost_mask = (size_t(1) << ilog2_roundup(want)) - 1;
@@ -187,8 +194,8 @@ void *create(uint64_t store_size)
     bool ok = s->at && s->ghost;
     for (unsigned i = 0; ok && i < s->n; i++) {
         new (&s->at[i]) shard();
-        s->at[i].small.arr.store(ring_make(ring_cap0), std::memory_order_relaxed);
-        s->at[i].main.arr.store(ring_make(ring_cap0), std::memory_order_relaxed);
+        s->at[i].small.arr.store(ring_make(cap), std::memory_order_relaxed);
+        s->at[i].main.arr.store(ring_make(cap), std::memory_order_relaxed);
         ok = s->at[i].small.arr.load(std::memory_order_relaxed) &&
              s->at[i].main.arr.load(std::memory_order_relaxed);
     }

@@ -11,7 +11,6 @@
 #include "msr.hh"
 #include "apic.hh"
 #include "ioapic.hh"
-#include <osv/mmu.hh>
 #include <string.h>
 #if CONF_drivers_acpi
 #include <drivers/acpi.hh>

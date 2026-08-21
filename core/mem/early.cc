@@ -18,6 +18,8 @@
 #include <cassert>
 #include <cstdint>
 
+#include <algorithm>
+
 #include <osv/align.hh>
 #include <osv/debug.hh>
 #include <osv/mem/early.hh>
@@ -65,6 +67,44 @@ unsigned short *size_field(void *object)
             static_cast<char *>(object) - sizeof(unsigned short));
 }
 
+// Big allocation
+constexpr unsigned short big_mark = 0xffff;
+
+struct big_header {
+    size_t total;
+    uint32_t offset;            // from the start of the run to the object
+    unsigned short pad;
+    unsigned short mark;        // sits in the two bytes before the object
+};
+
+constexpr size_t big_offset = sizeof(big_header);
+
+void *big_alloc(size_t bytes, size_t alignment)
+{
+    size_t offset = align_up(big_offset, alignment);
+    size_t total = align_up(bytes + offset, page_size);
+    frames::phys_addr p = frames::alloc(total, std::max(alignment, page_size));
+    if (p == frames::no_memory) {
+        return nullptr;
+    }
+    char *obj = static_cast<char *>(frames::to_linear(p)) + offset;
+    auto *h = reinterpret_cast<big_header *>(obj - sizeof(big_header));
+    h->total = total;
+    h->offset = offset;
+    h->mark = big_mark;
+    return obj;
+}
+
+bool is_big(void *p)
+{
+    return *size_field(p) == big_mark;
+}
+
+big_header *big_header_of(void *p)
+{
+    return reinterpret_cast<big_header *>(static_cast<char *>(p) - sizeof(big_header));
+}
+
 // Not the boot allocator: by the time this needs a page, llfree may already
 // own the memory. frames::alloc() picks whichever is current.
 void take_page()
@@ -101,6 +141,9 @@ bool takes(size_t bytes, size_t alignment)
 
 void *alloc(size_t bytes, size_t alignment)
 {
+    if (!takes(bytes, alignment)) {
+        return big_alloc(bytes, alignment);
+    }
     WITH_LOCK(lock) {
         if (!page) {
             take_page();
@@ -125,6 +168,12 @@ void *alloc(size_t bytes, size_t alignment)
 
 void free(void *p)
 {
+    if (is_big(p)) {
+        auto *b = big_header_of(p);
+        frames::free(frames::from_linear(static_cast<char *>(p) - b->offset),
+                     b->total);
+        return;
+    }
     WITH_LOCK(lock) {
         page_header *h = header_of(p);
         unsigned short bytes = *size_field(p);
@@ -151,11 +200,18 @@ void free(void *p)
 
 size_t size_of(void *p)
 {
+    if (is_big(p)) {
+        auto *b = big_header_of(p);
+        return b->total - b->offset;
+    }
     return *size_field(p);
 }
 
 bool owns(void *p)
 {
+    if (is_big(p)) {
+        return true;
+    }
     page_header *h = header_of(p);
     WITH_LOCK(lock) {
         for (unsigned i = 0; i < held_count; i++) {

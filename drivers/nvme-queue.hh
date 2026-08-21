@@ -21,7 +21,7 @@ namespace pci { class device; }
 #define nvme_w(...)    tprintf_w(nvme_tag, __VA_ARGS__)
 #define nvme_e(...)    tprintf_e(nvme_tag, __VA_ARGS__)
 
-#define NVME_PAGESIZE  mmu::page_size
+#define NVME_PAGESIZE  mem::mapping::page_size
 #define NVME_PAGESHIFT 12
 
 namespace nvme {

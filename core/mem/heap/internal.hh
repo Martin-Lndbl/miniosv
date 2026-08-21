@@ -94,7 +94,7 @@ void *paged_alloc(size_t bytes, size_t alignment);
 constexpr size_t large_min = 2ul << 20;
 
 // Reserve, allocate and map `bytes` (dedicated reservation).
-void *large_alloc(size_t bytes);
+void *large_alloc(size_t bytes, size_t alignment = mapping::page_size);
 
 // Give back what large_alloc returned. The pointer must be one of its results.
 void large_free(void *p);

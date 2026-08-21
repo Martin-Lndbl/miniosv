@@ -37,7 +37,7 @@ struct range {
     }
 };
 
-// Access permissions. The values match the hardware-facing mmu::perm_* set.
+// Access permissions. The values match the hardware-facing permission bits.
 enum {
     perm_none = 0,
     perm_read = 1,

@@ -5,6 +5,7 @@
  * BSD license as described in the LICENSE file in the top-level directory.
  */
 
+#include <osv/align.hh>
 #include <osv/debug.hh>
 #include <osv/mem/frames.hh>
 #include <osv/mem/heap.hh>
@@ -247,22 +248,21 @@ void page_put(uint32_t i)
     }
 }
 
-// Decides the size class of the object.
+// A reservation is aligned to the huge page it starts on, and nothing here
+// can do better than that.
 bool takes(size_t bytes, size_t alignment)
 {
-    if (bytes > alloc_max) {
-        // A reservation of its own, aligned to the huge page it starts on.
-        return alignment <= large_min;
-    }
-    // An object below small_max is aligned to its own class.
-    // Objects above small_max are aligned to their own size.
-    return std::max(bytes, alignment) <= small_max || alignment <= align_max;
+    return alignment <= large_min;
 }
 
 void *alloc(size_t bytes, size_t alignment)
 {
     assert(takes(bytes, alignment));
-    return bytes > alloc_max ? large_alloc(bytes) : paged_alloc(bytes, alignment);
+    if (bytes <= alloc_max &&
+        (alignment <= align_max || std::max(bytes, alignment) <= small_max)) {
+        return paged_alloc(bytes, alignment);
+    }
+    return large_alloc(bytes, alignment);
 }
 
 void free(void *p)

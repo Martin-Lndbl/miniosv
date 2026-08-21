@@ -161,13 +161,13 @@ constexpr bool tlb_is_broadcast = false;
 }
 }
 
-// boot time memory layout and limits, set up by arch_setup_free_memory().
-namespace mmu {
+namespace mem {
+namespace mapping {
 
 // Widths reported by CPUID.
-constexpr uint8_t max_phys_bits = mem::mapping::addr_bits;
-extern uint8_t phys_bits, virt_bits;
+constexpr uint8_t max_phys_bits = addr_bits;
 
+}
 }
 
 #endif /* ARCH_MEM_HW_HH */

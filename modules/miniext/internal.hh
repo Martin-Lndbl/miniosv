@@ -10,7 +10,8 @@
 #include <memory>
 #include <vector>
 #include <osv/condvar.h>
-#include <osv/contiguous_alloc.hh>
+#include <osv/mem/frames.hh>
+#include <osv/mem/phys.hh>
 #include <osv/mutex.h>
 #include <osv/rwlock.h>
 #include <osv/sched.hh>
@@ -93,12 +94,14 @@ private:
 class scratch {
 public:
     explicit scratch(uint32_t size)
-        : _p(static_cast<uint8_t *>(
-              memory::alloc_phys_contiguous_aligned(size, size))), _size(size) {}
+        : _pa(mem::frames::alloc(size, size)), _size(size)
+    {
+        _p = _pa ? static_cast<uint8_t *>(mem::map_phys(_pa, size)) : nullptr;
+    }
     ~scratch()
     {
         if (_p) {
-            memory::free_phys_contiguous_aligned(_p, _size);
+            mem::frames::free(_pa, _size);
         }
     }
     scratch(const scratch &) = delete;
@@ -108,6 +111,7 @@ public:
     explicit operator bool() const { return _p != nullptr; }
 
 private:
+    mem::frames::phys_addr _pa;
     uint8_t *_p;
     uint32_t _size;
 };

@@ -12,7 +12,6 @@
 #include <functional>
 #include <osv/mutex.h>
 #include <osv/debug.hh>
-#include <osv/mmu.hh>
 #include <osv/sched.hh>
 #include <osv/trace.hh>
 #include <osv/mem/mapping.hh>
@@ -263,6 +262,7 @@ class virtio_driver;
         virtio_driver* _driver;
         u16 _q_index;
         // The physical of the physical address handed to the virtio device
+        mem::frames::phys_addr _vring_pa;
         void* _vring_ptr;
         size_t _vring_size;
         
