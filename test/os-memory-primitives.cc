@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <thread>
 #include <vector>
 
@@ -22,6 +23,8 @@
 #include <osv/mem/frames.hh>
 #include <osv/mem/heap.hh>
 #include <osv/mem/mapping.hh>
+#include <osv/mem/pagecache.hh>
+#include <osv/mem/store.hh>
 #include <osv/mem/vspace.hh>
 #include <osv/mempool.hh>
 #include <osv/mmu.hh>
@@ -1052,6 +1055,482 @@ void heap_functional()
     }
 }
 
+/* page cache -------------------------------------------------------------- */
+
+/*
+ * A backend with nothing behind it: every byte is a function of where it is, so
+ * an object of any size costs nothing to serve and every byte read can be
+ * checked against what it should have been. Synchronous, since what is being
+ * tested here is the cache and not a driver.
+ */
+struct pattern_store : mem::store {
+    explicit pattern_store(uint64_t bytes) : _bytes(bytes) {}
+
+    uint64_t size() override { return _bytes; }
+
+    mem::io *read(void *buf, uint64_t off, size_t bytes) override
+    {
+        fill(static_cast<uint8_t *>(buf), off, bytes);
+        reads += bytes;
+        return done_with(bytes);
+    }
+
+    mem::io *write(const void *buf, uint64_t off, size_t bytes) override
+    {
+        // Only where a test is going to look. Where the hardware keeps no
+        // dirty bit every eviction writes back, and an object larger than
+        // memory would put every byte of itself in here.
+        if (record) {
+            auto *w = static_cast<const uint64_t *>(buf);
+            for (size_t i = 0; i < bytes / sizeof(uint64_t); i++) {
+                written[off + i * sizeof(uint64_t)] = w[i];
+            }
+        }
+        writes += bytes;
+        return done_with(bytes);
+    }
+
+    bool done(mem::io *) override { return true; }
+
+    int64_t wait(mem::io *req) override
+    {
+        auto *r = reinterpret_cast<int64_t *>(req);
+        int64_t n = *r;
+        delete r;
+        return n;
+    }
+
+    // Every aligned word is its own offset, so a byte anywhere says where it
+    // came from and a transfer of any length can be checked.
+    static uint64_t word(uint64_t off) { return off; }
+
+    static void fill(uint8_t *p, uint64_t off, size_t n)
+    {
+        size_t whole = n & ~size_t(7);
+        auto *w = reinterpret_cast<uint64_t *>(p);
+        for (size_t i = 0; i < whole / sizeof(uint64_t); i++) {
+            w[i] = off + i * sizeof(uint64_t);
+        }
+        for (size_t i = whole; i < n; i++) {
+            p[i] = uint8_t((off + (i & ~size_t(7))) >> (8 * (i & 7)));
+        }
+    }
+
+    uint64_t _bytes;
+    bool record = false;
+    std::atomic<size_t> reads{0};
+    std::atomic<size_t> writes{0};
+    std::map<uint64_t, uint64_t> written;   // only where a test wrote something
+
+private:
+    mem::io *done_with(size_t bytes)
+    {
+        return reinterpret_cast<mem::io *>(new int64_t(bytes));
+    }
+};
+
+// Reads that ask for more than a page at a time, to check that a buffer is
+// whatever the policy says it is rather than always one page.
+size_t fault_64k(void *, uint64_t) { return 64 * 1024; }
+
+// Three pages and a bit: bigger than a couple of pages, and no whole number of
+// them, so consecutive buffers begin and end part-way through one.
+const uint64_t ragged_span = 3 * 4096 + 1000;
+size_t fault_ragged(void *, uint64_t) { return ragged_span; }
+
+// Megabytes and misaligned: the analytics-page shape, with whole 2 MiB spans
+// inside every buffer.
+const uint64_t big_span = (5ull << 20) + 12345;
+size_t fault_big(void *, uint64_t) { return big_span; }
+
+void pagecache_functional()
+{
+    group("pagecache");
+    namespace pc = mem::pagecache;
+
+    section("a page is read in when it is touched, and not before");
+    {
+        pattern_store s(16 * huge);
+        void *m = pc::map(s);
+        CHECK(m != nullptr);
+        CHECK(!pc::resident(m));
+        CHECK(s.reads.load() == 0);
+
+        auto *w = static_cast<volatile uint64_t *>(m);
+        CHECK(w[0] == pattern_store::word(0));
+        CHECK(pc::resident(m));
+        CHECK(s.reads.load() == page);
+
+        // Somewhere else entirely, which the first fault cannot have covered.
+        auto *far = reinterpret_cast<volatile uint64_t *>(
+            static_cast<char *>(m) + 8 * huge);
+        CHECK(!pc::resident(const_cast<uint64_t *>(far)));
+        CHECK(far[0] == pattern_store::word(8 * huge));
+        CHECK(s.reads.load() == 2 * page);
+        pc::unmap(m);
+    }
+
+    section("a buffer is as big as the policy asks for");
+    {
+        pattern_store s(16 * huge);
+        pc::policy p = pc::defaults();
+        p.fault_size = fault_64k;
+
+        void *m = pc::map(s, p);
+        CHECK(m != nullptr);
+        auto *b = static_cast<char *>(m);
+        CHECK(*reinterpret_cast<volatile uint64_t *>(b + 8 * page) ==
+              pattern_store::word(8 * page));
+
+        // One transfer, and the fifteen pages around it are there without
+        // another fault between them.
+        CHECK(s.reads.load() == 64 * 1024);
+        for (int i = 0; i < 16; i++) {
+            CHECK(pc::resident(b + i * page));
+        }
+        CHECK(!pc::resident(b + 16 * page));
+        pc::unmap(m);
+    }
+
+    section("a buffer holds every page it touches, shared edges included");
+    {
+        /*
+         * Buffers of an awkward size, which is the case this is all for: an
+         * analytics page is whatever it is, and consecutive ones land wherever
+         * the one before them ended.
+         *
+         *   bytes 0     13288       26576       39864       53152
+         *         |  b0   |    b1     |    b2     |    b3     |
+         *   pages 0  1  2  3  4  5  6  7  8  9 10 11 12
+         *
+         * b2 is [26576, 39864). Pages 7 and 8 are inside it; pages 6 and 9 it
+         * shares with the buffer either side, and it holds those whole.
+         */
+        const uint64_t span = ragged_span;
+        pattern_store s(16 * huge);
+        pc::policy p = pc::defaults();
+        p.fault_size = fault_ragged;
+
+        void *m = pc::map(s, p);
+        CHECK(m != nullptr);
+        auto *b = static_cast<char *>(m);
+
+        const uint64_t b2 = 2 * span;
+        const uint64_t lo = b2 / page;                       // 6, shared below
+        const uint64_t hi = (3 * span - 1) / page;           // 9, shared above
+        CHECK(lo * page < b2);                               // it really is shared
+        CHECK((hi + 1) * page > 3 * span);
+
+        // One touch in the middle of it. A fault names the page it happened
+        // in, not the byte, so this has to be somewhere the page it lands in
+        // begins inside b2 -- which is what "inner" means here.
+        const uint64_t mid = (b2 + span / 2) & ~uint64_t(7);
+        CHECK(*reinterpret_cast<volatile uint64_t *>(b + mid) ==
+              pattern_store::word(mid));
+
+        // Every page it touches came in, the two it only partly owns included,
+        // and nothing beyond them did.
+        for (uint64_t i = lo; i <= hi; i++) {
+            CHECK(pc::resident(b + i * page));
+        }
+        CHECK(!pc::resident(b + (lo - 1) * page));
+        CHECK(!pc::resident(b + (hi + 1) * page));
+        CHECK(s.reads.load() == (hi - lo + 1) * page);
+
+        // The bytes of b2 that fell in those shared pages are readable now,
+        // although the buffers they belong to have never been faulted.
+        CHECK(*reinterpret_cast<volatile uint64_t *>(b + lo * page) ==
+              pattern_store::word(lo * page));
+        CHECK(*reinterpret_cast<volatile uint64_t *>(b + hi * page) ==
+              pattern_store::word(hi * page));
+
+        // Its neighbour now finds one of its own pages taken. It stops at the
+        // edge rather than fighting for it, so it comes up short by the part
+        // of itself that fell in page "lo".
+        size_t before = s.reads.load();
+        CHECK(*reinterpret_cast<volatile uint64_t *>(b + span) ==
+              pattern_store::word(span));
+        CHECK(s.reads.load() - before == (lo - span / page) * page);
+        CHECK(pc::resident(b + span));
+        // b1 starts part-way through page 3, and that page came in with it and
+        // not with b0, which has still not been read at all.
+        CHECK(pc::resident(b + (span / page) * page));
+        CHECK(!pc::resident(b + (span / page - 1) * page));
+
+        // And every byte of the four of them reads as the object says, across
+        // the seams and through the pages two buffers had a claim on.
+        bool ok = true;
+        for (uint64_t off = 0; off < 4 * span; off += sizeof(uint64_t)) {
+            ok &= *reinterpret_cast<volatile uint64_t *>(b + off) ==
+                  pattern_store::word(off);
+        }
+        CHECK(ok);
+        pc::unmap(m);
+    }
+
+    section("a page two buffers fall in goes to the one that was reached for");
+    {
+        // Page 3 holds the end of b0 and the start of b1. Which of them it
+        // comes in with is decided by the byte that faulted, so the same page
+        // goes either way depending on what was touched.
+        const uint64_t span = ragged_span;
+        const uint64_t seam = span / page;               // 3
+        const uint64_t here = seam * page;               // 12288, still b0
+
+        {
+            pattern_store s(16 * huge);
+            pc::policy p = pc::defaults();
+            p.fault_size = fault_ragged;
+            void *m = pc::map(s, p);
+            auto *b = static_cast<char *>(m);
+
+            CHECK(*reinterpret_cast<volatile uint64_t *>(b + here) ==
+                  pattern_store::word(here));
+            // b0 is [0, span): pages 0 to 3.
+            CHECK(pc::resident(b));
+            CHECK(pc::resident(b + here));
+            CHECK(!pc::resident(b + here + page));
+            CHECK(s.reads.load() == (seam + 1) * page);
+            pc::unmap(m);
+        }
+        {
+            pattern_store s(16 * huge);
+            pc::policy p = pc::defaults();
+            p.fault_size = fault_ragged;
+            void *m = pc::map(s, p);
+            auto *b = static_cast<char *>(m);
+
+            // The same page, a few hundred bytes further along, where b1
+            // begins. It comes in with b1 instead, and b0 is untouched.
+            CHECK(*reinterpret_cast<volatile uint64_t *>(b + span) ==
+                  pattern_store::word(span));
+            CHECK(!pc::resident(b));
+            CHECK(pc::resident(b + here));
+            CHECK(pc::resident(b + here + page));
+            // b1 is [span, 2 * span): pages 3 to 6.
+            const uint64_t last = (2 * span - 1) / page;
+            CHECK(s.reads.load() == (last + 1 - seam) * page);
+            pc::unmap(m);
+        }
+    }
+
+    section("an object that ends part-way through a page");
+    {
+        const uint64_t odd = 4 * huge + 1234;
+        pattern_store s(odd);
+        void *m = pc::map(s);
+        CHECK(m != nullptr);
+        auto *b = static_cast<char *>(m);
+
+        const uint64_t last = (odd - 8) & ~uint64_t(7);
+        CHECK(*reinterpret_cast<volatile uint64_t *>(b + last) ==
+              pattern_store::word(last));
+        // The store has no more to give, and what is left of the page it ended
+        // in is reachable, so it has to be something. It is zero.
+        CHECK(b[odd] == 0);
+        CHECK(b[odd + 100] == 0);
+        pc::unmap(m);
+    }
+
+    section("fetch brings in a range in one go");
+    {
+        pattern_store s(16 * huge);
+        void *m = pc::map(s);
+        CHECK(m != nullptr);
+        CHECK(pc::fetch(m, 32 * page) == 32 * page);
+        CHECK(s.reads.load() == 32 * page);
+
+        auto *w = static_cast<volatile uint64_t *>(m);
+        bool ok = true;
+        for (size_t i = 0; i < 32 * page / sizeof(uint64_t); i++) {
+            ok &= w[i] == pattern_store::word(i * sizeof(uint64_t));
+        }
+        CHECK(ok);
+        // Nothing more was read: fetch left the pages mapped, not just fetched.
+        CHECK(s.reads.load() == 32 * page);
+        pc::unmap(m);
+    }
+
+    section("what is written goes back on sync, and again on unmap");
+    {
+        pattern_store s(16 * huge);
+        s.record = true;
+        void *m = pc::map(s);
+        CHECK(m != nullptr);
+
+        auto *w = static_cast<uint64_t *>(m);
+        w[0] = 0xfeed;
+        CHECK(pc::sync(m, page) == (int64_t)page);
+        CHECK(s.written[0] == 0xfeed);
+        CHECK(s.writes.load() == page);
+
+        // Nothing has changed since, so there is nothing to write -- where the
+        // hardware says so. Where it does not, everything reads as written to.
+        if (mem::mapping::tracks_writes) {
+            CHECK(pc::sync(m, page) == 0);
+            CHECK(s.writes.load() == page);
+        }
+
+        auto *later = reinterpret_cast<uint64_t *>(static_cast<char *>(m) + 4 * page);
+        *later = 0xbeef;
+        pc::unmap(m);
+        CHECK(s.written[4 * page] == 0xbeef);
+    }
+
+    section("a cache with a limit stays inside it");
+    {
+        const size_t cap = 64 << 20;
+        pattern_store s(8ull << 30);
+        size_t before = mem::frames::free_bytes();
+        void *m = pc::map(s, pc::defaults(), cap);
+        CHECK(m != nullptr);
+
+        auto *b = static_cast<char *>(m);
+        bool ok = true;
+        size_t worst = 0;
+        for (uint64_t off = 0; off < 8 * size_t(cap); off += page) {
+            ok &= *reinterpret_cast<volatile uint64_t *>(b + off) ==
+                  pattern_store::word(off);
+            size_t held = before - mem::frames::free_bytes();
+            worst = std::max(worst, held);
+        }
+        CHECK(ok);
+        // Eight times its limit went through it, and it never held much more
+        // than the limit at once. The slack is the table and the policy's own
+        // memory, which the limit does not cover.
+        CHECK(worst < cap + (cap / 2));
+        printf("      a %zu MiB limit held at most %zu MiB\n", cap >> 20, worst >> 20);
+        pc::unmap(m);
+    }
+
+    section("a big misaligned buffer takes huge frames where it can");
+    {
+        pattern_store s(1ull << 30);
+        pc::policy p = pc::defaults();
+        p.fault_size = fault_big;
+        void *m = pc::map(s, p);
+        CHECK(m != nullptr);
+        auto *b = static_cast<char *>(m);
+
+        // One touch in the second tile brings its whole ~5 MiB in.
+        const uint64_t off = (big_span + 3 * page) & ~uint64_t(7);
+        CHECK(*reinterpret_cast<volatile uint64_t *>(b + off) ==
+              pattern_store::word(off));
+        size_t foot = ((2 * big_span - 1) / page - big_span / page + 1) * page;
+        CHECK(s.reads.load() == foot);
+
+        // The aligned 2 MiB spans inside it are single level-1 leaves; the
+        // ragged lead is small entries.
+        uintptr_t base = reinterpret_cast<uintptr_t>(b);
+        auto h = map::find(base + align_up(big_span, uint64_t(huge)));
+        CHECK(bool(h));
+        CHECK(h.level() == 1);
+        auto l = map::find(base + align_down(big_span, uint64_t(page)));
+        CHECK(bool(l));
+        CHECK(l.level() == 0);
+
+        // Every byte of it, seams and huge interiors alike.
+        bool ok = true;
+        for (uint64_t o = big_span; o < 2 * big_span; o += 8) {
+            ok &= *reinterpret_cast<volatile uint64_t *>(b + (o & ~uint64_t(7))) ==
+                  pattern_store::word(o & ~uint64_t(7));
+        }
+        CHECK(ok);
+        pc::unmap(m);
+    }
+
+    section("big buffers cycle through a limit");
+    {
+        const size_t cap = 64 << 20;
+        pattern_store s(1ull << 30);
+        pc::policy p = pc::defaults();
+        p.fault_size = fault_big;
+        size_t before = mem::frames::free_bytes();
+        void *m = pc::map(s, p, cap);
+        CHECK(m != nullptr);
+        auto *b = static_cast<char *>(m);
+
+        // Eight limits' worth of object, one probe per tile.
+        bool ok = true;
+        size_t worst = 0;
+        for (uint64_t off = 0; off + 8 <= 8 * uint64_t(cap); off += big_span) {
+            uint64_t o = (off + big_span / 2) & ~uint64_t(7);
+            ok &= *reinterpret_cast<volatile uint64_t *>(b + o) ==
+                  pattern_store::word(o);
+            worst = std::max(worst, before - mem::frames::free_bytes());
+        }
+        CHECK(ok);
+        CHECK(worst < cap + (cap / 2));
+        printf("      %zu MiB of %zu KiB buffers through a %zu MiB limit, held %zu MiB\n",
+               size_t(8) * (cap >> 20), size_t(big_span >> 10), cap >> 20, worst >> 20);
+        pc::unmap(m);
+    }
+
+    section("ragged buffers survive eviction, from many threads");
+    {
+        // Buffers that share edge pages, a limit small enough that eviction
+        // runs the whole time, and every cpu faulting at once: the edge
+        // handover between a leaving buffer and an arriving neighbour has to
+        // hold under all of it.
+        pattern_store s(1ull << 30);
+        pc::policy p = pc::defaults();
+        p.fault_size = fault_ragged;
+        void *m = pc::map(s, p, 32 << 20);
+        CHECK(m != nullptr);
+
+        auto *b = static_cast<char *>(m);
+        std::atomic<bool> ok{true};
+        parallel(n_cpus(), [&](unsigned t) {
+            uint64_t seed = 0x9e3779b9u * (t + 1);
+            for (int i = 0; i < 20000; i++) {
+                seed = seed * 6364136223846793005ull + 1;
+                uint64_t off = (seed >> 16) % ((1ull << 30) - 8) & ~uint64_t(7);
+                if (*reinterpret_cast<volatile uint64_t *>(b + off) !=
+                    pattern_store::word(off)) {
+                    ok = false;
+                }
+            }
+        });
+        CHECK(ok);
+        pc::unmap(m);
+    }
+
+    section("a working set bigger than memory is served and served correctly");
+    {
+        // Twice what is free, so that the cache has to give pages back to
+        // reach the end of it, and has to fault back what it gave up.
+        const uint64_t bytes = (2 * mem::frames::free_bytes()) & ~(huge - 1);
+        pattern_store s(bytes);
+        void *m = pc::map(s);
+        CHECK(m != nullptr);
+
+        auto *b = static_cast<char *>(m);
+        bool ok = true;
+        for (uint64_t off = 0; off < bytes; off += page) {
+            ok &= *reinterpret_cast<volatile uint64_t *>(b + off) ==
+                  pattern_store::word(off);
+        }
+        CHECK(ok);
+        CHECK(s.reads.load() >= bytes);
+
+        // The start of the object is what was faulted longest ago, so going
+        // back to it reads it in again -- which is eviction, seen from outside.
+        size_t after_first_pass = s.reads.load();
+        for (uint64_t off = 0; off < bytes / 8; off += page) {
+            ok &= *reinterpret_cast<volatile uint64_t *>(b + off) ==
+                  pattern_store::word(off);
+        }
+        CHECK(ok);
+        // Most of that eighth had to come back from the store: it is the part
+        // that was faulted longest ago, and so the part a fifo gives up first.
+        CHECK(s.reads.load() - after_first_pass > bytes / 8 / 2);
+        printf("      %zu MiB of object through %zu MiB of memory, %zu MiB read\n",
+               (size_t)(bytes >> 20), mem::frames::total_available_bytes() >> 20,
+               s.reads.load() >> 20);
+        pc::unmap(m);
+    }
+}
+
 }
 
 int os_memory_primitives_main()
@@ -1067,6 +1546,7 @@ int os_memory_primitives_main()
     mapping_functional();
     mapping_perf();
     heap_functional();
+    pagecache_functional();
 
     return summary("MEMORY PRIMITIVE");
 }

@@ -5,12 +5,15 @@
 #ifndef MINIEXT_INTERNAL_HH
 #define MINIEXT_INTERNAL_HH
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <vector>
+#include <osv/condvar.h>
 #include <osv/contiguous_alloc.hh>
 #include <osv/mutex.h>
 #include <osv/rwlock.h>
+#include <osv/sched.hh>
 
 #include "miniext.hh"
 #include "ondisk.hh"
@@ -18,6 +21,17 @@
 namespace nvme { class io_queue_pair; class nvme_driver; }
 
 namespace miniext {
+
+// transfers in flight
+struct io_group {
+    std::atomic<unsigned> outstanding{1};   // the submitter's own hold
+    std::atomic<int> error{0};
+    sched::thread_handle waiter;
+
+    void hold() { outstanding.fetch_add(1, std::memory_order_relaxed); }
+    void drop();
+    bool settled() const { return outstanding.load(std::memory_order_acquire) == 0; }
+};
 
 // --- device -------------------------------------------------------------
 // Block layer folded inside the filesysstem. It owns NVMe queues (1 per vCPU)
@@ -38,6 +52,8 @@ public:
     int read(void *buf, uint64_t block, uint32_t count);
     int write(const void *buf, uint64_t block, uint32_t count);
     int flush();
+    int read_async(void *buf, uint64_t block, uint32_t count, io_group &g);
+    int write_async(const void *buf, uint64_t block, uint32_t count, io_group &g);
 
     uint64_t lba_count() const { return _lba_count; }
     uint32_t lba_size() const { return _lba_size; }
@@ -58,7 +74,9 @@ private:
     static std::shared_ptr<queue_set> queues_for(int nvme_id,
                                                  nvme::nvme_driver *drv);
     int submit(void *buf, uint64_t block, uint32_t count, bool write);
+    int submit_async(void *buf, uint64_t block, uint32_t count, bool write, io_group &g);
     int bounce(void *buf, uint64_t block, uint32_t count, bool write);
+    bool in_range(uint64_t block, uint32_t count) const;
     queue &pick();
 
     std::shared_ptr<queue_set> _queues;
@@ -136,6 +154,37 @@ struct open_inode {
     inode in;
     rwlock lock;
     int refs = 0;
+
+    /*
+     * Reads that have left the lock but not the device.
+     *
+     * A read lock cannot be held from aread() to await(): a caller batching
+     * several transfers would hold it several times over, and a writer
+     * arriving between two of them blocks the second -- the lock stops
+     * granting reads as soon as a writer is waiting. So a read holds it only
+     * while it decides where the blocks are, and counts itself here for as
+     * long as a transfer is on its way to them.
+     *
+     * A writer waits for that count to reach zero. It is holding the lock by
+     * then, so nothing new can join.
+     */
+    mutex io_lock;
+    condvar io_idle;
+    unsigned inflight = 0;
+};
+
+// One more transfer under way, and one fewer. Called with the read lock held
+// and with nothing held, in that order.
+void oi_io_begin(open_inode *oi);
+void oi_io_end(open_inode *oi);
+
+// Wait for the transfers already under way. With the write lock held.
+void oi_io_drain(open_inode *oi);
+
+// An open handle: which inode, and what it was opened for.
+struct file {
+    open_inode *oi;
+    int flags;
 };
 
 open_inode *oi_get(fs *f, uint32_t ino, const inode *in);

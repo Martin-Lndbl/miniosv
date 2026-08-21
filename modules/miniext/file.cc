@@ -27,11 +27,6 @@
 
 namespace miniext {
 
-struct file {
-    open_inode *oi;
-    int flags;
-};
-
 namespace {
 // Every handle onto an inode shares one entry, so a reader and a writer see the
 // same inode instead of private copies that drift apart.
@@ -141,6 +136,7 @@ file *open(const char *path, int flags, int *err)
 
     if (flags & O_TRUNC) {
         WITH_LOCK(oi->lock.for_write()) {
+            oi_io_drain(oi);
             int rc = inode_truncate(f, oi->ino, &oi->in, 0);
             if (rc < 0) {
                 SCOPE_LOCK(f->lock);
@@ -190,6 +186,9 @@ int64_t pwrite(file *fp, const void *buf, size_t len, uint64_t offset)
     }
     fs *f = get_fs();
     WITH_LOCK(fp->oi->lock.for_write()) {
+        // The lock stops new reads; these are the ones that already have a
+        // block number and are on their way to it.
+        oi_io_drain(fp->oi);
         return inode_pwrite(f, fp->oi->ino, &fp->oi->in, buf, len, offset);
     }
 }
@@ -204,6 +203,7 @@ int truncate(file *fp, uint64_t new_size)
     }
     fs *f = get_fs();
     WITH_LOCK(fp->oi->lock.for_write()) {
+        oi_io_drain(fp->oi);
         return inode_truncate(f, fp->oi->ino, &fp->oi->in, new_size);
     }
 }

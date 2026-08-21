@@ -697,6 +697,13 @@ objects += core/mem/heap/large.o
 objects += core/mem/heap/objects.o
 objects += core/mem/heap/window.o
 
+# The page cache: address space for an object bigger than memory, backed on
+# demand from a store.
+objects += core/mem/store.o
+objects += core/mem/pagecache/cache.o
+objects += core/mem/pagecache/reclaim.o
+objects += core/mem/pagecache/s3fifo.o
+
 # Not ours: llfree is vendored C, and does not build under the kernel's -Werror.
 $(out)/external/llfree/%.o: CFLAGS += -w -Wno-error -I external/llfree
 $(out)/core/mem/frames/%.o: CXXFLAGS += -I external/llfree
@@ -820,6 +827,7 @@ objects += modules/miniext/extent.o
 objects += modules/miniext/inode.o
 objects += modules/miniext/dir.o
 objects += modules/miniext/file.o
+objects += modules/miniext/aio.o
 objects += modules/miniext/raw.o
 objects += modules/miniext/fstream.o
 endif

@@ -7,6 +7,7 @@
  * Callbacks run on the allocation path, so must not block or allocate.
  */
 
+#include <algorithm>
 #include <atomic>
 
 #include <osv/kernel_config.h>
@@ -30,9 +31,10 @@ void pressure_init(size_t total_bytes)
     threshold = total_bytes / 100 * CONF_memory_pressure_percent;
 }
 
-void watch_pressure(pressure_watcher &w, pressure_fn cb)
+void watch_pressure(pressure_watcher &w, pressure_fn cb, unsigned order)
 {
     w.fn = cb;
+    w.order = order;
     w.next = watchers.load(std::memory_order_relaxed);
     while (!watchers.compare_exchange_weak(w.next, &w, std::memory_order_release,
                                            std::memory_order_relaxed)) {
@@ -52,16 +54,33 @@ bool reclaim()
         return false;
     }
     bool gave = false;
+    unsigned level = ~0u;
     for (pressure_watcher *w = head; w; w = w->next) {
-        gave |= w->fn();
+        level = std::min(level, w->order);
+    }
+    while (level != ~0u) {
+        unsigned next = ~0u;
+        for (pressure_watcher *w = head; w; w = w->next) {
+            if (w->order == level) {
+                gave |= w->fn();
+            } else if (w->order > level) {
+                next = std::min(next, w->order);
+            }
+        }
+        level = next;
     }
     in_callback.store(false);
     return gave;
 }
 
+bool under_pressure()
+{
+    return threshold && free_bytes() < threshold;
+}
+
 void check_pressure()
 {
-    if (!threshold || free_bytes() >= threshold) {
+    if (!under_pressure()) {
         return;
     }
     reclaim();

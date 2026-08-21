@@ -171,6 +171,77 @@ void protect(range r, unsigned perm)
     stale.invalidate();
 }
 
+// Whether any present leaf in the range has "bit" set.
+static bool any_leaf(range r, bool (*bit)(pte))
+{
+    bool found = false;
+    walk_opts o{false, false, false, max_leaf_level};
+    walk_range(page_align(r), o, [&](pte_ref e, uintptr_t) {
+        pte v = e.read();
+        found = pte_present(v) && bit(v);
+        return !found;
+    });
+    return found;
+}
+
+bool accessed(range r)
+{
+    return any_leaf(r, pte_accessed);
+}
+
+bool dirty(range r)
+{
+    return !tracks_writes || any_leaf(r, pte_dirty);
+}
+
+// Rewrite every present leaf in the range with one of its bits taken away,
+// telling "stale" about the ones that changed.
+static void clear_leaves(range r, pte (*without)(pte), pending_invalidation *stale)
+{
+    walk_opts o{false, false, false, max_leaf_level};
+    walk_range(page_align(r), o, [=](pte_ref e, uintptr_t va) {
+        pte old = e.read();
+        if (pte_present(old)) {
+            pte now = without(old);
+            if (now != old) {
+                e.write(now);
+                if (stale) {
+                    stale->add(va);
+                }
+            }
+        }
+        return true;
+    });
+    pte_barrier();
+    if (stale) {
+        stale->epoch = flush_epoch();
+    }
+}
+
+void clear_accessed(range r)
+{
+    clear_leaves(r, [](pte e) { return pte_set_accessed(e, false); }, nullptr);
+}
+
+static pte without_dirty(pte e)
+{
+    return pte_set_dirty(e, false);
+}
+
+void clear_dirty(range r)
+{
+    if (tracks_writes) {
+        clear_leaves(r, without_dirty, nullptr);
+    }
+}
+
+void clear_dirty(range r, pending_invalidation &stale)
+{
+    if (tracks_writes) {
+        clear_leaves(r, without_dirty, &stale);
+    }
+}
+
 void split(range r)
 {
     walk_opts o{false, true, false, 0};

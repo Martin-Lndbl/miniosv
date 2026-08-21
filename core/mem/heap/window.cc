@@ -183,7 +183,7 @@ void init()
         push(free_list, i);
     }
 
-    frames::watch_pressure(pressure, under_pressure);
+    frames::watch_pressure(pressure, under_pressure, frames::pressure_heap);
 
     window_start = window.span.start;
     window_end.store(window.span.end, std::memory_order_release);

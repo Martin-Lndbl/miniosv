@@ -20,6 +20,9 @@
 #include <string>
 #include <vector>
 
+#include <osv/mem/pagecache.hh>
+#include <osv/mem/store.hh>
+
 #include "modules/miniext/miniext.hh"
 
 namespace {
@@ -439,6 +442,84 @@ int os_miniext_main()
         }
     }
     check(miniext::unlink("/db/ooo.bin") == 0, "unlink ooo.bin");
+
+    // --- as a page cache backend ----------------------------------------
+    // The same file read twice: once through pread, and once as memory. The
+    // second way is what the async submit path is for, so a mismatch here is
+    // either the cache or the transfers it issues, and nothing else.
+    {
+        int err = 0;
+        miniext::file *f = miniext::open("/db/big.bin", miniext::O_RD, &err);
+        check(f != nullptr, "open /db/big.bin for the cache");
+        if (f) {
+            mem::store *s = miniext::store_open(f);
+            check(s != nullptr, "a store over big.bin");
+            void *m = s ? mem::pagecache::map(*s) : nullptr;
+            check(m != nullptr, "map big.bin");
+            if (m) {
+                check(!mem::pagecache::resident(m), "nothing is read until it is touched");
+
+                const auto *p = static_cast<const uint8_t *>(m);
+                uint64_t h = fnv1a(p, expected[1].size);
+                check(h == expected[1].fnv, "the mapping checksums as the file does");
+                check(mem::pagecache::resident(m), "and is resident afterwards");
+
+                // Read ahead of any fault, and checked against the same bytes
+                // taken the ordinary way.
+                std::vector<uint8_t> want(65536);
+                check(miniext::pread(f, want.data(), want.size(), 65536) ==
+                      (int64_t)want.size(), "pread the same range");
+                check(mem::pagecache::fetch(const_cast<uint8_t *>(p) + 65536,
+                                            want.size()) == want.size(),
+                      "fetch a range");
+                check(memcmp(p + 65536, want.data(), want.size()) == 0,
+                      "the fetched range is what the file holds");
+
+                mem::pagecache::unmap(m);
+            }
+            miniext::store_close(s);
+            miniext::close(f);
+        }
+    }
+
+    // Writing through it, which is the async write path and the write-back.
+    {
+        int err = 0;
+        miniext::file *f = miniext::open("/db/cached.bin",
+                                         miniext::O_RDWR | miniext::O_CREATE, &err);
+        check(f != nullptr, "create /db/cached.bin");
+        if (f) {
+            // A store is as big as the file was when it was made, so the file
+            // has to have its size before it is mapped.
+            const size_t bytes = 256 * 1024;
+            std::vector<uint8_t> zero(bytes, 0);
+            check(miniext::pwrite(f, zero.data(), bytes, 0) == (int64_t)bytes,
+                  "give cached.bin a size");
+
+            mem::store *s = miniext::store_open(f);
+            void *m = s ? mem::pagecache::map(*s) : nullptr;
+            check(m != nullptr, "map cached.bin");
+            if (m) {
+                auto *p = static_cast<uint8_t *>(m);
+                for (size_t i = 0; i < bytes; i++) {
+                    p[i] = (uint8_t)(i * 17 + 3);
+                }
+                check(mem::pagecache::sync(m, bytes) > 0, "sync writes it back");
+                mem::pagecache::unmap(m);
+            }
+            miniext::store_close(s);
+
+            // Through the filesystem, which never saw the stores at all.
+            std::vector<uint8_t> back(bytes);
+            bool ok = miniext::pread(f, back.data(), bytes, 0) == (int64_t)bytes;
+            for (size_t i = 0; ok && i < bytes; i++) {
+                ok = back[i] == (uint8_t)(i * 17 + 3);
+            }
+            check(ok, "pread sees what was written through the mapping");
+            miniext::close(f);
+        }
+    }
+    check(miniext::unlink("/db/cached.bin") == 0, "unlink cached.bin");
 
     check(miniext::sync() == 0, "final sync");
     check(miniext::umount() == 0, "umount");

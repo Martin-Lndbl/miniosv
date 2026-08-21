@@ -113,6 +113,13 @@ void detach_deferred(range r, pending_invalidation &stale);
 // Apply new permissions to a virtual range. Flushes the TLB if any permissions changed (arch-specific).
 void protect(range r, unsigned perm);
 
+// Helpers (arch-agnostic)
+bool accessed(range r);
+bool dirty(range r);
+void clear_accessed(range r);
+void clear_dirty(range r);
+void clear_dirty(range r, pending_invalidation &stale);
+
 // Break every large leaf in "r" into leaves of the smallest size.
 void split(range r);
 

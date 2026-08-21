@@ -49,7 +49,19 @@ void io_complete(void *ctx, const nvme_sq_entry_t *)
     req->done = true;
     req->waiter.wake_from_kernel_or_with_irq_disabled();
 }
+
+void group_complete(void *ctx, const nvme_sq_entry_t *)
+{
+    static_cast<io_group *>(ctx)->drop();
+}
 } // namespace
+
+void io_group::drop()
+{
+    if (outstanding.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        waiter.wake_from_kernel_or_with_irq_disabled();
+    }
+}
 
 int device::open(int nvme_id)
 {
@@ -160,6 +172,16 @@ void device::close()
     _queues.reset();
 }
 
+bool device::in_range(uint64_t block, uint32_t count) const
+{
+    if ((block + count) * static_cast<uint64_t>(_lbas_per_block) <= _lba_count) {
+        return true;
+    }
+    printf("miniext: I/O past end of namespace (block %lu count %u)\n",
+           (unsigned long)block, count);
+    return false;
+}
+
 int device::submit(void *buf, uint64_t block, uint32_t count, bool write)
 {
     if (!_queues || _queues->empty()) {
@@ -169,9 +191,7 @@ int device::submit(void *buf, uint64_t block, uint32_t count, bool write)
     const uint64_t byte_off = block * static_cast<uint64_t>(_block_size);
     const uint32_t byte_len = count * _block_size;
 
-    if ((block + count) * static_cast<uint64_t>(_lbas_per_block) > _lba_count) {
-        printf("miniext: I/O past end of namespace (block %lu count %u)\n",
-               (unsigned long)block, count);
+    if (!in_range(block, count)) {
         return -EIO;
     }
 
@@ -208,6 +228,60 @@ int device::submit(void *buf, uint64_t block, uint32_t count, bool write)
     sched::thread::wait_until([&req] { return req.done; });
     req.waiter.clear();
     return 0;
+}
+
+// Place the command and leave. The group is what the completion finds its way
+// back to, and it is held from here until the interrupt drops it.
+int device::submit_async(void *buf, uint64_t block, uint32_t count, bool write,
+                         io_group &g)
+{
+    if (!_queues || _queues->empty()) {
+        return -ENODEV;
+    }
+    if (!in_range(block, count)) {
+        return -EIO;
+    }
+
+    const uint64_t byte_off = block * static_cast<uint64_t>(_block_size);
+    const uint32_t byte_len = count * _block_size;
+    queue &qu = pick();
+
+    g.hold();
+    for (;;) {
+        int rc;
+        {
+            SCOPE_LOCK(qu.lock);
+            rc = qu.q->submit_request(1, buf, byte_off, byte_len, group_complete,
+                                      &g, 0, write ? nvme::WRITE : nvme::READ);
+        }
+        if (rc == 1) {
+            return 0;
+        }
+        if (rc != 0) {
+            g.drop();
+            printf("miniext: submit_request failed (%d)\n", rc);
+            return -EIO;
+        }
+        // The queue is full and nothing was placed. The requests ahead of us
+        // are what free a slot, so let them.
+        sched::thread::yield();
+    }
+}
+
+int device::read_async(void *buf, uint64_t block, uint32_t count, io_group &g)
+{
+    if (!mem::mapping::is_contiguous(buf, static_cast<size_t>(count) * _block_size)) {
+        return bounce(buf, block, count, false);
+    }
+    return submit_async(buf, block, count, false, g);
+}
+
+int device::write_async(const void *buf, uint64_t block, uint32_t count, io_group &g)
+{
+    if (!mem::mapping::is_contiguous(buf, static_cast<size_t>(count) * _block_size)) {
+        return bounce(const_cast<void *>(buf), block, count, true);
+    }
+    return submit_async(const_cast<void *>(buf), block, count, true, g);
 }
 
 // Use a bounce buffer when the caller hands us a buffer outside the linear map

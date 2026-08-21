@@ -14,9 +14,16 @@
 namespace mem {
 namespace vspace {
 
+struct region;
+
+struct region_ops {
+    bool (*fault)(region &r, uintptr_t addr, unsigned error);
+};
+
 struct region {
     range span;
     unsigned perm; // for reference, not enforced by this layer
+    const region_ops *ops = nullptr;
 };
 
 // Range of addresses available for reservations.

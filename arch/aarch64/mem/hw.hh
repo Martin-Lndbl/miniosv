@@ -130,6 +130,9 @@ inline bool pte_perm_change_needs_flush(unsigned old, unsigned neu)
     return old != neu;
 }
 
+constexpr bool tracks_writes = false;
+
+inline pte pte_set_present(pte e, bool v) { return v ? e | pte_valid : e & ~pte_valid; }
 inline bool pte_accessed(pte e) { return e & pte_af; }
 inline bool pte_dirty(pte e) { return e & pte_d; }
 inline pte pte_set_accessed(pte e, bool v) { return v ? e | pte_af : e & ~pte_af; }

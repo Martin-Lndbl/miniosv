@@ -16,8 +16,8 @@
 #include "arch-cpu.hh"
 #include "exceptions.hh"
 
-#define ACCESS_FLAG_FAULT_LEVEL_3(esr)            ((esr & 0b0111111) == 0x0b) // 0xb = 0b1011 indicates level 3
-#define ACCESS_FLAG_FAULT_LEVEL_3_WHEN_WRITE(esr) ((esr & 0b1111111) == 0x4b)
+#define ACCESS_FLAG_FAULT(esr)            ((esr & 0b0111100) == 0x08)
+#define ACCESS_FLAG_FAULT_WHEN_WRITE(esr) (ACCESS_FLAG_FAULT(esr) && (esr & 0x40))
 
 TRACEPOINT(trace_mmu_vm_access_flag_fault, "addr=%p", void *);
 
@@ -32,7 +32,7 @@ static void handle_access_flag_fault(exception_frame *ef, u64 addr)
     }
     auto e = entry.read();
     e = mem::mapping::pte_set_accessed(e, true);
-    if (ACCESS_FLAG_FAULT_LEVEL_3_WHEN_WRITE(ef->esr)) {
+    if (ACCESS_FLAG_FAULT_WHEN_WRITE(ef->esr)) {
         e = mem::mapping::pte_set_dirty(e, true);
     }
     entry.write(e);
@@ -64,7 +64,7 @@ void page_fault(exception_frame *ef)
         abort("trying to execute null pointer");
     }
 
-    if (ACCESS_FLAG_FAULT_LEVEL_3(ef->esr)) {
+    if (ACCESS_FLAG_FAULT(ef->esr)) {
         return handle_access_flag_fault(ef, addr);
     }
 

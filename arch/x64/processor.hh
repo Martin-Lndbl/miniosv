@@ -54,6 +54,12 @@ struct cpuid_result {
     u32 a, b, c, d;
 };
 
+// Tell the cpu this is a spin, so it can let another thread of its own run.
+inline void spin_hint()
+{
+    asm volatile ("pause" ::: "memory");
+}
+
 inline cpuid_result cpuid(u32 function) {
     cpuid_result r;
     asm("cpuid" : "=a"(r.a), "=b"(r.b), "=c"(r.c), "=d"(r.d)

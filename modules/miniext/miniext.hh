@@ -21,6 +21,8 @@
 #include <functional>
 #include <string>
 
+namespace mem { struct store; }
+
 namespace miniext {
 
 struct file;
@@ -59,6 +61,18 @@ void close(file *f);
 int64_t pread(file *f, void *buf, size_t len, uint64_t offset);
 int64_t pwrite(file *f, const void *buf, size_t len, uint64_t offset);
 
+// async IO operations
+struct aio;
+
+aio *aread(file *f, void *buf, size_t len, uint64_t offset);
+aio *awrite(file *f, const void *buf, size_t len, uint64_t offset);
+
+// Whether it has landed, without waiting for it.
+bool adone(aio *a);
+
+// Wait for it, release it, and say how it went: bytes moved, or -errno.
+int64_t await(aio *a);
+
 int truncate(file *f, uint64_t new_size);
 
 // Push the device's volatile write cache. Writes already returned are on the
@@ -67,6 +81,10 @@ int sync(file *f);
 int sync();
 
 uint64_t size(file *f);
+
+// for the page cache
+mem::store *store_open(file *f);
+void store_close(mem::store *s);
 
 // Metadata without opening.
 bool exists(const char *path);
