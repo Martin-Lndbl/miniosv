@@ -20,6 +20,7 @@
 #include <sys/mman.h>
 
 #include <osv/align.hh>
+#include <osv/debug.hh>
 #include <osv/mem/early.hh>
 #include <osv/mem/frames.hh>
 #include <osv/mem/heap.hh>
@@ -1225,23 +1226,40 @@ void heap_functional()
         size_t held = before - mem::frames::free_bytes();
         CHECK(held > asked / 2);      // it really is holding it
 
-        // Ask for more than is free but not for all of what it holds, so that
-        // the rest of the kernel is never actually out of memory.
-        size_t want = mem::frames::free_bytes() + held / 2;
-        std::vector<mem::frames::phys_addr> blocks;
-        blocks.reserve(want / huge + 1);
-        bool ok = true;
-        for (size_t got = 0; got < want && ok; got += huge) {
-            auto f = mem::frames::alloc(huge, huge);
-            ok = f != mem::frames::no_memory;
-            if (ok) {
-                blocks.push_back(f);
+        // Ask for more than is free but not for all of what it holds, so
+        // that the rest of the kernel is never actually out of memory. Huge
+        // blocks while they last and pages after: what is tested here is that
+        // the memory comes back, and by then the rest of the system has left
+        // no 2 MiB run in what it is using.
+        size_t free_at_start = mem::frames::free_bytes();
+        size_t want = free_at_start + held / 2;
+        std::vector<mem::frames::phys_addr> big, small;
+        size_t taken = 0;
+        for (;;) {
+            if (taken >= want) {
+                break;
             }
+            auto f = mem::frames::alloc(huge, huge);
+            if (f != mem::frames::no_memory) {
+                big.push_back(f);
+                taken += huge;
+                continue;
+            }
+            auto s = mem::frames::alloc(page, page);
+            if (s == mem::frames::no_memory) {
+                break;
+            }
+            small.push_back(s);
+            taken += page;
         }
-        CHECK(ok);
-        printf("      heap held %zu MiB, then gave up %zu MiB of it\n",
-               held >> 20, (blocks.size() * huge - (want - held / 2)) >> 20);
-        for (auto f : blocks) {
+        CHECK(taken >= want);
+        printf("      heap held %zu MiB, gave back %zu MiB under pressure\n",
+               held >> 20,
+               taken > free_at_start ? (taken - free_at_start) >> 20 : 0);
+        for (auto f : small) {
+            mem::frames::free(f, page);
+        }
+        for (auto f : big) {
             mem::frames::free(f, huge);
         }
     }
@@ -1277,12 +1295,81 @@ struct pattern_store : mem::store {
     mem::io *read(void *buf, uint64_t off, size_t bytes) override
     {
         fill(static_cast<uint8_t *>(buf), off, bytes);
+        // Which frame each page was filled into, so that a write-back from a
+        // frame that was never filled for that page can be told apart.
+        if (read_from) {
+            for (size_t i = 0; i < bytes; i += page) {
+                read_from[(off + i) / page].store(
+                    (reinterpret_cast<uint64_t>(buf) + i) & ~uint64_t(page - 1),
+                    std::memory_order_relaxed);
+            }
+        }
         reads += bytes;
         return done_with(bytes);
     }
 
     mem::io *write(const void *buf, uint64_t off, size_t bytes) override
     {
+        // What comes back has to be what that offset holds: a write-back
+        // reading the wrong frame says so here rather than at the next fault.
+        if (verify) {
+            auto *w = static_cast<const uint64_t *>(buf);
+            size_t n = bytes / sizeof(uint64_t), bad = 0, first = 0;
+            int64_t delta = 0;
+            bool uniform = true;
+            for (size_t i = 0; i < n; i++) {
+                uint64_t want = word(off + i * sizeof(uint64_t));
+                if (w[i] == want) {
+                    continue;
+                }
+                if (!bad++) {
+                    first = i;
+                    delta = int64_t(w[i] - want);
+                } else if (int64_t(w[i] - want) != delta) {
+                    uniform = false;
+                }
+            }
+            // One displacement over a whole page says the frame was another
+            // page's; a mixed one says the contents are not a page at all.
+            if (bad && !wrong.fetch_add(bad)) {
+                wrong_off = off + first * sizeof(uint64_t);
+                wrong_val = w[first];
+                wrong_bytes = bytes;
+                wrong_pos = first * sizeof(uint64_t);
+                wrong_run = bad * sizeof(uint64_t);
+                wrong_uniform = uniform;
+                if (read_from) {
+                    uint64_t bad_off = off + first * sizeof(uint64_t);
+                    wrong_frame = (reinterpret_cast<uint64_t>(buf) +
+                                   first * sizeof(uint64_t)) & ~uint64_t(page - 1);
+                    wrong_frame_of_off = read_from[bad_off / page].load(
+                        std::memory_order_relaxed);
+                    wrong_frame_of_val = read_from[w[first] / page].load(
+                        std::memory_order_relaxed);
+                }
+                // Stop on the spot: the backtrace names the eviction that did
+                // it, which is gone by the time the threads have joined.
+                if (stop_on_wrong) {
+                    printf("\n!! write-back caught in the act\n");
+                    printf("   %#lx holds %#lx (%+ld pages), %zu of %zu B wrong "
+                           "at +%zu, %s\n",
+                           wrong_off.load(), wrong_val.load(),
+                           (long)(wrong_val.load() - wrong_off.load()) / (long)page,
+                           wrong_run.load(), wrong_bytes.load(),
+                           wrong_pos.load(),
+                           uniform ? "one displacement" : "mixed");
+                    printf("   frame %#lx; that page was read into %#lx (%s), "
+                           "the page it holds into %#lx (%s)\n",
+                           wrong_frame.load(), wrong_frame_of_off.load(),
+                           wrong_frame.load() == wrong_frame_of_off.load()
+                               ? "same" : "OTHER",
+                           wrong_frame_of_val.load(),
+                           wrong_frame.load() == wrong_frame_of_val.load()
+                               ? "same" : "other");
+                    abort("pagecache: a write-back handed over another page\n");
+                }
+            }
+        }
         // Only where a test is going to look. Where the hardware keeps no
         // dirty bit every eviction writes back, and an object larger than
         // memory would put every byte of itself in here.
@@ -1324,8 +1411,21 @@ struct pattern_store : mem::store {
 
     uint64_t _bytes;
     bool record = false;
+    bool verify = false;            // check what write-back hands over
+    bool stop_on_wrong = false;     // halt the guest where it is caught
     std::atomic<size_t> reads{0};
     std::atomic<size_t> writes{0};
+    std::atomic<size_t> wrong{0};
+    std::atomic<uint64_t> wrong_off{0}, wrong_val{0};
+    std::atomic<size_t> wrong_bytes{0}, wrong_pos{0}, wrong_run{0};
+    std::atomic<bool> wrong_uniform{false};
+    std::atomic<uint64_t> wrong_frame{0}, wrong_frame_of_off{0}, wrong_frame_of_val{0};
+    std::atomic<uint64_t> *read_from = nullptr;
+
+    void track_frames()
+    {
+        read_from = new std::atomic<uint64_t>[_bytes / page]();
+    }
     std::map<uint64_t, uint64_t> written;   // only where a test wrote something
 
 private:
@@ -1861,6 +1961,7 @@ void pagecache_functional()
         auto *b = static_cast<char *>(m);
         std::atomic<bool> ok{true};
         std::atomic<uint64_t> bad_off{0}, bad_val{0}, bad_again{0};
+        std::atomic<uint64_t> bad_pa{0}, bad_pa_other{0};
         parallel(n_cpus(), [&](unsigned t) {
             uint64_t seed = 0x9e3779b9u * (t + 1);
             for (int i = 0; i < 20000; i++) {
@@ -1872,6 +1973,10 @@ void pagecache_functional()
                         bad_off = off;
                         bad_val = v;
                         bad_again = *reinterpret_cast<volatile uint64_t *>(b + off);
+                        // While it is still mapped: after the threads join it
+                        // has usually been evicted and says nothing.
+                        bad_pa = map::to_phys(b + off);
+                        bad_pa_other = v < (1ull << 30) ? map::to_phys(b + v) : 0;
                     }
                 }
             }
@@ -1882,8 +1987,102 @@ void pagecache_functional()
                    "reread %#lx\n",
                    o, v, (long)(v - o), (long)(v - o) / (long)page,
                    (long)(v - o) / (long)ragged_span, bad_again.load());
+            // Same frame under both addresses means one was handed out twice;
+            // different frames mean this one was filled for somebody else.
+            unsigned long pa = bad_pa.load(), pb = bad_pa_other.load();
+            printf("      phys %#lx, phys of the data's own address %#lx, %s\n",
+                   pa, pb, pa && pa == pb ? "SAME FRAME" : "different");
+        }
+
+        // Whether any frame is under two addresses at once, which is the
+        // shape of every wrong value seen so far. Independent of whether a
+        // probe happened to land on one.
+        {
+            std::map<mem::frames::phys_addr, uint64_t> seen;
+            unsigned dup = 0, resident = 0;
+            for (uint64_t off = 0; off < (1ull << 30); off += page) {
+                auto pa = map::to_phys(b + off);
+                if (!pa) {
+                    continue;
+                }
+                resident++;
+                auto it = seen.find(pa);
+                if (it != seen.end()) {
+                    if (dup++ < 4) {
+                        printf("      ALIAS: frame %#lx at %#lx and %#lx\n",
+                               (unsigned long)pa, it->second, off);
+                    }
+                } else {
+                    seen[pa] = off;
+                }
+            }
+            printf("      %u pages resident, %u aliased\n", resident, dup);
+            CHECK(dup == 0);
         }
         CHECK(ok);
+        pc::unmap(m);
+    }
+
+    section("ragged buffers survive eviction under writes, from many threads");
+    {
+        // The same, writing. Every buffer touched is dirty, so eviction has to
+        // write it back before the frame goes -- the long way round, on every
+        // architecture, where the read-only pass leaves clean buffers that go
+        // straight back. Each word is written the value it already holds, so
+        // what the store receives is checkable and a refault still verifies.
+        pattern_store s(1ull << 30);
+        s.verify = true;
+        s.stop_on_wrong = true;
+        s.track_frames();
+        pc::policy p = pc::defaults();
+        p.fault_size = fault_ragged;
+        void *m = pc::map(s, p, 32 << 20);
+        CHECK(m != nullptr);
+
+        auto *b = static_cast<char *>(m);
+        std::atomic<bool> ok{true};
+        std::atomic<uint64_t> bad_off{0}, bad_val{0};
+        parallel(n_cpus(), [&](unsigned t) {
+            uint64_t seed = 0x85ebca6bu * (t + 1);
+            for (int i = 0; i < 20000; i++) {
+                seed = seed * 6364136223846793005ull + 1;
+                uint64_t off = (seed >> 16) % ((1ull << 30) - 8) & ~uint64_t(7);
+                auto *at = reinterpret_cast<volatile uint64_t *>(b + off);
+                uint64_t v = *at;
+                if (v != pattern_store::word(off)) {
+                    if (ok.exchange(false)) {
+                        bad_off = off;
+                        bad_val = v;
+                    }
+                }
+                *at = pattern_store::word(off);
+            }
+        });
+        if (!ok) {
+            uint64_t o = bad_off.load(), v = bad_val.load();
+            printf("      at %#lx read %#lx (delta %ld, page %+ld)\n",
+                   o, v, (long)(v - o), (long)(v - o) / (long)page);
+        }
+        if (s.wrong.load()) {
+            printf("      write-back handed over %zu wrong words, first at "
+                   "%#lx: %#lx\n",
+                   s.wrong.load(), s.wrong_off.load(), s.wrong_val.load());
+            printf("      chunk %zu B, %zu B wrong at +%zu, delta %+ld pages, %s\n",
+                   s.wrong_bytes.load(), s.wrong_run.load(), s.wrong_pos.load(),
+                   (long)(s.wrong_val.load() - s.wrong_off.load()) / (long)page,
+                   s.wrong_uniform.load() ? "one displacement" : "mixed");
+            printf("      frame %#lx; that page was read into %#lx (%s), "
+                   "the page it holds into %#lx (%s)\n",
+                   s.wrong_frame.load(), s.wrong_frame_of_off.load(),
+                   s.wrong_frame.load() == s.wrong_frame_of_off.load() ? "same"
+                                                                       : "OTHER",
+                   s.wrong_frame_of_val.load(),
+                   s.wrong_frame.load() == s.wrong_frame_of_val.load() ? "same"
+                                                                       : "other");
+        }
+        printf("      %zu MiB written back\n", s.writes.load() >> 20);
+        CHECK(ok);
+        CHECK(s.wrong.load() == 0);
         pc::unmap(m);
     }
 
