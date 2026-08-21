@@ -160,6 +160,7 @@ conf_interrupt_stack_size=0x1000
 # --- device drivers --------------------------------------------------------
 conf_drivers_acpi=1
 conf_drivers_pci=1
+conf_drivers_ena=1
 conf_drivers_nvme=1
 # vAccel needs virtio transport drivers (bus, vring, PCI).
 conf_drivers_virtio=1
@@ -562,6 +563,13 @@ drivers += drivers/virtio-accel.o
 endif
 endif
 endif
+ifeq ($(conf_drivers_ena),1)
+drivers += drivers/enav2/ena.o
+drivers += drivers/enav2/base/ena_eth_com.o
+drivers += drivers/enav2/base/ena_com.o
+drivers += drivers/enav2/ena_ethdev.o
+drivers += drivers/enav2/ena_rss.o
+endif
 drivers += drivers/driver.o
 
 # ACPI is the device-discovery model on both architectures under UEFI boot.
@@ -587,17 +595,12 @@ endif
 # The application is statically linked into the kernel image and entered via
 # osv_app_main(). There is no separate app .so or filesystem image.
 #
-# Two build modes select which application is linked in. Each application lives
+# The build mode select which application is linked in. Each application lives
 # in its own directory with a Makefile fragment that lists its objects in
 # $(app-objects); the kernel compiles and links them with its own flags.
 #   make            -> the user application   (app/)
-#   make app=tests  -> the test application   (test/)
-app ?= default
-ifeq ($(app),tests)
-include test/Makefile
-else
-include app/Makefile
-endif
+app ?= app
+include $(app)/Makefile
 objects += $(app-objects)
 
 # Record the selected app mode so that switching between `make` and

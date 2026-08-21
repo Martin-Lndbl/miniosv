@@ -833,12 +833,10 @@ namespace pci {
 
     bar * function::add_bar(int idx, u32 pos)
     {
+        // val==0 is *not* a shortcut for "not implemented" — an unassigned
+        // 32-bit non-prefetchable MMIO BAR reads as raw zero too. Gate on
+        // read_bar_size() (returns 0 only for unimplemented BARs) instead.
         u32 val = pci_readl(pos);
-#ifdef __x86_64__
-        if (!val) {
-            return nullptr;
-        }
-#endif
         bool is_64 = false, is_prefetchable = false;
         bool is_mmio = ((val & PCI_BAR_MEMORY_INDICATOR_MASK) == PCI_BAR_MMIO);
         if (is_mmio) {
@@ -863,6 +861,13 @@ namespace pci {
             }
         } else {
             addr_lo = val & PCI_BAR_PIO_ADDR_MASK;
+        }
+
+        // arch_add_bar may leave the address at 0 (pool exhausted; PIO on
+        // an arch without a PIO allocator). bar()'s constructor asserts on
+        // that, so bail cleanly here.
+        if (addr_lo == 0 && addr_hi == 0) {
+            return nullptr;
         }
 
         bar *pbar = new bar(this, pos, addr_lo, addr_hi, addr_size, is_mmio, is_64, is_prefetchable);
