@@ -213,6 +213,7 @@ void arch_setup_pci()
 extern bool opt_pci_disabled;
 void arch_setup_free_memory()
 {
+    mem::mapping::detect_hw_dirty();
     setup_temporary_phys_map();
 
     /* import from loader.cc */

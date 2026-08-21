@@ -48,6 +48,11 @@ inline unsigned pt_index(void *va, unsigned level)
 // Leave the boot tables behind for the ones the kernel built.
 void switch_to_runtime_page_tables();
 
+#ifdef __aarch64__
+// Settle tracks_writes from the cpu, before anything is mapped.
+void detect_hw_dirty();
+#endif
+
 // Fault handling helpers.
 bool is_page_fault_insn(unsigned int err);
 bool is_page_fault_write(unsigned int err);

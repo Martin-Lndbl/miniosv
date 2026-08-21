@@ -50,9 +50,16 @@ enum : pte {
     pte_ap2   = pte(1) << 7,   // set means read-only
     pte_sh    = pte(3) << 8,   // inner shareable
     pte_af    = pte(1) << 10,  // access flag
+    pte_dbm   = pte(1) << 51,  // hardware clears ap2 on write instead of faulting
     pte_pxn   = pte(1) << 53,  // privileged execute never
-    pte_d     = pte(1) << 55,  // dirty, maintained by software
+    pte_d     = pte(1) << 55,  // dirty, where software has to maintain it
 };
+
+// Whether the cpu maintains the dirty state itself (FEAT_HAFDBS, armv8.1).
+// Set from ID_AA64MMFR1_EL1 before the first mapping is made; boot.S turns on
+// TCR_EL1.HA/HD to match. With it, a writable entry carries dbm and starts
+// read-only, and the cpu clearing ap2 is what says it was written to.
+extern bool tracks_writes;
 
 constexpr unsigned addr_bits = 48;
 
@@ -87,7 +94,10 @@ inline unsigned pte_perm(pte e)
     if (!(e & pte_valid)) {
         return 0;
     }
-    return perm_read | ((e & pte_ap2) ? 0 : perm_write) |
+    // A dbm entry is writable whichever way ap2 stands: that bit is its dirty
+    // state, not its permission.
+    bool writable = !(e & pte_ap2) || (e & pte_dbm);
+    return perm_read | (writable ? perm_write : 0) |
            ((e & pte_pxn) ? 0 : perm_exec);
 }
 
@@ -98,7 +108,7 @@ inline pte pte_make_table(frames::phys_addr p)
 
 inline pte pte_make_leaf(frames::phys_addr p, unsigned perm, unsigned level, mattr ma)
 {
-    pte e = p | pte_af | pte_d | pte_sh |
+    pte e = p | pte_af | pte_sh |
             attr_index(ma == mattr::dev ? attr_device : attr_normal);
     if (level == 0) {
         e |= pte_table;
@@ -106,7 +116,11 @@ inline pte pte_make_leaf(frames::phys_addr p, unsigned perm, unsigned level, mat
     if (perm) {
         e |= pte_valid;
     }
-    if (!(perm & perm_write)) {
+    if (perm & perm_write) {
+        // Writable and clean: dbm, read-only until the cpu marks it. Where the
+        // cpu does not do that, the software bit says written to.
+        e |= tracks_writes ? (pte_dbm | pte_ap2) : pte_d;
+    } else {
         e |= pte_ap2;
     }
     if (!(perm & perm_exec)) {
@@ -120,7 +134,11 @@ inline pte pte_make_leaf(frames::phys_addr p, unsigned perm, unsigned level, mat
 inline pte pte_with_perm(pte e, unsigned perm)
 {
     e = perm ? e | pte_valid : e & ~pte_valid;
-    e = (perm & perm_write) ? e & ~pte_ap2 : e | pte_ap2;
+    if (perm & perm_write) {
+        e = tracks_writes ? (e | pte_dbm | pte_ap2) : (e & ~pte_ap2);
+    } else {
+        e = (e & ~pte_dbm) | pte_ap2;
+    }
     return (perm & perm_exec) ? e & ~pte_pxn : e | pte_pxn;
 }
 
@@ -130,13 +148,24 @@ inline bool pte_perm_change_needs_flush(unsigned old, unsigned neu)
     return old != neu;
 }
 
-constexpr bool tracks_writes = false;
-
 inline pte pte_set_present(pte e, bool v) { return v ? e | pte_valid : e & ~pte_valid; }
 inline bool pte_accessed(pte e) { return e & pte_af; }
-inline bool pte_dirty(pte e) { return e & pte_d; }
 inline pte pte_set_accessed(pte e, bool v) { return v ? e | pte_af : e & ~pte_af; }
-inline pte pte_set_dirty(pte e, bool v) { return v ? e | pte_d : e & ~pte_d; }
+
+// On a dbm entry the cpu clears ap2 to say it was written to; clearing that
+// again is what puts it back to clean.
+inline bool pte_dirty(pte e)
+{
+    return (e & pte_dbm) ? !(e & pte_ap2) : (e & pte_d);
+}
+
+inline pte pte_set_dirty(pte e, bool v)
+{
+    if (e & pte_dbm) {
+        return v ? e & ~pte_ap2 : e | pte_ap2;
+    }
+    return v ? e | pte_d : e & ~pte_d;
+}
 
 inline bool pte_sw_bit(pte e, unsigned n) { return (e >> (56 + n)) & 1; }
 

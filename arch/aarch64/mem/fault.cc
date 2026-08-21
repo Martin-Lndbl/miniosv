@@ -30,12 +30,18 @@ static void handle_access_flag_fault(exception_frame *ef, u64 addr)
     if (!entry) {
         return;
     }
+    // Only while the entry is still the one that faulted: a page evicted under
+    // this fault must not be brought back. Dropping it refaults for real.
     auto e = entry.read();
-    e = mem::mapping::pte_set_accessed(e, true);
-    if (ACCESS_FLAG_FAULT_WHEN_WRITE(ef->esr)) {
-        e = mem::mapping::pte_set_dirty(e, true);
+    while (mem::mapping::pte_present(e)) {
+        auto want = mem::mapping::pte_set_accessed(e, true);
+        if (ACCESS_FLAG_FAULT_WHEN_WRITE(ef->esr)) {
+            want = mem::mapping::pte_set_dirty(want, true);
+        }
+        if (entry.compare_exchange(e, want)) {
+            break;
+        }
     }
-    entry.write(e);
     mem::mapping::barrier();
 }
 

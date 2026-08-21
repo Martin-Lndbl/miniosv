@@ -12,6 +12,17 @@
 namespace mem {
 namespace mapping {
 
+bool tracks_writes;
+
+// Read before the first mapping is made. boot.S has already put TCR_EL1 in
+// step with the same register, on every cpu.
+void detect_hw_dirty()
+{
+    uint64_t mmfr1;
+    asm volatile("mrs %0, id_aa64mmfr1_el1" : "=r"(mmfr1));
+    tracks_writes = (mmfr1 & 0xf) >= 2;
+}
+
 // Pseudo-entries at the root, holding the tables pointed by TTBR0 and TTBR1
 // Bit 63 of an address picks between them; everything this kernel maps is
 // in the low half, the second is only used during boot.
