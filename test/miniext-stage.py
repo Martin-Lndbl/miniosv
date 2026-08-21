@@ -11,7 +11,7 @@ belong in git.
 Then:
 
     scripts/mkdata.sh build/data.img build/miniext-stage 64M
-    make app=tests && scripts/run.py --emulated-nvme build/data.img
+    make app=test && scripts/run.py --emulated-nvme build/data.img
 
 If you change the tree, re-run with --table and paste the result over the
 `expected[]` array in test/os-miniext.cc. The checksums are what prove miniext

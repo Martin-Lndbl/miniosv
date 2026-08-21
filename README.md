@@ -37,7 +37,8 @@ and `mtools` + `gdisk` to build the disk image. Override the firmware with the `
 checks it reaches the kernel.
 
 The default app (`app/app.cc`) is a conformance gate that prints a `PASS`/`FAIL` line per check.
-Build the larger test suite with `make app=tests`.
+`app=` selects what is linked in instead: `make app=test` for the larger test suite, `app=duckdb`
+or `app=llama` for the submodules, or any directory holding a Makefile that sets `$(app-objects)`.
 
 ## License
 

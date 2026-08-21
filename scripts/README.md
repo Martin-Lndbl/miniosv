@@ -7,7 +7,7 @@ is small.
 
 # Building
 The kernel is built straight from the top-level Makefile: `make` (x86-64),
-`make arch=aarch64`, `make app=tests`, `make clean`.
+`make arch=aarch64`, `make app=test`, `make clean`.
 * **build-llvm-libc.sh** — builds the no-syscall baremetal llvm-libc
   (`libc.a`/`libm.a`) from the pinned `external/llvm-project`, using the curated
   config in `external/llvm-libc-config/`. Auto-invoked by the Makefile.

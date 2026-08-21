@@ -2,7 +2,7 @@
 # correctness and stress suites. Linked into the kernel instead of the normal
 # application with:
 #
-#     make app=tests
+#     make app=test
 #
 # This file is included by the top-level Makefile, which compiles these sources
 # with the kernel's own flags and links them into the kernel image.

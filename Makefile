@@ -160,7 +160,8 @@ conf_interrupt_stack_size=0x1000
 # --- device drivers --------------------------------------------------------
 conf_drivers_acpi=1
 conf_drivers_pci=1
-conf_drivers_ena=1
+# Off until the ENA port is brought up to the current memory and PCI APIs.
+conf_drivers_ena=0
 conf_drivers_nvme=1
 # vAccel needs virtio transport drivers (bus, vring, PCI).
 conf_drivers_virtio=1
@@ -595,17 +596,35 @@ endif
 # The application is statically linked into the kernel image and entered via
 # osv_app_main(). There is no separate app .so or filesystem image.
 #
-# The build mode select which application is linked in. Each application lives
-# in its own directory with a Makefile fragment that lists its objects in
-# $(app-objects); the kernel compiles and links them with its own flags.
-#   make            -> the user application   (app/)
+# "app" names a directory holding a Makefile fragment that lists the
+# application's objects in $(app-objects); the kernel compiles and links them
+# with its own flags. Only one can be linked at a time -- two osv_app_main()
+# would collide.
+#
+#   make                 -> app/, the placeholder app.cc
+#   make app=test        -> the test suite in test/
+#   make app=duckdb      -> DuckDB    (the app/miniduckdb submodule)
+#   make app=llama       -> llama.cpp (the app/llama.cpp submodule)
+#   make app=<directory> -> that directory, in the tree or out of it
+#
+# The submodules keep their fragment beside their own miniOSv port, so the two
+# names below are shorthands for it. Paths in a fragment are relative to the
+# miniOSv root.
 app ?= app
-include $(app)/Makefile
+app-mk-duckdb = app/miniduckdb/miniosv/miniosv.mk
+app-mk-llama = app/llama.cpp/miniosv/miniosv.mk
+app-mk := $(or $(app-mk-$(app)),$(app)/Makefile)
+ifeq ($(wildcard $(app-mk)),)
+$(error no $(app-mk) for app '$(app)': give a directory holding a Makefile, or \
+        one of duckdb, llama. A submodule needs 'git submodule update --init', \
+        and its port may not be wired up yet)
+endif
+include $(app-mk)
 objects += $(app-objects)
 
-# Record the selected app mode so that switching between `make` and
-# `make app=tests` forces the kernel to relink (the set of linked-in app
-# objects changes, which plain timestamp checking would not notice).
+# Record the selected app so that switching between `make` and `make app=test`
+# forces the kernel to relink (the set of linked-in app objects changes, which
+# plain timestamp checking would not notice).
 app_mode_dep = $(out)/app_mode.last
 .PHONY: app_mode_phony
 $(app_mode_dep): app_mode_phony

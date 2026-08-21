@@ -1211,7 +1211,10 @@ void heap_functional()
         // it before it fails, and this is the only thing that asks.
         const size_t size = 64ul << 10;
         size_t before = mem::frames::free_bytes();
-        size_t n = before / 2 / size;
+        // Enough of the heap to measure, and not so much that the objects take
+        // longer to make than the giving back takes to show.
+        size_t asked = std::min<size_t>(before / 2, 4ul << 30);
+        size_t n = asked / size;
         std::vector<void *> p(n);
         for (size_t i = 0; i < n; i++) {
             p[i] = malloc(size);
@@ -1220,7 +1223,7 @@ void heap_functional()
             free(p[i]);
         }
         size_t held = before - mem::frames::free_bytes();
-        CHECK(held > before / 8);      // it really is holding it
+        CHECK(held > asked / 2);      // it really is holding it
 
         // Ask for more than is free but not for all of what it holds, so that
         // the rest of the kernel is never actually out of memory.
@@ -1727,8 +1730,9 @@ void pagecache_functional()
         }
         CHECK(ok);
         // Eight times its limit went through it, and it never held much more
-        // than the limit at once. The slack is the page tables for the range.
-        CHECK(worst < cap + (cap / 8));
+        // than the limit at once. The slack is the page tables for the range
+        // and what the frame allocator keeps in its per-cpu caches.
+        CHECK(worst < cap + (cap / 2));
         printf("      a %zu MiB limit held at most %zu MiB\n", cap >> 20, worst >> 20);
         pc::unmap(m);
     }
@@ -1856,35 +1860,53 @@ void pagecache_functional()
 
         auto *b = static_cast<char *>(m);
         std::atomic<bool> ok{true};
+        std::atomic<uint64_t> bad_off{0}, bad_val{0}, bad_again{0};
         parallel(n_cpus(), [&](unsigned t) {
             uint64_t seed = 0x9e3779b9u * (t + 1);
             for (int i = 0; i < 20000; i++) {
                 seed = seed * 6364136223846793005ull + 1;
                 uint64_t off = (seed >> 16) % ((1ull << 30) - 8) & ~uint64_t(7);
-                if (*reinterpret_cast<volatile uint64_t *>(b + off) !=
-                    pattern_store::word(off)) {
-                    ok = false;
+                uint64_t v = *reinterpret_cast<volatile uint64_t *>(b + off);
+                if (v != pattern_store::word(off)) {
+                    if (ok.exchange(false)) {
+                        bad_off = off;
+                        bad_val = v;
+                        bad_again = *reinterpret_cast<volatile uint64_t *>(b + off);
+                    }
                 }
             }
         });
+        if (!ok) {
+            uint64_t o = bad_off.load(), v = bad_val.load();
+            printf("      at %#lx read %#lx (delta %ld, page %+ld, spans %+ld) "
+                   "reread %#lx\n",
+                   o, v, (long)(v - o), (long)(v - o) / (long)page,
+                   (long)(v - o) / (long)ragged_span, bad_again.load());
+        }
         CHECK(ok);
         pc::unmap(m);
     }
 
-    section("a working set bigger than memory is served and served correctly");
+    section("a working set bigger than the cache is served and served correctly");
     {
-        // Twice what is free, so that the cache has to give pages back to
-        // reach the end of it, and has to fault back what it gave up.
-        const uint64_t bytes = (2 * mem::frames::free_bytes()) & ~(huge - 1);
+        // Twice what the cache may hold, so that it has to give pages back to
+        // reach the end of the object, and has to fault back what it gave up.
+        // What it may hold is all of free memory, until there is more of that
+        // than a pass over twice it is worth spending: past that, a limit puts
+        // the same pressure on the cache at a fixed cost.
+        const uint64_t roof = 16ull << 30;
+        const uint64_t room = mem::frames::free_bytes();
+        const size_t limit = room > roof ? roof : 0;
+        const uint64_t bytes = (2 * (limit ? limit : room)) & ~(huge - 1);
         pattern_store s(bytes);
-        // 2 MiB at a time where there is a lot of memory, so that a pass costs
-        // what the store can move and not one fault per page of it.
+        // 2 MiB at a time where the object is big, so that a pass costs what
+        // the store can move and not one fault per page of it.
         pc::policy p = pc::defaults();
         if (bytes > (8ull << 30)) {
             p.fault_size = fault_huge;
         }
         auto t0 = clk::now();
-        void *m = pc::map(s, p);
+        void *m = pc::map(s, p, limit);
         CHECK(m != nullptr);
 
         auto *b = static_cast<char *>(m);
@@ -1907,9 +1929,9 @@ void pagecache_functional()
         // Most of that eighth had to come back from the store: it is the part
         // that was faulted longest ago, and so the part a fifo gives up first.
         CHECK(s.reads.load() - after_first_pass > bytes / 8 / 2);
-        printf("      %zu MiB of object through %zu MiB of memory, %zu MiB read"
-               " in %.1f s\n",
-               (size_t)(bytes >> 20), mem::frames::total_available_bytes() >> 20,
+        printf("      %zu MiB of object through %zu MiB, %zu MiB read in %.1f s\n",
+               (size_t)(bytes >> 20),
+               (limit ? limit : mem::frames::total_available_bytes()) >> 20,
                s.reads.load() >> 20, since(t0));
         pc::unmap(m);
     }
