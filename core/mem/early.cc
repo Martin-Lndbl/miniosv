@@ -34,26 +34,19 @@ namespace {
 
 constexpr size_t page_size = frames::page_size;
 
-// The count is what lets a page go back: every object in it took one, and the
-// page is done when they have all been given back.
 struct page_header {
+    page_header *next;
     unsigned short allocations_count;
 };
 
 mutex lock;
 
-// The page the bump pointer is in, and where free memory starts within it.
-// "next" is the first byte after the object allocated last, not the address
-// the next one will get: that has to account for alignment and for the two
-// bytes of size in front of it.
 char *page = nullptr;
 size_t next_offset = 0;
 size_t previous_offset = 0;
 
-// Pages that this allocator holds
-constexpr unsigned max_pages = 64;
-page_header *held[max_pages];
-unsigned held_count;
+// Pages that this allocator holds, most recent first.
+page_header *held = nullptr;
 
 page_header *header_of(void *object)
 {
@@ -109,24 +102,26 @@ big_header *big_header_of(void *p)
 // own the memory. frames::alloc() picks whichever is current.
 void take_page()
 {
-    if (held_count == max_pages) {
-        abort("early: more than %u pages of small objects are live before the "
-              "heap exists.\n       Raise max_pages in core/mem/early.cc.\n",
-              max_pages);
+    frames::phys_addr p = frames::alloc();
+    if (p == frames::no_memory) {
+        abort("early: out of memory before the heap exists\n");
     }
-    page = static_cast<char *>(frames::to_linear(frames::alloc()));
-    header_of(page)->allocations_count = 0;
+    page = static_cast<char *>(frames::to_linear(p));
+    auto *h = header_of(page);
+    h->allocations_count = 0;
+    h->next = held;
+    held = h;
     next_offset = sizeof(page_header);
-    held[held_count++] = header_of(page);
 }
 
 void give_back(page_header *h)
 {
-    for (unsigned i = 0; i < held_count; i++) {
-        if (held[i] == h) {
-            held[i] = held[--held_count];
-            break;
-        }
+    page_header **link = &held;
+    while (*link && *link != h) {
+        link = &(*link)->next;
+    }
+    if (*link) {
+        *link = h->next;
     }
     frames::free(frames::from_linear(h));
 }
@@ -214,8 +209,8 @@ bool owns(void *p)
     }
     page_header *h = header_of(p);
     WITH_LOCK(lock) {
-        for (unsigned i = 0; i < held_count; i++) {
-            if (held[i] == h) {
+        for (page_header *k = held; k; k = k->next) {
+            if (k == h) {
                 return true;
             }
         }

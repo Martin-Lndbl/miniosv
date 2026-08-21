@@ -31,7 +31,7 @@ constexpr size_t align_max = 2048;
 constexpr size_t page_bytes = mapping::huge_page_size;
 
 // Virtual memory reserved for the heap.
-constexpr size_t window_bytes = 64ul << 30;
+constexpr size_t window_bytes = 512ul << 30; // 512GiB should be a lot
 constexpr uint32_t page_count = window_bytes / page_bytes;
 
 constexpr uint32_t no_page = ~0u;

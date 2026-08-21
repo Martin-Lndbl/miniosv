@@ -1081,6 +1081,34 @@ void early_functional()
         mem::early::free(p);
     }
 
+    section("as many pages as boot asks for, all given back");
+    {
+        // One object per page, live at once: boot holds one of these for every
+        // cpu it brings up, and the count is not something to guess at.
+        const int n = 512;
+        const size_t big = page - 64;
+        std::vector<void *> p(n);
+        for (int i = 0; i < n; i++) {
+            p[i] = mem::early::alloc(big, 8);
+            CHECK(p[i] != nullptr);
+            memset(p[i], i & 0xff, big);
+        }
+        bool own = true, kept = true;
+        for (int i = 0; i < n; i++) {
+            own = own && mem::early::owns(p[i]);
+            kept = kept && static_cast<unsigned char *>(p[i])[big - 1] == (i & 0xff);
+        }
+        CHECK(own);
+        CHECK(kept);
+        for (int i = 0; i < n; i++) {
+            mem::early::free(p[i]);
+        }
+        void *q = mem::early::alloc(64, 8);
+        CHECK(q != nullptr);
+        CHECK(mem::early::owns(q));
+        mem::early::free(q);
+    }
+
     section("what no page can hold gets frames of its own");
     {
         CHECK(!mem::early::takes(3 * page, 64));
@@ -1317,6 +1345,8 @@ size_t fault_ragged(void *, uint64_t) { return ragged_span; }
 // inside every buffer.
 const uint64_t big_span = (5ull << 20) + 12345;
 size_t fault_big(void *, uint64_t) { return big_span; }
+
+size_t fault_huge(void *, uint64_t) { return huge; }
 
 /* store ------------------------------------------------------------------- */
 
@@ -1680,10 +1710,12 @@ void pagecache_functional()
     {
         const size_t cap = 64 << 20;
         pattern_store s(8ull << 30);
-        size_t before = mem::frames::free_bytes();
         void *m = pc::map(s, pc::defaults(), cap);
         CHECK(m != nullptr);
 
+        // Measured from the mapped cache: the policy sizes its queues at
+        // create, from the store and the memory, and the limit is on buffers.
+        size_t before = mem::frames::free_bytes();
         auto *b = static_cast<char *>(m);
         bool ok = true;
         size_t worst = 0;
@@ -1695,9 +1727,8 @@ void pagecache_functional()
         }
         CHECK(ok);
         // Eight times its limit went through it, and it never held much more
-        // than the limit at once. The slack is the table and the policy's own
-        // memory, which the limit does not cover.
-        CHECK(worst < cap + (cap / 2));
+        // than the limit at once. The slack is the page tables for the range.
+        CHECK(worst < cap + (cap / 8));
         printf("      a %zu MiB limit held at most %zu MiB\n", cap >> 20, worst >> 20);
         pc::unmap(m);
     }
@@ -1846,7 +1877,14 @@ void pagecache_functional()
         // reach the end of it, and has to fault back what it gave up.
         const uint64_t bytes = (2 * mem::frames::free_bytes()) & ~(huge - 1);
         pattern_store s(bytes);
-        void *m = pc::map(s);
+        // 2 MiB at a time where there is a lot of memory, so that a pass costs
+        // what the store can move and not one fault per page of it.
+        pc::policy p = pc::defaults();
+        if (bytes > (8ull << 30)) {
+            p.fault_size = fault_huge;
+        }
+        auto t0 = clk::now();
+        void *m = pc::map(s, p);
         CHECK(m != nullptr);
 
         auto *b = static_cast<char *>(m);
@@ -1869,9 +1907,10 @@ void pagecache_functional()
         // Most of that eighth had to come back from the store: it is the part
         // that was faulted longest ago, and so the part a fifo gives up first.
         CHECK(s.reads.load() - after_first_pass > bytes / 8 / 2);
-        printf("      %zu MiB of object through %zu MiB of memory, %zu MiB read\n",
+        printf("      %zu MiB of object through %zu MiB of memory, %zu MiB read"
+               " in %.1f s\n",
                (size_t)(bytes >> 20), mem::frames::total_available_bytes() >> 20,
-               s.reads.load() >> 20);
+               s.reads.load() >> 20, since(t0));
         pc::unmap(m);
     }
 }
