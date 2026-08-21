@@ -66,8 +66,10 @@ void vm_fault(uintptr_t addr, exception_frame *ef)
         return;
     }
 
+    // A region without a fault handler has nothing to answer with.
     auto *r = vspace::lookup(addr);
-    if (!r || !r->ops || !permitted(r->perm, error) || !r->ops->fault(*r, addr, error)) {
+    if (!r || !r->ops || !r->ops->fault || !permitted(r->perm, error) ||
+        !r->ops->fault(*r, addr, error)) {
         sigsegv(addr, ef);
         trace_vm_fault_sigsegv(addr, error, "slow");
         return;

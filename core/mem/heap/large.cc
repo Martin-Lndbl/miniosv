@@ -31,10 +31,13 @@ struct record {
     size_t bytes;    // what the caller asked for
 };
 
+// Tells a large allocation's reservation from every other one.
+const vspace::region_ops large_ops = { .fault = nullptr };
+
 record *record_at(void *p)
 {
     auto *r = vspace::lookup(reinterpret_cast<uintptr_t>(p));
-    if (!r || r->span.start != reinterpret_cast<uintptr_t>(p)) {
+    if (!r || r->ops != &large_ops || r->span.start != reinterpret_cast<uintptr_t>(p)) {
         return nullptr;
     }
     return reinterpret_cast<record *>(r);
@@ -59,6 +62,7 @@ void *large_alloc(size_t bytes, size_t alignment)
     auto *rec = new (frames::to_linear(hp)) record();
     rec->bytes = bytes;
     rec->r.perm = perm_rw;
+    rec->r.ops = &large_ops;
 
     if (vspace::reserve(rec->r, mapped, align) != vspace::resa_result::success) {
         frames::free(hp);

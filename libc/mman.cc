@@ -97,23 +97,17 @@ static void anon_unmap(mem::vspace::region *r)
 OSV_LIBC_API
 int mprotect(void *addr, size_t len, int prot)
 {
-    // we don't support mprotecting() the linear map (e.g.., malloc() memory)
-    // because that could leave the linear map a mess.
-    if (reinterpret_cast<long>(addr) < 0) {
-        abort("mprotect() on linear map not supported\n");
-    }
-
     if (!page_aligned(addr)) {
-        // address not page aligned
         return libc_error(EINVAL);
     }
 
+    // Only a mapping this made can be reprotected: anything else shares its
+    // pages with the allocation next to it.
     len = align_up(len, mem::mapping::page_size);
     uintptr_t start = reinterpret_cast<uintptr_t>(addr);
     auto *r = anon_at(addr);
     if (!r || !r->span.contains({start, start + len})) {
-        errno = ENOMEM;
-        return -1;
+        return libc_error(ENOMEM);
     }
     mem::mapping::protect({start, start + len}, libc_prot_to_perm(prot));
     return 0;
@@ -146,22 +140,10 @@ void *mmap(void *addr, size_t length, int prot, int flags,
         return MAP_FAILED;
     }
 
-    // make use the payload isn't remapping physical memory
-    assert(reinterpret_cast<long>(addr) >= 0);
-
     void *ret;
 
     auto mmap_perm = libc_prot_to_perm(prot);
 
-#ifndef AARCH64_PORT_STUB
-    if ((flags & MAP_32BIT) && !(flags & MAP_FIXED) && !addr) {
-        // If addr is not specified, OSv by default starts mappings at address
-        // a low default. MAP_32BIT asks for a lower one still.
-        // default. If MAP_FIXED or addr were specified, the default does not
-        // matter anyway.
-        addr = (void*)0x2000000ul;
-    }
-#endif
     // There is no filesystem, so only anonymous mappings are supported;
     // file-backed mmap is not available.
     if (!(flags & MAP_ANONYMOUS)) {

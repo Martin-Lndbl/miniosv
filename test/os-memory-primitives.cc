@@ -1142,6 +1142,15 @@ void heap_functional()
         void *q = mem::heap::alloc(64, 16);
         CHECK(q != nullptr);
         mem::heap::free(q, 64);
+
+        // A mapping has a reservation of its own too, and the heap must not
+        // mistake it for one of its large allocations.
+        void *m = mmap(nullptr, huge, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        CHECK(m != MAP_FAILED);
+        CHECK(!mem::heap::owns(m));
+        CHECK(mem::heap::size_of(m) == 0);
+        CHECK(munmap(m, huge) == 0);
     }
 
     section("a large allocation is backed by huge pages");

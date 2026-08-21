@@ -529,6 +529,19 @@ void mmap_functional()
         CHECK(munmap(p, size) == 0);
         CHECK(msync(p, size, MS_SYNC) != 0);
     }
+
+    section("these calls answer only for what mmap handed out");
+    {
+        // A page-aligned malloc, so the refusal is about ownership and not
+        // about the alignment every one of these checks first.
+        void *m = aligned_alloc(page, page);
+        CHECK(m != nullptr);
+        CHECK(munmap(m, page) != 0);
+        CHECK(mprotect(m, page, PROT_READ) != 0);
+        CHECK(madvise(m, page, MADV_DONTNEED) != 0);
+        CHECK(msync(m, page, MS_SYNC) != 0);
+        free(m);
+    }
 }
 
 void mmap_perf()
