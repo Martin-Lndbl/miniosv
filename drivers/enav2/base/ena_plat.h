@@ -22,8 +22,9 @@
 #include <api/minidpdk/time.hh>
 #include <api/minidpdk/util.hh>
 
-#include <osv/contiguous_alloc.hh>
 #include <osv/debug.h>
+#include <osv/mem/frames.hh>
+#include <osv/mem/mapping.hh>
 #include <osv/types.h>
 
 #define ENA_LOG_ENABLE
@@ -307,8 +308,7 @@ int ena_dma_alloc(rte_eth_dev_data *dmadev, bus_size_t size,
 
 #define ENA_MEM_FREE_COHERENT(dmadev, size, virt, phys, mem_handle)            \
   do {                                                                         \
-    (void)size;                                                                \
-    memory::free_phys_contiguous_aligned(virt);                                \
+    mem::frames::free(mem::mapping::to_phys(virt), (size));                    \
     (virt) = NULL;                                                             \
   } while (0)
 

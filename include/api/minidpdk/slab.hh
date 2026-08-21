@@ -8,7 +8,9 @@
 
 #include <minidpdk/util.hh>
 #include <minidpdk/stack.hh>
-#include <osv/mmu.hh>
+#include <osv/mem/frames.hh>
+#include <osv/mem/mapping.hh>
+#include <osv/mem/phys.hh>
 #include <osv/types.h>
 
 namespace minidpdk {
@@ -217,11 +219,12 @@ public:
   mbuf *alloc_single() { return alloc_default(); }
 
   void alloc_new_region() {
-    auto *region = memory::alloc_huge_page(mmu::huge_page_size);
-    assert(region != nullptr);
+    auto pa = mem::frames::alloc(kSlabSize, kSlabSize);
+    assert(pa != mem::frames::no_memory);
+    auto *region = mem::map_phys(pa, kSlabSize);
     auto *s = new (region) page_header();
     auto *base = reinterpret_cast<uint8_t *>(region) + sizeof(page_header);
-    s->iova = mmu::virt_to_phys(s);
+    s->iova = pa;
     size_t space = kSlabSize - sizeof(page_header);
     ps.regions.list_push(s);
     size_t off = 0;
@@ -271,7 +274,7 @@ public:
       auto *s = list.head.next;
       while (s != &list.tail) {
         auto *next = s->next;
-        memory::free_huge_page(s, mmu::huge_page_size);
+        mem::frames::free(s->iova, kSlabSize);
         s = next;
       }
     };

@@ -4,6 +4,7 @@
 #include <cstring>
 #include <minidpdk/util.hh>
 #include <osv/sched.hh>
+#include <processor.hh>
 #include <vector>
 
 // Inter-CPU test-and-set spinlock. `preempt_lock` alone would only stop
@@ -17,7 +18,7 @@ struct pool_spinlock {
   void lock() {
     while (flag.exchange(true, std::memory_order_acquire)) {
       while (flag.load(std::memory_order_relaxed)) {
-        __builtin_ia32_pause();
+        processor::spin_hint();
       }
     }
   }

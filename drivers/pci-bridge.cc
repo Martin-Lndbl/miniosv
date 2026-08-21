@@ -8,12 +8,14 @@
 #include <algorithm>
 
 #include <osv/debug.hh>
+#include <osv/drivers_config.h>
 #include <osv/pci.hh>
 #include "drivers/pci-function.hh"
 #include "drivers/pci-bridge.hh"
 
 namespace pci {
 
+#if CONF_drivers_ena
     // PCI-to-PCI bridge (header type 1) memory-window registers.
     // Base/Limit low words hold bits [31:20] in bits [15:4]; low 20 bits
     // are implicit 0/1, giving 1 MiB granularity. Prefetchable base's
@@ -24,6 +26,7 @@ namespace pci {
     static constexpr u8 BRIDGE_PREF_LIMIT     = 0x26;
     static constexpr u8 BRIDGE_PREF_BASE_HI   = 0x28;
     static constexpr u8 BRIDGE_PREF_LIMIT_HI  = 0x2C;
+#endif /* CONF_drivers_ena */
 
     bridge::bridge(u8 bus, u8 device, u8 func)
         : function(bus, device, func)
@@ -40,6 +43,7 @@ namespace pci {
     {
         function::parse_pci_config();
 
+#if CONF_drivers_ena
         // Some AWS Nitro Gen 5 configs (c7i.large) leave downstream
         // bridges with empty memory windows (limit < base). BARs behind
         // such a bridge are unreachable until we program the window.
@@ -100,6 +104,7 @@ namespace pci {
         if (new_command != command) {
             pci_writew(PCI_CFG_COMMAND, new_command);
         }
+#endif /* CONF_drivers_ena */
 
         return true;
     }

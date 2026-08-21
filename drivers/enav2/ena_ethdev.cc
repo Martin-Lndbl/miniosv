@@ -9,11 +9,9 @@
 #include "base/ena_eth_com.h"
 #include "ena_if.h"
 #include "osv/aligned_new.hh"
-#include "osv/mmu-defs.hh"
 #include "osv/msi.hh"
 #include "osv/sched.hh"
 #include "osv/version.hh"
-#include "osv/virt_to_phys.hh"
 
 #include "base/ena_plat.h"
 #include <api/minidpdk/bit.hh>
@@ -29,6 +27,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <drivers/pci-device.hh>
+#include <osv/mem/frames.hh>
+#include <osv/mem/mapping.hh>
+#include <osv/mem/phys.hh>
 #include <osv/trace.hh>
 
 #define DRV_MODULE_VER_MAJOR 2
@@ -2348,14 +2349,14 @@ static void ena_copy_customer_metrics(struct ena_adapter *adapter,
 int ena_dma_alloc(rte_eth_dev_data *dmadev, bus_size_t size,
                   ena_mem_handle_t *dma, int mapflags, bus_size_t alignment,
                   int domain) {
-  dma->vaddr =
-      (caddr_t)memory::alloc_phys_contiguous_aligned(size, mmu::page_size);
-  if (!dma->vaddr) {
-    ena_log(pdev, ERR, "memory::alloc_phys_contiguous_aligned failed!", 1);
+  auto pa = mem::frames::alloc(size, mem::mapping::page_size);
+  if (pa == mem::frames::no_memory) {
+    ena_log(pdev, ERR, "no memory for a DMA buffer!", 1);
     dma->vaddr = 0;
     dma->paddr = 0;
     return ENA_COM_NO_MEM;
   }
+  dma->vaddr = (caddr_t)mem::map_phys(pa, size);
 
   /* Match dma_alloc_coherent() semantics on Linux/FreeBSD: hand back
    * zeroed memory. ena_com's admin CQ polls the phase bit of each entry
@@ -2365,7 +2366,7 @@ int ena_dma_alloc(rte_eth_dev_data *dmadev, bus_size_t size,
    * -ENODEV. */
   memset(dma->vaddr, 0, size);
 
-  dma->paddr = mmu::virt_to_phys(dma->vaddr);
+  dma->paddr = pa;
 
   return (0);
 }
