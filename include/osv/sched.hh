@@ -88,24 +88,40 @@ extern "C" {
 
 namespace bi = boost::intrusive;
 
-const unsigned max_cpus = sizeof(unsigned long) * 8;
+const unsigned max_cpus = 256;
 
+// One word per 64 cpus. Every operation works on the word holding its bit, so
+// a machine with 64 cpus or fewer only ever touches the first.
 class cpu_set {
+    static constexpr unsigned word_bits = sizeof(unsigned long) * 8;
+    static constexpr unsigned words = max_cpus / word_bits;
+    static unsigned word_of(unsigned c) { return c / word_bits; }
+    static unsigned long bit_of(unsigned c) { return 1UL << (c % word_bits); }
 public:
     explicit cpu_set() : _mask() {}
-    cpu_set(const cpu_set& other) : _mask(other._mask.load(std::memory_order_relaxed)) {}
+    cpu_set(const cpu_set& other) {
+        for (unsigned w = 0; w < words; w++) {
+            _mask[w].store(other._mask[w].load(std::memory_order_relaxed),
+                           std::memory_order_relaxed);
+        }
+    }
     void set(unsigned c) {
-        _mask.fetch_or(1UL << c, std::memory_order_release);
+        _mask[word_of(c)].fetch_or(bit_of(c), std::memory_order_release);
     }
     bool test_and_set(unsigned c) {
-        unsigned bit = 1UL << c;
-        return _mask.fetch_or(bit, std::memory_order_release) & bit;
+        unsigned long bit = bit_of(c);
+        return _mask[word_of(c)].fetch_or(bit, std::memory_order_release) & bit;
     }
+    // Set the bit and say whether that word held anything beforehand. Per word
+    // and not across the set, because fetch_clear() empties one word at a time:
+    // a setter that looked at the whole set could find another word still full,
+    // report the set non-empty, and leave its own bit behind a word the reader
+    // has already gone past. Erring this way costs a redundant wakeup at worst.
     bool test_all_and_set(unsigned c) {
-        return _mask.fetch_or(1UL << c, std::memory_order_release);
+        return _mask[word_of(c)].fetch_or(bit_of(c), std::memory_order_release);
     }
     void clear(unsigned c) {
-        _mask.fetch_and(~(1UL << c), std::memory_order_release);
+        _mask[word_of(c)].fetch_and(~bit_of(c), std::memory_order_release);
     }
     class iterator;
     iterator begin() {
@@ -116,14 +132,21 @@ public:
     }
     cpu_set fetch_clear() {
         cpu_set ret;
-        if (_mask.load(std::memory_order_relaxed)) {
-            ret._mask.store(_mask.exchange(0, std::memory_order_acquire),
-                            std::memory_order_relaxed);
+        for (unsigned w = 0; w < words; w++) {
+            if (_mask[w].load(std::memory_order_relaxed)) {
+                ret._mask[w].store(_mask[w].exchange(0, std::memory_order_acquire),
+                                   std::memory_order_relaxed);
+            }
         }
         return ret;
     }
     operator bool() const {
-        return _mask.load(std::memory_order_relaxed);
+        for (unsigned w = 0; w < words; w++) {
+            if (_mask[w].load(std::memory_order_relaxed)) {
+                return true;
+            }
+        }
+        return false;
     }
     class iterator {
     public:
@@ -162,20 +185,24 @@ public:
         }
     private:
         void advance() {
-            unsigned long tmp = _set._mask.load(std::memory_order_relaxed);
-            tmp &= ~((1UL << _idx) - 1);
-            if (tmp) {
-                _idx = __builtin_ctzl(tmp);
-            } else {
-                _idx = max_cpus;
+            while (_idx < max_cpus) {
+                unsigned w = word_of(_idx);
+                unsigned long tmp = _set._mask[w].load(std::memory_order_relaxed);
+                tmp &= ~0UL << (_idx % word_bits);
+                if (tmp) {
+                    _idx = w * word_bits + __builtin_ctzl(tmp);
+                    return;
+                }
+                _idx = (w + 1) * word_bits;
             }
+            _idx = max_cpus;
         }
     private:
         cpu_set& _set;
         unsigned _idx;
     };
 private:
-    std::atomic<unsigned long> _mask;
+    std::atomic<unsigned long> _mask[words];
 };
 
 class timer_base {
