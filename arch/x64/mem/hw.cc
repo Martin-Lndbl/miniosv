@@ -99,11 +99,11 @@ static void shootdown(const uintptr_t *va, size_t count)
                 return false;
             }
 
-            c->lazy_flush_tlb.store(true, std::memory_order_relaxed);
+            c->lazy_flush_tlb.store(true, std::memory_order_seq_cst);
             if (!c->app_thread.load(std::memory_order_seq_cst)) {
                 return false;
             }
-            if (!c->lazy_flush_tlb.exchange(false, std::memory_order_relaxed)) {
+            if (!c->lazy_flush_tlb.exchange(false, std::memory_order_seq_cst)) {
                 return false;
             }
             return true;

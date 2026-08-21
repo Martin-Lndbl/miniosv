@@ -234,6 +234,15 @@ enum class claim_result { fresh, adopted, taken, nomem };
  * neighbour's page; adopting it claims the tile. Anything else is another
  * cpu's tile, arriving or leaving.
  */
+// Eviction reads phys, so a frame claimed before the neighbour won must go.
+void give_up_claim(chunk &k)
+{
+    if (k.phys != frames::no_memory) {
+        frames::free(k.phys, chunk_bytes(k));
+        k.phys = frames::no_memory;
+    }
+}
+
 claim_result anchor_claim(cache &c, chunk &a)
 {
     uintptr_t va = va_of(c, a.pid * page_size);
@@ -256,6 +265,7 @@ claim_result anchor_claim(cache &c, chunk &a)
                 return claim_result::taken;
             }
             if (s.compare_exchange(e, mapping::pte_set_sw_bit(e, sw_right, true))) {
+                give_up_claim(a);
                 a.adopted = true;
                 return claim_result::adopted;
             }
@@ -292,6 +302,7 @@ claim_result tail_take(cache &c, chunk &k)
         mapping::pte e = s.read();
         if (mapping::pte_present(e) && !mapping::pte_sw_bit(e, sw_left)) {
             if (s.compare_exchange(e, mapping::pte_set_sw_bit(e, sw_left, true))) {
+                give_up_claim(k);
                 k.adopted = true;
                 return claim_result::adopted;
             }

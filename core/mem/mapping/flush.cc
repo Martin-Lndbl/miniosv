@@ -13,11 +13,14 @@
 namespace mem {
 namespace mapping {
 
-static std::atomic<uint64_t> epoch;
+// Global flushes started, and global flushes finished. Two counters, because
+// what a client needs to know is that one began after its entries were cleared,
+// which a count of completions alone cannot say.
+static std::atomic<uint64_t> begun, done;
 
 uint64_t flush_epoch()
 {
-    return epoch.load(std::memory_order_acquire);
+    return begun.load(std::memory_order_seq_cst);
 }
 
 void flush_local(range r)
@@ -50,8 +53,9 @@ void flush_range(range r)
 
 void flush_all()
 {
+    begun.fetch_add(1, std::memory_order_seq_cst);
     tlb_flush_all();
-    epoch.fetch_add(1, std::memory_order_acq_rel);
+    done.fetch_add(1, std::memory_order_seq_cst);
 }
 
 void pending_invalidation::add(uintptr_t addr)
@@ -65,8 +69,10 @@ void pending_invalidation::add(uintptr_t addr)
 
 void pending_invalidation::invalidate()
 {
-    // Need to be +2 in case a flush happened while accumulating addresses.
-    if ((count || all) && flush_epoch() < epoch + 2) {
+    // More flushes have finished than had started when the entries were
+    // cleared, so one of them started after: it named these addresses already.
+    // Flushes overlap, which is why finishing later is not enough on its own.
+    if ((count || all) && done.load(std::memory_order_seq_cst) <= epoch) {
         if (all) {
             flush_all();
         } else {
@@ -75,7 +81,7 @@ void pending_invalidation::invalidate()
     }
     count = 0;
     all = false;
-    epoch = 0;
+    epoch = never_flushed;
 }
 
 }

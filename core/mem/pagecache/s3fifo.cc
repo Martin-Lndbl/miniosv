@@ -11,8 +11,6 @@
 
 #include <osv/debug.hh>
 #include <osv/ilog2.hh>
-#include <osv/preempt-lock.hh>
-#include <osv/sched.hh>
 
 #include "internal.hh"
 
@@ -27,129 +25,88 @@ constexpr size_t small_share = 10;
 // Buffers one call to evict() looks at before giving up on finding a cold one.
 constexpr unsigned steps_max = 4096;
 
-constexpr int64_t ring_cap_min = 1024;
-constexpr int64_t ring_cap_max = 1 << 20;
-constexpr unsigned retired_max = 40;
+constexpr uint64_t ring_cap_min = 1024;
 
-struct ring {
-    int64_t cap;                // a power of two
-    std::atomic<buffer *> *slot;
+// Whose turn a slot is: its own index means an enqueue may fill it, one past
+// that means a dequeue may take it.
+struct slot {
+    std::atomic<uint64_t> seq;
+    buffer *b;
 };
 
-ring *ring_make(int64_t cap)
-{
-    auto *r = static_cast<ring *>(
-        std::malloc(sizeof(ring) + cap * sizeof(std::atomic<buffer *>)));
-    if (r) {
-        r->cap = cap;
-        r->slot = reinterpret_cast<std::atomic<buffer *> *>(r + 1);
-    }
-    return r;
-}
-
-std::atomic<buffer *> &at(ring *r, int64_t i)
-{
-    return r->slot[i & (r->cap - 1)];
-}
-
-// Single producer at the bottom (the cpu owning it, preemption off), any
-// number of stealers at the top. Indices only grow, so there is no aba.
-struct deque {
-    std::atomic<int64_t> top{0}, bottom{0};
-    std::atomic<ring *> arr{nullptr};
+struct fifo {
+    slot *at = nullptr;
+    uint64_t mask = 0;
+    std::atomic<uint64_t> head{0}, tail{0};
     std::atomic<size_t> bytes{0};
-    ring *retired[retired_max];
-    unsigned nretired = 0;
-};
-
-struct shard {
-    deque small;
-    deque main;
 };
 
 struct queues {
-    shard *at;
-    unsigned n;
-    std::atomic<unsigned> turn{0};
+    fifo small, main;
 
-    // The names of what the small queues gave up: one slot per hash, the
+    // The names of what the small queue gave up: one slot per hash, the
     // newest name winning it. Forgets early, invents nothing.
-    std::atomic<uint32_t> *ghost;
-    size_t ghost_mask;
+    std::atomic<uint32_t> *ghost = nullptr;
+    size_t ghost_mask = 0;
 };
 
-buffer *steal(deque &q)
+bool fifo_make(fifo &q, uint64_t cap)
 {
-    int64_t t = q.top.load(std::memory_order_acquire);
-    std::atomic_thread_fence(std::memory_order_seq_cst);
-    int64_t bot = q.bottom.load(std::memory_order_acquire);
-    if (t >= bot) {
-        return nullptr;
+    q.at = static_cast<slot *>(std::malloc(cap * sizeof(slot)));
+    if (!q.at) {
+        return false;
     }
-    ring *a = q.arr.load(std::memory_order_acquire);
-    buffer *b = at(a, t).load(std::memory_order_relaxed);
-    if (!q.top.compare_exchange_strong(t, t + 1, std::memory_order_seq_cst)) {
-        return nullptr;
+    for (uint64_t i = 0; i < cap; i++) {
+        q.at[i].seq.store(i, std::memory_order_relaxed);
+        q.at[i].b = nullptr;
     }
-    q.bytes.fetch_sub(size(*b), std::memory_order_relaxed);
-    return b;
+    q.mask = cap - 1;
+    return true;
 }
 
-// Push onto the deque of whichever cpu this runs on. The ring is grown, and a
-// leftover spare freed, with preemption enabled.
-void enqueue(queues &s, deque shard::*which, buffer *b)
+bool push(fifo &q, buffer *b)
 {
-    ring *spare = nullptr;
     for (;;) {
-        int64_t need = 0;
-        bool done = false;
-        {
-            SCOPE_LOCK(preempt_lock);
-            deque &q = s.at[sched::cpu::current()->id % s.n].*which;
-            int64_t bot = q.bottom.load(std::memory_order_relaxed);
-            int64_t top = q.top.load(std::memory_order_acquire);
-            ring *a = q.arr.load(std::memory_order_relaxed);
-            if (spare && spare->cap > a->cap) {
-                for (int64_t i = top; i < bot; i++) {
-                    at(spare, i).store(at(a, i).load(std::memory_order_relaxed),
-                                       std::memory_order_relaxed);
-                }
-                if (q.nretired == retired_max) {
-                    abort("pagecache: policy queue grew out of bounds\n");
-                }
-                q.retired[q.nretired++] = a;
-                q.arr.store(spare, std::memory_order_release);
-                a = spare;
-                spare = nullptr;
-            }
-            if (bot - top < a->cap) {
-                at(a, bot).store(b, std::memory_order_relaxed);
-                std::atomic_thread_fence(std::memory_order_release);
-                q.bottom.store(bot + 1, std::memory_order_relaxed);
-                q.bytes.fetch_add(size(*b), std::memory_order_relaxed);
-                done = true;
-            } else {
-                need = a->cap * 2;
-            }
+        uint64_t t = q.tail.load(std::memory_order_relaxed);
+        slot &s = q.at[t & q.mask];
+        int64_t d = int64_t(s.seq.load(std::memory_order_acquire)) - int64_t(t);
+        if (d < 0) {
+            return false;
         }
-        if (done) {
-            std::free(spare);
-            return;
-        }
-        std::free(spare);
-        spare = ring_make(need);
-        if (!spare) {
-            abort("pagecache: no memory for the policy queue\n");
+        if (d == 0 && q.tail.compare_exchange_weak(t, t + 1,
+                                                   std::memory_order_relaxed)) {
+            s.b = b;
+            s.seq.store(t + 1, std::memory_order_release);
+            q.bytes.fetch_add(size(*b), std::memory_order_relaxed);
+            return true;
         }
     }
 }
 
-void deque_destroy(deque &q)
+buffer *pop(fifo &q)
 {
-    for (unsigned i = 0; i < q.nretired; i++) {
-        std::free(q.retired[i]);
+    for (;;) {
+        uint64_t h = q.head.load(std::memory_order_relaxed);
+        slot &s = q.at[h & q.mask];
+        int64_t d = int64_t(s.seq.load(std::memory_order_acquire)) - int64_t(h + 1);
+        if (d < 0) {
+            return nullptr;
+        }
+        if (d == 0 && q.head.compare_exchange_weak(h, h + 1,
+                                                   std::memory_order_relaxed)) {
+            buffer *b = s.b;
+            s.seq.store(h + q.mask + 1, std::memory_order_release);
+            q.bytes.fetch_sub(size(*b), std::memory_order_relaxed);
+            return b;
+        }
     }
-    std::free(q.arr.load(std::memory_order_relaxed));
+}
+
+void enqueue(fifo &q, buffer *b)
+{
+    if (!push(q, b)) {
+        abort("pagecache: the policy queue is full\n");
+    }
 }
 
 uint32_t name_of(uint64_t off)
@@ -170,20 +127,31 @@ void remember(queues &s, uint64_t off)
     s.ghost[n & s.ghost_mask].store(n, std::memory_order_relaxed);
 }
 
+void destroy(void *p)
+{
+    auto *s = static_cast<queues *>(p);
+    if (!s) {
+        return;
+    }
+    std::free(s->small.at);
+    std::free(s->main.at);
+    std::free(s->ghost);
+    delete s;
+}
+
 void *create(uint64_t store_size)
 {
     auto *s = new (std::nothrow) queues();
     if (!s) {
         return nullptr;
     }
-    s->n = sched::cpus.size();
-    s->at = static_cast<shard *>(std::calloc(s->n, sizeof(shard)));
 
-    // Avoid allocating when we are growing the queue.
-    uint64_t capacity = std::min<uint64_t>(store_size, frames::phys_mem_size) / page_size;
-    int64_t cap = int64_t(1) << ilog2_roundup(
-        std::min<uint64_t>(std::max<uint64_t>(capacity / s->n, ring_cap_min),
-                           ring_cap_max));
+    // A slot for every buffer the cache could hold, so that a push never
+    // fails and nothing goes untracked.
+    uint64_t capacity =
+        std::min<uint64_t>(store_size, frames::phys_mem_size) / page_size;
+    uint64_t cap = uint64_t(1)
+                   << ilog2_roundup(std::max<uint64_t>(capacity, ring_cap_min));
 
     uint64_t want = std::min<uint64_t>(
         std::max<uint64_t>(store_size / page_size / 8, 1024), 1u << 20);
@@ -191,36 +159,11 @@ void *create(uint64_t store_size)
     s->ghost = static_cast<std::atomic<uint32_t> *>(
         std::calloc(s->ghost_mask + 1, sizeof(uint32_t)));
 
-    bool ok = s->at && s->ghost;
-    for (unsigned i = 0; ok && i < s->n; i++) {
-        new (&s->at[i]) shard();
-        s->at[i].small.arr.store(ring_make(cap), std::memory_order_relaxed);
-        s->at[i].main.arr.store(ring_make(cap), std::memory_order_relaxed);
-        ok = s->at[i].small.arr.load(std::memory_order_relaxed) &&
-             s->at[i].main.arr.load(std::memory_order_relaxed);
-    }
-    if (!ok) {
-        std::free(s->at);
-        std::free(s->ghost);
-        delete s;
+    if (!s->ghost || !fifo_make(s->small, cap) || !fifo_make(s->main, cap)) {
+        destroy(s);
         return nullptr;
     }
     return s;
-}
-
-void destroy(void *p)
-{
-    auto *s = static_cast<queues *>(p);
-    if (!s) {
-        return;
-    }
-    for (unsigned i = 0; i < s->n; i++) {
-        deque_destroy(s->at[i].small);
-        deque_destroy(s->at[i].main);
-    }
-    std::free(s->at);
-    std::free(s->ghost);
-    delete s;
 }
 
 size_t fault_size(void *, uint64_t)
@@ -234,8 +177,7 @@ void on_fault(void *p, buffer &b)
     if (!s) {
         return;
     }
-    bool proven = remembered(*s, offset(b));
-    enqueue(*s, proven ? &shard::main : &shard::small, &b);
+    enqueue(remembered(*s, offset(b)) ? s->main : s->small, &b);
 }
 
 void evict(void *p, size_t bytes, buffer_list &victims)
@@ -245,29 +187,27 @@ void evict(void *p, size_t bytes, buffer_list &victims)
         return;
     }
     size_t got = 0;
-    unsigned dry = 0;
+    unsigned chances = 0;
     for (unsigned step = 0;
-         got < bytes && !victims.full() && dry < 2 * s->n && step < steps_max; step++) {
-        shard &sh = s->at[s->turn.fetch_add(1, std::memory_order_relaxed) % s->n];
-        size_t sb = sh.small.bytes.load(std::memory_order_relaxed);
-        size_t mb = sh.main.bytes.load(std::memory_order_relaxed);
+         got < bytes && !victims.full() && step < steps_max; step++) {
+        size_t sb = s->small.bytes.load(std::memory_order_relaxed);
+        size_t mb = s->main.bytes.load(std::memory_order_relaxed);
         // Probation is over once the small queue exceeds its share.
         bool from_small = sb * small_share > sb + mb;
-        buffer *b = steal(from_small ? sh.small : sh.main);
+        buffer *b = pop(from_small ? s->small : s->main);
         if (!b) {
             from_small = !from_small;
-            b = steal(from_small ? sh.small : sh.main);
+            b = pop(from_small ? s->small : s->main);
         }
         if (!b) {
-            dry++;
-            continue;
+            break;
         }
-        dry = 0;
-        if (accessed(*b)) {
-            // The second chance: the clear costs the same invalidation the
-            // eviction it avoids would have.
+        if (accessed(*b) && chances < steps_max / 2) {
+            // A second chance, capped so that hot buffers cannot starve the
+            // caller of a victim.
             clear_accessed(*b);
-            enqueue(*s, &shard::main, b);
+            chances++;
+            enqueue(s->main, b);
             continue;
         }
         if (from_small) {
@@ -291,8 +231,6 @@ const policy s3fifo = {
     .evict = evict,
     .on_fault = on_fault,
     .on_evicted = on_evicted,
-    // Null: the cache reads the dirty bits after the shootdown, which is the
-    // accurate source.
     .is_dirty = nullptr,
 };
 

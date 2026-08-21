@@ -91,16 +91,19 @@ bool attach_missing(range r, frames::phys_addr phys, unsigned perm, size_t slop 
 /*
  * Virtual address that have been cleared but that may be stale in a TLB.
  * invalidate() flushes the TLB.
- * 
+ *
  * The list has flush_batch entries at max.
- * The flush epoch value is the one recorded once the last of these entries was
- * cleared. If current epoch >= old + 2, then invalidate() returns directly.
+ * "epoch" is flush_epoch() as of the moment the last of these entries was
+ * cleared; invalidate() returns directly if a global flush has begun and
+ * finished since. Leaving it alone means flushing.
  */
+constexpr uint64_t never_flushed = ~uint64_t(0);
+
 struct pending_invalidation {
     uintptr_t va[flush_batch];
     unsigned count = 0;
     bool all = false;
-    uint64_t epoch = 0;
+    uint64_t epoch = never_flushed;
 
     void add(uintptr_t addr);
     void invalidate();

@@ -150,15 +150,17 @@ void protect(range r, unsigned perm)
     walk_opts o{false, true, false, max_leaf_level};
     auto res = walk_range(page_align(r), o, [&](pte_ref e, uintptr_t va) {
         pte old = e.read();
-        if (pte_empty(old)) {
-            return true;
-        }
-        pte now = pte_with_perm(old, perm);
-        if (now != old) {
-            e.write(now);
-            if (pte_perm_change_needs_flush(pte_perm(old), perm)) {
-                // Flush only if needed (arch specific).
-                stale.add(va);
+        while (!pte_empty(old)) {
+            pte now = pte_with_perm(old, perm);
+            if (now == old) {
+                break;
+            }
+            if (e.compare_exchange(old, now)) {
+                if (pte_perm_change_needs_flush(pte_perm(old), perm)) {
+                    // Flush only if needed (arch specific).
+                    stale.add(va);
+                }
+                break;
             }
         }
         return true;
@@ -200,14 +202,19 @@ static void clear_leaves(range r, pte (*without)(pte), pending_invalidation *sta
 {
     walk_opts o{false, false, false, max_leaf_level};
     walk_range(page_align(r), o, [=](pte_ref e, uintptr_t va) {
+        // Only while it is still the entry that was read: one going away under
+        // this must not be written back.
         pte old = e.read();
-        if (pte_present(old)) {
+        while (pte_present(old)) {
             pte now = without(old);
-            if (now != old) {
-                e.write(now);
+            if (now == old) {
+                break;
+            }
+            if (e.compare_exchange(old, now)) {
                 if (stale) {
                     stale->add(va);
                 }
+                break;
             }
         }
         return true;
