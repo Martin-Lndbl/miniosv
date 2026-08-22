@@ -706,6 +706,10 @@ objects += core/mem/mapping/flush.o
 objects += arch/$(arch)/mem/hw.o
 objects += arch/$(arch)/mem/fault.o
 
+# Arch-specific (SIMD) implementations for string functions
+objects += arch/$(arch)/string.o
+$(out)/arch/$(arch)/string.o: CXXFLAGS += -fno-builtin
+
 # The sub-page allocator. So far only the path for allocations big enough to
 # get a reservation of their own.
 objects += core/mem/boot.o
@@ -851,6 +855,7 @@ objects += modules/miniext/file.o
 objects += modules/miniext/aio.o
 objects += modules/miniext/raw.o
 objects += modules/miniext/fstream.o
+objects += modules/miniext/etcache.o
 endif
 
 # The vAccel operations the application calls, on top of the virtio-accel
