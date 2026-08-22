@@ -89,21 +89,20 @@ int mount(int nvme_id, const char *mount_point)
 
     {
         const uint32_t lba = f->dev.lba_size();
-        if (SUPERBLOCK_OFFSET % lba != 0 || sizeof(superblock) % lba != 0) {
-            printf("miniext: %u-byte LBAs do not divide the superblock offset\n", lba);
-            return -EINVAL;
-        }
-        scratch buf(sizeof(superblock));
+        const uint64_t first = SUPERBLOCK_OFFSET / lba;
+        const uint32_t off = SUPERBLOCK_OFFSET % lba;
+        const uint32_t span = (off + sizeof(superblock) + lba - 1) / lba;
+
+        scratch buf(span * lba);
         if (!buf) {
             return -ENOMEM;
         }
-        rc = f->dev.read(buf.data(), SUPERBLOCK_OFFSET / lba,
-                         sizeof(superblock) / lba);
+        rc = f->dev.read(buf.data(), first, span);
         if (rc < 0) {
             printf("miniext: could not read the superblock\n");
             return rc;
         }
-        memcpy(&f->sb, buf.data(), sizeof(superblock));
+        memcpy(&f->sb, buf.data() + off, sizeof(superblock));
     }
 
     if (le16(f->sb.s_magic) != SUPERBLOCK_MAGIC) {
@@ -202,6 +201,10 @@ int mount(int nvme_id, const char *mount_point)
     while (f->mount_point.size() > 1 && f->mount_point.back() == '/') {
         f->mount_point.pop_back();
     }
+    // Sized here rather than at configure() time: an entry is one filesystem
+    // block, which is not known until the superblock has been read.
+    etcache::configure(extent_cache_configured(), f->block_size);
+
     f->mounted = true;
 
     printf("miniext: mounted nvme%d at %s: %u-byte blocks, %lu blocks, "
@@ -218,6 +221,7 @@ int umount()
     if (!f->mounted) {
         return -EINVAL;
     }
+    etcache::teardown();
     f->dev.flush();
     f->dev.close();
     f->groups.clear();
