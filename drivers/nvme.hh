@@ -70,7 +70,8 @@ public:
   // Create an I/O queue pair of the given depth and return an opaque handle
   // (really an io_queue_pair*). target_interrupt_cpu pins the queue's MSI-X
   // completion interrupt; nullptr uses the current CPU.
-  void *create_io_queue(int qsize, sched::cpu *target_interrupt_cpu = nullptr);
+  void *create_io_queue(int qsize, sched::cpu *target_interrupt_cpu = nullptr,
+                        bool interrupts = true);
   void remove_io_user_queue(io_queue_pair *queue);
 
   bool reset_and_destroy_controller();

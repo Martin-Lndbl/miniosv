@@ -30,11 +30,11 @@ void read_complete(void *ctx, const nvme_sq_entry_t *)
     req->waiter.wake_from_kernel_or_with_irq_disabled();
 }
 
-// Read one raw sector off the boot disk (NVMe controller 0). 
+// Read one raw sector off NVMe controller `nvme_id`.
 // Returns false when there is no such controller (absence of arguments).
-bool read_boot_sector(unsigned lba, void *buf, unsigned bytes)
+bool read_boot_sector(int nvme_id, unsigned lba, void *buf, unsigned bytes)
 {
-    auto *drv = nvme::nvme_driver::get_nvme_device(0);
+    auto *drv = nvme::nvme_driver::get_nvme_device(nvme_id);
     if (!drv) {
         return false;
     }
@@ -89,8 +89,16 @@ std::string read_bootargs()
     auto *buf = static_cast<uint8_t *>(mem::map_phys(pa, 512));
     memset(buf, 0, 512);
 
+    // The boot disk is not always controller 0: a device passed through with
+    // vfio can be probed before it. So the disk carrying the arguments is the
+    // one whose sector holds the magic, and it is looked for rather than
+    // assumed.
     std::string out;
-    if (read_boot_sector(bootargs_lba, buf, 512)) {
+    for (size_t id = 0; id < nvme::nvme_driver::nvme_drives.size(); id++) {
+        memset(buf, 0, 512);
+        if (!read_boot_sector(int(id), bootargs_lba, buf, 512)) {
+            continue;
+        }
         auto *blk = reinterpret_cast<bootargs_block *>(buf);
         if (memcmp(blk->magic, bootargs_magic, sizeof(bootargs_magic)) == 0) {
             uint32_t len = blk->length;
@@ -99,6 +107,7 @@ std::string read_bootargs()
             }
             blk->args[len] = '\0';
             out.assign(blk->args, len);
+            break;
         }
     }
     mem::frames::free(pa, 512);

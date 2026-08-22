@@ -351,8 +351,9 @@ int nvme_driver::identify_namespace(u32 nsid) {
   _ns_data[nsid]->bpshift = NVME_PAGESHIFT - _ns_data[nsid]->blockshift;
   _ns_data[nsid]->id = nsid;
 
-  printf("Identified namespace with nsid=%d, blockcount=%d, blocksize=%d\n",
-         nsid, _ns_data[nsid]->blockcount, _ns_data[nsid]->blocksize);
+  printf("Identified namespace with nsid=%d, blockcount=%lu, blocksize=%d\n",
+         nsid, (unsigned long)_ns_data[nsid]->blockcount,
+         _ns_data[nsid]->blocksize);
   return 0;
 }
 
@@ -408,7 +409,8 @@ void nvme_driver::enable_write_cache() {
 // I/O queue management
 // ===========================================================================
 
-void *nvme_driver::create_io_queue(int qsize, sched::cpu *target_interrupt_cpu) {
+void *nvme_driver::create_io_queue(int qsize, sched::cpu *target_interrupt_cpu,
+                                   bool interrupts) {
   assert(qsize > 1 && qsize < _qsize);
   size_t qid = ++_queue_id_counter;
   assert(qid < (1 << 16) && qid > 0);
@@ -430,7 +432,9 @@ void *nvme_driver::create_io_queue(int qsize, sched::cpu *target_interrupt_cpu) 
   setup_create_io_queue_cmd<nvme_acmd_create_cq_t>(
       &cmd_cq, qid, qsize, NVME_ACMD_CREATE_CQ, queue->cq_phys_addr());
   cmd_cq.iv = iv;
-  cmd_cq.ien = 1;
+  // A polled queue must not raise an interrupt: the handler and the polling
+  // thread would both drain the same completion queue.
+  cmd_cq.ien = interrupts ? 1 : 0;
 
   // Submission queue command.
   nvme_acmd_create_sq_t cmd_sq;
@@ -445,9 +449,10 @@ void *nvme_driver::create_io_queue(int qsize, sched::cpu *target_interrupt_cpu) 
   io_queue_pair *qp = queue.get();
   _io_queues.push_back(std::move(queue));
 
-  assert(target_interrupt_cpu != nullptr); 
-  msix_register_completion_interrupt(
-      iv, qp, target_interrupt_cpu);
+  if (interrupts) {
+    assert(target_interrupt_cpu != nullptr);
+    msix_register_completion_interrupt(iv, qp, target_interrupt_cpu);
+  }
 
   _admin_queue->submit_and_return_on_completion((nvme_sq_entry_t *)&cmd_cq);
   _admin_queue->submit_and_return_on_completion((nvme_sq_entry_t *)&cmd_sq);

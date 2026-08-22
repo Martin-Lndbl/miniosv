@@ -18,6 +18,7 @@
 #include <osv/mem/mapping.hh>
 #include <osv/mem/frames.hh>
 #include <osv/mem/phys.hh>
+#include "processor.hh"
 
 TRACEPOINT(trace_nvme_cq_wait, "nvme%d qid=%d, cq_head=%d", int, int, int);
 TRACEPOINT(trace_nvme_cq_woken, "nvme%d qid=%d, have_elements=%d", int, int, bool);
