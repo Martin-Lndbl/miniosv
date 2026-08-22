@@ -335,7 +335,7 @@ inline void cli_notrace()
 inline u64 rdtsc()
 {
     u32 lo, hi;
-    asm("rdtsc" : "=a"(lo), "=d"(hi));
+    asm volatile ("rdtsc" : "=a"(lo), "=d"(hi));
     return lo | (u64(hi) << 32);
 }
 
