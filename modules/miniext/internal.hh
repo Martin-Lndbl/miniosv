@@ -237,6 +237,26 @@ void inode_add_blocks(fs *f, inode *in, int64_t delta_fs_blocks);
 // unallocated range or an uninitialised extent), which reads as zeros.
 // *run is the number of consecutive blocks that share the mapping, so callers
 // can coalesce I/O.
+// --- extent tree block cache --------------------------------------------
+//
+// See etcache.cc. read() is a read-through: it fills dst either from the cache
+// or from the device. Every write of an extent tree block must invalidate it.
+namespace etcache {
+struct stats {
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+    uint64_t evictions = 0;
+    unsigned held = 0;
+    size_t bytes = 0;
+};
+void configure(unsigned blocks, uint32_t block_size);
+void teardown();
+unsigned capacity();
+int read(fs *f, uint64_t block, uint8_t *dst);
+void invalidate(uint64_t block);
+stats report();
+}
+
 int extent_lookup(fs *f, const inode *in, uint32_t fblock,
                   uint64_t *phys, uint32_t *run);
 

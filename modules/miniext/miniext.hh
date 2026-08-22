@@ -101,6 +101,19 @@ int rename(const char *from, const char *to);
 int mkdir(const char *path);
 int rmdir(const char *path);
 
+// Cache extents in memory
+void extent_cache_configure(unsigned blocks);
+unsigned extent_cache_configured();
+
+struct extent_cache_stats {
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t evictions;
+    unsigned held;          // blocks actually allocated
+    size_t bytes;           // what it costs
+};
+extent_cache_stats extent_cache_report();
+
 // Geometry, for diagnostics.
 struct fs_info {
     uint32_t block_size;
@@ -131,6 +144,13 @@ uint64_t size(device *d);
 
 // Bytes read, 0 at end of namespace, or -errno.
 int64_t pread(device *d, void *buf, size_t len, uint64_t offset);
+
+// The same page cache backend store_open(file*) gives, over the namespace
+// itself. One store per device rather than one per file, which is the shape a
+// buffer manager wants: it owns the whole device and does its own placement,
+// so a filesystem underneath would only add a translation it does not need.
+mem::store *store_open(device *d);
+void store_close(mem::store *s);
 
 } // namespace raw
 

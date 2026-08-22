@@ -20,6 +20,21 @@ namespace miniext {
 
 namespace {
 
+// Every write of an extent tree block makes a cached copy of it stale, so the
+// two belong together rather than at each of the call sites. Invalidated even
+// when the write failed: a write that reported an error may still have partly
+// landed, and the cached copy can no longer be trusted either way.
+int write_tree_block(fs *f, const uint8_t *data, uint64_t block)
+{
+    int rc = f->dev.write(data, block, 1);
+    etcache::invalidate(block);
+    return rc;
+}
+
+} // namespace
+
+namespace {
+
 extent_header *root_header(inode *in)
 {
     return reinterpret_cast<extent_header *>(in->i_block);
@@ -235,7 +250,7 @@ static int grow_to_depth1(fs *f, uint32_t ino, inode *in)
     memcpy(buf.data() + sizeof(extent_header), in->i_block + sizeof(extent_header),
            le16(eh->eh_entries) * sizeof(extent));
 
-    rc = f->dev.write(buf.data(), leaf, 1);
+    rc = write_tree_block(f, buf.data(), leaf);
     if (rc < 0) {
         block_free(f, leaf, 1);
         return rc;
@@ -306,7 +321,7 @@ static int extent_insert(fs *f, uint32_t ino, inode *in, uint32_t fblock,
     }
 
     if (leaf_insert(lh, leaf_capacity(f), fblock, phys, count)) {
-        rc = f->dev.write(buf.data(), leaf, 1);
+        rc = write_tree_block(f, buf.data(), leaf);
         if (rc < 0) {
             return rc;
         }
@@ -377,11 +392,11 @@ static int extent_insert(fs *f, uint32_t ino, inode *in, uint32_t fblock,
         return -ENOSPC;             // both halves full: cannot happen after a split
     }
 
-    rc = f->dev.write(buf.data(), leaf, 1);
+    rc = write_tree_block(f, buf.data(), leaf);
     if (rc < 0) {
         return rc;
     }
-    rc = f->dev.write(nbuf.data(), new_leaf, 1);
+    rc = write_tree_block(f, nbuf.data(), new_leaf);
     if (rc < 0) {
         return rc;
     }
@@ -536,7 +551,7 @@ int extent_truncate(fs *f, uint32_t ino, inode *in, uint32_t from)
                 keep = i;
             }
         } else if (changed) {
-            rc = f->dev.write(buf.data(), leaf, 1);
+            rc = write_tree_block(f, buf.data(), leaf);
             if (rc < 0) {
                 return rc;
             }

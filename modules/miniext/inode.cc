@@ -147,7 +147,9 @@ int extent_lookup(fs *f, const inode *in, uint32_t fblock,
         }
 
         const uint64_t child = extent_idx_leaf(&ix[chosen]);
-        int rc = f->dev.read(node.data(), child, 1);
+        // Through the cache: the same few tree blocks answer every lookup on a
+        // file, so this is the device read worth not doing.
+        int rc = etcache::read(f, child, node.data());
         if (rc < 0) {
             return rc;
         }
