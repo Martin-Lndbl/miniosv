@@ -12,6 +12,11 @@
 #include <cerrno>
 #include <cstring>
 
+#include <algorithm>
+
+#include <osv/mem/mapping.hh>
+#include <osv/mem/store.hh>
+
 #include "internal.hh"
 
 namespace miniext {
@@ -118,6 +123,115 @@ int64_t pread(device *d, void *buf, size_t len, uint64_t offset)
     }
 
     return static_cast<int64_t>(moved);
+}
+
+/* The page cache's backend, with no filesystem under it. */
+
+namespace {
+
+struct raw_io {
+    io_group g;
+    int64_t moved = 0;
+    int err = 0;
+};
+
+class raw_store : public mem::store {
+public:
+    raw_store(device *d, size_t unit) : _d(d), _unit(unit) {}
+
+    uint64_t size() override { return _d->bytes; }
+    size_t granularity() override { return _unit; }
+
+    mem::io *read(void *buf, uint64_t offset, size_t bytes) override
+    {
+        return start(buf, offset, bytes, false);
+    }
+
+    mem::io *write(const void *buf, uint64_t offset, size_t bytes) override
+    {
+        return start(const_cast<void *>(buf), offset, bytes, true);
+    }
+
+    bool done(mem::io *req) override
+    {
+        auto *r = reinterpret_cast<raw_io *>(req);
+        return r && r->g.settled();
+    }
+
+    int64_t wait(mem::io *req) override
+    {
+        auto *r = reinterpret_cast<raw_io *>(req);
+        if (!r) {
+            return -EINVAL;
+        }
+        sched::thread::wait_until([r] { return r->g.settled(); });
+        r->g.waiter.clear();
+        int err = r->err ? r->err : r->g.error.load(std::memory_order_relaxed);
+        int64_t moved = r->moved;
+        delete r;
+        return err ? err : moved;
+    }
+
+private:
+    mem::io *start(void *buf, uint64_t offset, size_t bytes, bool write);
+
+    device *_d;
+    size_t _unit;
+};
+
+mem::io *raw_store::start(void *buf, uint64_t offset, size_t bytes, bool write)
+{
+    auto *r = new (std::nothrow) raw_io();
+    if (!r) {
+        return nullptr;
+    }
+    r->g.waiter.reset(*sched::thread::current());
+
+    if (offset >= _d->bytes) {
+        bytes = 0;
+    } else if (bytes > _d->bytes - offset) {
+        bytes = _d->bytes - offset;
+    }
+
+    const uint32_t lba_size = _d->lba_size;
+    if (bytes == 0) {
+        // Nothing to submit, so the group settles on the drop below.
+    } else if (offset % lba_size || bytes % lba_size) {
+        // The cache faults at granularity boundaries, which are whole LBAs, so
+        // anything else is a caller's mistake rather than a case to bounce.
+        r->err = -EINVAL;
+    } else {
+        const uint64_t lba = offset / lba_size;
+        const auto count = static_cast<uint32_t>(bytes / lba_size);
+        int rc = write ? _d->dev.write_async(buf, lba, count, r->g)
+                       : _d->dev.read_async(buf, lba, count, r->g);
+        if (rc < 0) {
+            r->err = rc;
+        } else {
+            r->moved = static_cast<int64_t>(bytes);
+        }
+    }
+
+    r->g.drop();
+    return reinterpret_cast<mem::io *>(r);
+}
+
+} // namespace
+
+mem::store *store_open(device *d)
+{
+    if (!d) {
+        return nullptr;
+    }
+    // The cache hands out memory, so its unit cannot be smaller than a page
+    // however small the device's LBA is.
+    size_t unit = std::max<size_t>(d->lba_size, mem::mapping::page_size);
+    return new (std::nothrow) raw_store(d, unit);
+}
+
+void store_close(mem::store *s)
+{
+    delete s;
 }
 
 } // namespace raw
