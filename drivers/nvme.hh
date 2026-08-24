@@ -121,6 +121,14 @@ private:
       _io_queues;
   size_t _queue_id_counter = 0;
 
+  // create_io_queue and remove_io_user_queue are called from application
+  // threads -- the fio engine creates one queue per job, all at once -- and
+  // between them they hand out queue ids, grow _io_queues, claim an MSI-X
+  // vector and run an admin command. None of that is safe to interleave: two
+  // threads reading _queue_id_counter together take the same id, and with it
+  // the same interrupt vector and doorbell.
+  mutex _queue_admin_lock;
+
   // --- controller registers / PCI ---
   pci::device &_dev;
   pci::bar *_bar0 = nullptr;
@@ -129,6 +137,11 @@ private:
   u32 _qsize;
 
   std::unique_ptr<nvme_identify_ctlr_t> _identify_controller;
+
+  // What the controller allocated in response to Set Features / Number of
+  // Queues. Creating more than this is refused by the controller, so it is the
+  // ceiling create_io_queue enforces. One until the request has been made.
+  u16 _max_io_queues = 1;
 
   // --- interrupt plumbing ---
   interrupt_manager _msi;

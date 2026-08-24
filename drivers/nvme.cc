@@ -112,6 +112,14 @@ nvme_driver::nvme_driver(pci::device &pci_dev) : _dev(pci_dev), _msi(&pci_dev) {
   assert(identify_controller() == 0);
   assert(identify_namespace(NVME_NAMESPACE_DEFAULT_NS) == 0);
 
+  // Ask for I/O queues before creating any
+  u16 want = static_cast<u16>(sched::cpus.size());
+  u16 granted = 0;
+  if (set_number_of_queues(want, &granted) == 0 && granted) {
+    _max_io_queues = granted;
+  }
+  printf("nvme: %u I/O queues allocated (asked for %u)\n", _max_io_queues, want);
+
   // Enable write cache if available
   if (_identify_controller->vwc & 0x1 && NVME_VWC_ENABLED) {
     enable_write_cache();
@@ -371,11 +379,8 @@ int nvme_driver::set_number_of_queues(u16 num, u16 *ret) {
   if (res.sct != 0 || res.sc != 0)
     return EIO;
 
-  if (num > cq_num || num > sq_num) {
-    *ret = (cq_num > sq_num) ? cq_num : sq_num;
-  } else {
-    *ret = num;
-  }
+  u16 usable = (cq_num < sq_num ? cq_num : sq_num) + 1;
+  *ret = num < usable ? num : usable;
   return 0;
 }
 
@@ -412,8 +417,15 @@ void nvme_driver::enable_write_cache() {
 void *nvme_driver::create_io_queue(int qsize, sched::cpu *target_interrupt_cpu,
                                    bool interrupts) {
   assert(qsize > 1 && qsize < _qsize);
+  SCOPE_LOCK(_queue_admin_lock);
+
   size_t qid = ++_queue_id_counter;
   assert(qid < (1 << 16) && qid > 0);
+
+  if (qid > _max_io_queues) {
+    nvme_e("asked for I/O queue %zu of %u allocated", qid, _max_io_queues);
+    return nullptr;
+  }
 
   u32 *sq_doorbell =
       (u32 *)((u64)_control_reg->sq0tdbl + 2 * _doorbell_stride * qid);
@@ -451,11 +463,29 @@ void *nvme_driver::create_io_queue(int qsize, sched::cpu *target_interrupt_cpu,
 
   if (interrupts) {
     assert(target_interrupt_cpu != nullptr);
-    msix_register_completion_interrupt(iv, qp, target_interrupt_cpu);
+    if (!msix_register_completion_interrupt(iv, qp, target_interrupt_cpu)) {
+      nvme_e("no interrupt vector for qid %d; not creating the queue\n", qid);
+      _io_queues.pop_back();
+      return nullptr;
+    }
   }
 
-  _admin_queue->submit_and_return_on_completion((nvme_sq_entry_t *)&cmd_cq);
-  _admin_queue->submit_and_return_on_completion((nvme_sq_entry_t *)&cmd_sq);
+  // The status matters: a rejected create leaves no queue on the controller,
+  // and a caller given one anyway submits into nothing and waits for ever.
+  auto cq_res = _admin_queue->submit_and_return_on_completion(
+      (nvme_sq_entry_t *)&cmd_cq);
+  if (cq_res.sct != 0 || cq_res.sc != 0) {
+    nvme_e("create CQ %d rejected: sct=%#x sc=%#x", qid, cq_res.sct, cq_res.sc);
+    _io_queues.pop_back();
+    return nullptr;
+  }
+  auto sq_res = _admin_queue->submit_and_return_on_completion(
+      (nvme_sq_entry_t *)&cmd_sq);
+  if (sq_res.sct != 0 || sq_res.sc != 0) {
+    nvme_e("create SQ %d rejected: sct=%#x sc=%#x", qid, sq_res.sct, sq_res.sc);
+    _io_queues.pop_back();
+    return nullptr;
+  }
 
   printf("nvme: Created I/O queue pair for qid:%d with size:%d pointer=%p\n",
          qid, qsize, qp);
@@ -463,6 +493,8 @@ void *nvme_driver::create_io_queue(int qsize, sched::cpu *target_interrupt_cpu,
 }
 
 void nvme_driver::remove_io_user_queue(io_queue_pair *queue) {
+  SCOPE_LOCK(_queue_admin_lock);
+
   u32 qid = queue->_id;
 
   // Completion queue command (removed after the SQ per the NVMe spec).
@@ -475,8 +507,18 @@ void nvme_driver::remove_io_user_queue(io_queue_pair *queue) {
   setup_delete_io_queue_cmd<nvme_acmd_delete_ioq_t>(
       &cmd_sq, qid, NVME_ACMD_DELETE_SQ, _io_queues[qid - 1]->sq_phys_addr());
 
-  _admin_queue->submit_and_return_on_completion((nvme_sq_entry_t *)&cmd_cq);
-  _admin_queue->submit_and_return_on_completion((nvme_sq_entry_t *)&cmd_sq);
+  // Deleting is best effort: the queue is going away either way, but a refusal
+  // is worth knowing about.
+  auto del_cq = _admin_queue->submit_and_return_on_completion(
+      (nvme_sq_entry_t *)&cmd_cq);
+  if (del_cq.sct != 0 || del_cq.sc != 0) {
+    nvme_e("delete CQ %d refused: sct=%#x sc=%#x", qid, del_cq.sct, del_cq.sc);
+  }
+  auto del_sq = _admin_queue->submit_and_return_on_completion(
+      (nvme_sq_entry_t *)&cmd_sq);
+  if (del_sq.sct != 0 || del_sq.sc != 0) {
+    nvme_e("delete SQ %d refused: sct=%#x sc=%#x", qid, del_sq.sct, del_sq.sc);
+  }
 
   debugf("nvme: Removed I/O user queue pair for qid:%d with size:%d\n", qid,
          _qsize);
