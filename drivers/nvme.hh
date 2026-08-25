@@ -65,6 +65,10 @@ public:
   static hw_driver *probe(hw_device *dev);
   static std::vector<nvme_driver *> nvme_drives;
   
+  // Max IO op size and max queue depth (read from the controller)
+  size_t max_transfer_bytes() const { return _max_transfer; }
+  u32 max_queue_depth() const { return _qsize; }
+
   // --- I/O queue management (public API used by the app/io backend) ---
 
   // Create an I/O queue pair of the given depth and return an opaque handle
@@ -137,6 +141,7 @@ private:
   u32 _qsize;
 
   std::unique_ptr<nvme_identify_ctlr_t> _identify_controller;
+  size_t _max_transfer = 0;
 
   // What the controller allocated in response to Set Features / Number of
   // Queues. Creating more than this is refused by the controller, so it is the

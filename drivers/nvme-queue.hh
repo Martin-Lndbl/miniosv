@@ -3,6 +3,7 @@
 
 #include <osv/nvme-structs.h>
 #include <lockfree/ring.hh>
+#include <atomic>
 
 #include <osv/mem/mapping.hh>
 #include <osv/mutex.h>
@@ -102,6 +103,8 @@ public:
 
     void enable_interrupts();
     void disable_interrupts();
+    void set_polled(bool polled);
+    bool polled() const { return _polled.load(std::memory_order_acquire); }
 
     bool completion_queue_not_empty() const;
 
@@ -116,6 +119,9 @@ public:
     u32 _id;
 
 protected:
+    std::atomic<bool> _draining{false};
+    std::atomic<bool> _polled{false};
+
     inline void advance_sq_tail();
     inline void advance_cq_head()
     {
@@ -195,6 +201,9 @@ public:
     int process_completions(int max) override;
 
 private:
+    // One pass over the completion queue, with _draining held.
+    int drain_completions(int max);
+
     u16 submit_flush_cmd(u16 cid, u32 nsid);
 
     void init_callbacks(u32 level);

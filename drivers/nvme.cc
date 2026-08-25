@@ -119,6 +119,13 @@ nvme_driver::nvme_driver(pci::device &pci_dev) : _dev(pci_dev), _msi(&pci_dev) {
     _max_io_queues = granted;
   }
   printf("nvme: %u I/O queues allocated (asked for %u)\n", _max_io_queues, want);
+  // Read MDTS from the controller
+  if (_identify_controller->mdts) {
+    const size_t min_page = size_t(1) << (12 + _control_reg->cap.mpsmin);
+    _max_transfer = min_page << _identify_controller->mdts;
+  }
+  printf("nvme: max transfer %zu KiB (mdts=%u)\n",
+         _max_transfer >> 10, _identify_controller->mdts);
 
   // Enable write cache if available
   if (_identify_controller->vwc & 0x1 && NVME_VWC_ENABLED) {
@@ -444,9 +451,7 @@ void *nvme_driver::create_io_queue(int qsize, sched::cpu *target_interrupt_cpu,
   setup_create_io_queue_cmd<nvme_acmd_create_cq_t>(
       &cmd_cq, qid, qsize, NVME_ACMD_CREATE_CQ, queue->cq_phys_addr());
   cmd_cq.iv = iv;
-  // A polled queue must not raise an interrupt: the handler and the polling
-  // thread would both drain the same completion queue.
-  cmd_cq.ien = interrupts ? 1 : 0;
+  cmd_cq.ien = 1;
 
   // Submission queue command.
   nvme_acmd_create_sq_t cmd_sq;
@@ -460,14 +465,11 @@ void *nvme_driver::create_io_queue(int qsize, sched::cpu *target_interrupt_cpu,
   // interrupt with a moved-from, i.e. null, pointer).
   io_queue_pair *qp = queue.get();
   _io_queues.push_back(std::move(queue));
-
-  if (interrupts) {
-    assert(target_interrupt_cpu != nullptr);
-    if (!msix_register_completion_interrupt(iv, qp, target_interrupt_cpu)) {
-      nvme_e("no interrupt vector for qid %d; not creating the queue\n", qid);
-      _io_queues.pop_back();
-      return nullptr;
-    }
+  assert(target_interrupt_cpu != nullptr);
+  if (!msix_register_completion_interrupt(iv, qp, target_interrupt_cpu)) {
+    nvme_e("no interrupt vector for qid %d; not creating the queue\n", qid);
+    _io_queues.pop_back();
+    return nullptr;
   }
 
   // The status matters: a rejected create leaves no queue on the controller,
@@ -487,8 +489,12 @@ void *nvme_driver::create_io_queue(int qsize, sched::cpu *target_interrupt_cpu,
     return nullptr;
   }
 
-  printf("nvme: Created I/O queue pair for qid:%d with size:%d pointer=%p\n",
-         qid, qsize, qp);
+  if (!interrupts) {
+    qp->set_polled(true);
+  }
+
+  printf("nvme: Created I/O queue pair for qid:%d with size:%d pointer=%p (%s)\n",
+         qid, qsize, qp, interrupts ? "interrupt" : "polled");
   return qp;
 }
 

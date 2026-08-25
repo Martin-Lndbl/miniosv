@@ -155,6 +155,35 @@ namespace nvme
         trace_nvme_disable_interrupts(_driver_id, _id);
     }
 
+    void queue_pair::set_polled(bool polled)
+    {
+        if (_polled.load(std::memory_order_acquire) == polled) {
+            return;
+        }
+
+        if (polled) {
+            disable_interrupts();
+            _polled.store(true, std::memory_order_release);
+        } else {
+            _polled.store(false, std::memory_order_release);
+            enable_interrupts();
+        }
+
+        // Wait for any drain that was already under way.
+        bool idle = false;
+        while (!_draining.compare_exchange_weak(idle, true,
+                                                std::memory_order_acquire,
+                                                std::memory_order_relaxed)) {
+            idle = false;
+            processor::spin_hint();
+        }
+        _draining.store(false, std::memory_order_release);
+
+        if (!polled) {
+            process_completions(0);
+        }
+    }
+
     //
     // io_queue_pair: read/write/flush path with per-command callbacks and PRPs
     //
@@ -411,7 +440,27 @@ namespace nvme
     }
 
     //  returns number of completions processed (may be 0) or negated on error. -ENXIO in the special case that the qpair is failed at the transport layer.
-    int io_queue_pair::process_completions(int max) // Process any outstanding completions for I/O submitted on a queue pair.
+    int io_queue_pair::process_completions(int max)
+    {
+        int total = 0;
+        for (;;) {
+            bool idle = false;
+            if (!_draining.compare_exchange_strong(idle, true,
+                                                   std::memory_order_acquire,
+                                                   std::memory_order_relaxed)) {
+                return total;
+            }
+            total += drain_completions(max);
+            _draining.store(false, std::memory_order_release);
+
+            if (!completion_queue_not_empty()) {
+                return total;
+            }
+        }
+    }
+
+    // The drain itself. Runs with _draining held.
+    int io_queue_pair::drain_completions(int max)
     {
         nvme_cq_entry_t *cqep = nullptr;
         int counter = 0;
