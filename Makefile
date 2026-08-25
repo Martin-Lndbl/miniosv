@@ -151,6 +151,8 @@ conf_memory_histogram=0
 # directly (modules/miniext/miniext.hh). There is still no VFS and no fd table.
 # It drives an NVMe namespace itself, so it needs conf_drivers_nvme.
 conf_fs_miniext=1
+conf_nvme_max_queue_depth=16
+conf_pagecache_stats=0
 
 # --- threads / stacks ------------------------------------------------------
 conf_threads_default_kernel_stack_size=65536
@@ -358,7 +360,9 @@ $(out)/libc/%.o: source-dialects =
 
 kernel-defines = -D_KERNEL $(source-dialects) \
 	-DCONF_fs_miniext=$(conf_fs_miniext) \
-	-DCONF_memory_histogram=$(conf_memory_histogram)
+	-DCONF_memory_histogram=$(conf_memory_histogram) \
+	-DCONF_nvme_max_queue_depth=$(conf_nvme_max_queue_depth) \
+	-DCONF_pagecache_stats=$(conf_pagecache_stats)
 
 # This play the same role as "_KERNEL", but _KERNEL unfortunately is too
 # overloaded. A lot of files will expect it to be set no matter what, specially
@@ -727,6 +731,7 @@ objects += core/mem/store.o
 objects += core/mem/pagecache/cache.o
 objects += core/mem/pagecache/reclaim.o
 objects += core/mem/pagecache/s3fifo.o
+objects += core/mem/pagecache/stats.o
 
 # Not ours: llfree is vendored C, and does not build under the kernel's -Werror.
 $(out)/external/llfree/%.o: CFLAGS += -w -Wno-error -I external/llfree

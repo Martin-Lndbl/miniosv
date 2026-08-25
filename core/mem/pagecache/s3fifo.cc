@@ -166,15 +166,22 @@ void *create(uint64_t store_size)
     return s;
 }
 
-size_t fault_size(void *, uint64_t)
+// One page, wherever the fault landed.
+void fault_extent(void *, uint64_t off, uint64_t *start, uint64_t *len)
 {
-    return page_size;
+    *start = off & ~uint64_t(page_size - 1);
+    *len = page_size;
 }
 
 void on_fault(void *p, buffer &b)
 {
     auto *s = static_cast<queues *>(p);
     if (!s) {
+        return;
+    }
+    // Don't upgrade prefetched pages into the main queue
+    if (prefetched(b)) {
+        enqueue(s->small, &b);
         return;
     }
     enqueue(remembered(*s, offset(b)) ? s->main : s->small, &b);
@@ -207,7 +214,12 @@ void evict(void *p, size_t bytes, buffer_list &victims)
             // caller of a victim.
             clear_accessed(*b);
             chances++;
-            enqueue(s->main, b);
+            if (prefetched(*b)) {
+                clear_prefetched(*b);
+                enqueue(s->small, b);
+            } else {
+                enqueue(s->main, b);
+            }
             continue;
         }
         if (from_small) {
@@ -226,8 +238,9 @@ const policy s3fifo = {
     .bytes_per_buffer = 0,
     .create = create,
     .destroy = destroy,
-    .fault_size = fault_size,
+    .fault_extent = fault_extent,
     .prefetch = nullptr,
+    .prefetch_depth = 0,
     .evict = evict,
     .on_fault = on_fault,
     .on_evicted = on_evicted,

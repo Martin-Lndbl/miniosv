@@ -10,6 +10,7 @@
 #include "processor.hh"
 
 #include "internal.hh"
+#include "stats.hh"
 
 namespace mem {
 namespace pagecache {
@@ -80,6 +81,7 @@ size_t evict_bytes(cache &c, size_t bytes)
     }
 
     stale.invalidate();
+    PAGECACHE_COUNT(evicted, n);
     // Every write goes out before the first is waited for.
     sched::migrate_disable();
     for (unsigned i = 0; i < n; i++) {
@@ -89,19 +91,31 @@ size_t evict_bytes(cache &c, size_t bytes)
         evict_settle(c, taken[i]);
     }
     sched::migrate_enable();
-    return before - c.resident_bytes.load(std::memory_order_relaxed);
+    const size_t freed = before - c.resident_bytes.load(std::memory_order_relaxed);
+    PAGECACHE_COUNT(evicted_bytes, freed);
+    return freed;
 }
 
 void make_room(cache &c, size_t bytes)
 {
+    PAGECACHE_PHASE(room_ticks);
     if (frames::under_pressure()) {
         manager_pass(pass_bytes);
     }
     while (c.limit) {
         size_t held = c.resident_bytes.load(std::memory_order_relaxed);
-        if (held + bytes <= c.limit || !evict_bytes(c, held + bytes - c.limit)) {
+        if (held + bytes <= c.limit) {
             break;
         }
+        if (evict_bytes(c, held + bytes - c.limit)) {
+            continue;
+        }
+        
+        buffer *p = pending_take(c, 0, true);
+        if (!p) {
+            break;
+        }
+        load_finish(c, p);
     }
 }
 

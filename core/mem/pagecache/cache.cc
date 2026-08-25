@@ -16,6 +16,7 @@
 #include "processor.hh"
 
 #include "internal.hh"
+#include "stats.hh"
 #include "../linear.hh"
 
 namespace mem {
@@ -193,6 +194,10 @@ void chunk_write_start(cache &c, chunk &k, const buffer *b)
     size_t valid = stored(c, off, chunk_bytes(k));
     if (!valid) {
         return;
+    }
+    if (k.req) {
+        c.s->wait(k.req);
+        k.req = nullptr;
     }
     while (!(k.req = c.s->write(frames::to_linear(k.phys), off, valid))) {
         processor::spin_hint();
@@ -443,14 +448,38 @@ bool accessed(const buffer &b) { return mapping::accessed(range_of(&b)); }
 bool dirty(const buffer &b) { return mapping::dirty(range_of(&b)); }
 void clear_accessed(buffer &b) { mapping::clear_accessed(range_of(&b)); }
 
+bool prefetched(const buffer &b) { return b.prefetched; }
+void clear_prefetched(buffer &b) { b.prefetched = false; }
+
 /* Reading a buffer in. */
 
 uint64_t tile_of(cache &c, uint64_t off, uint64_t &start)
 {
-    size_t want = c.p->fault_size ? c.p->fault_size(c.state, off) : page_size;
-    want = std::min(std::max(want, page_size), tile_max);
-    start = (off / want) * want;
-    return std::min<uint64_t>(want, c.store_bytes - start);
+    if (!c.p->fault_extent) {
+        start = align_down(off, uint64_t(page_size));
+        return std::min<uint64_t>(page_size, c.store_bytes - start);
+    }
+
+    uint64_t len = page_size;
+    start = off;
+    c.p->fault_extent(c.state, off, &start, &len);
+
+    // Clamping the start to the offset
+    if (start > off) {
+        start = off;
+    }
+    start = align_down(start, uint64_t(page_size));
+    len = std::min<uint64_t>(std::max<uint64_t>(len, page_size), tile_max);
+
+    if (off - start >= len) {
+        len = align_up(off - start + 1, uint64_t(page_size));
+        len = std::min<uint64_t>(len, tile_max);
+        if (off - start >= len) {
+            start = align_down(off, uint64_t(page_size));
+            len = page_size;
+        }
+    }
+    return std::min<uint64_t>(len, c.store_bytes - start);
 }
 
 load_result load_start(cache &c, uint64_t off, buffer *&out)
@@ -553,28 +582,221 @@ bool load_finish(cache &c, buffer *b)
     return true;
 }
 
+// Park a started prefetch claim.
+int pending_park(cache &c, buffer *b)
+{
+    for (unsigned i = 0; i < pending_slots; i++) {
+        buffer *empty = nullptr;
+        if (c.pending[i].compare_exchange_strong(empty, b,
+                                                 std::memory_order_relaxed,
+                                                 std::memory_order_relaxed)) {
+            // The key last, and with a release: a taker that sees the key has
+            // to see a slot already holding the buffer it names.
+            c.pending_off[i].store(b->off, std::memory_order_release);
+            return int(i);
+        }
+    }
+    return -1;
+}
+
+// Take this buffer back out of its slot.
+bool pending_cancel(cache &c, unsigned i, buffer *b)
+{
+    buffer *expected = b;
+    if (!c.pending[i].compare_exchange_strong(expected, nullptr,
+                                              std::memory_order_acq_rel,
+                                              std::memory_order_relaxed)) {
+        return false;
+    }
+    c.pending_off[i].store(0, std::memory_order_relaxed);
+    return true;
+}
+
+//Publish a parked prefetch whose transfers have all landed.
+void publish_parked(cache &c, buffer *b)
+{
+    if (!pending_cancel(c, b->slot, b)) {
+        return;
+    }
+    chunk *ch = chunks_of(b);
+    for (uint32_t i = 1; i < b->chunks; i++) {
+        publish_chunk(c, ch[i]);
+    }
+    publish_chunk(c, ch[0]);
+    mapping::barrier();
+
+    PAGECACHE_COUNT(completed, 1);
+    if (c.p->on_fault) {
+        c.p->on_fault(c.state, *b);
+    }
+}
+
+// One transfer of a parked prefetch has landed.
+void prefetch_io_landed(void *arg)
+{
+    auto *b = static_cast<buffer *>(arg);
+    if (b->ios_left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        publish_parked(*b->owner, b);
+    }
+}
+
+// Claim slot
+buffer *pending_claim(cache &c, unsigned i)
+{
+    buffer *b = c.pending[i].load(std::memory_order_acquire);
+    if (!b) {
+        return nullptr;
+    }
+    c.pending_off[i].store(0, std::memory_order_relaxed);
+    if (!c.pending[i].compare_exchange_strong(b, nullptr,
+                                              std::memory_order_acq_rel,
+                                              std::memory_order_relaxed)) {
+        return nullptr;
+    }
+    return b;
+}
+
+// Take a pending claim
+buffer *pending_take(cache &c, uint64_t off, bool any)
+{
+    uint64_t start;
+    tile_of(c, off, start);
+
+    for (unsigned i = 0; i < pending_slots; i++) {
+        if (c.pending_off[i].load(std::memory_order_acquire) != start) {
+            continue;
+        }
+        if (buffer *b = pending_claim(c, i)) {
+            return b;
+        }
+    }
+    if (!any) {
+        return nullptr;
+    }
+    for (unsigned i = 0; i < pending_slots; i++) {
+        if (buffer *b = pending_claim(c, i)) {
+            return b;
+        }
+    }
+    return nullptr;
+}
+
+// Ask for prefetch candidates and launch IO operations
+void prefetch_start(cache &c, buffer &b)
+{
+    unsigned want = std::min(c.p->prefetch_depth, prefetch_max);
+    if (!c.p->prefetch || !want) {
+        return;
+    }
+    uint64_t offs[prefetch_max];
+    offset_list also{offs, 0, want};
+    c.p->prefetch(c.state, b, also);
+
+    for (unsigned i = 0; i < also.count; i++) {
+        if (offs[i] >= c.store_bytes) {
+            continue;
+        }
+        buffer *eb;
+        if (load_start(c, offs[i], eb) != load_result::started) {
+            continue;
+        }
+        // Tagged before it is reachable by anyone else: the policy reads this
+        // when the buffer finally reaches it, to tell a guess from a demand.
+        eb->prefetched = true;
+        PAGECACHE_COUNT(prefetched, 1);
+        PAGECACHE_COUNT(bytes_in, eb->bytes);
+
+        chunk *ch = chunks_of(eb);
+        unsigned nreq = 0;
+        for (uint32_t i = 0; i < eb->chunks; i++) {
+            if (ch[i].req) {
+                nreq++;
+            }
+        }
+        eb->ios_left.store(nreq + 1, std::memory_order_relaxed);
+        bool subscribed = true;
+        for (uint32_t i = 0; subscribed && i < eb->chunks; i++) {
+            if (ch[i].req) {
+                subscribed = c.s->subscribe(ch[i].req, prefetch_io_landed, eb);
+            }
+        }
+        if (!subscribed) {
+            // A store with no notification: park it for a fault to adopt, the
+            // way this worked before stores could announce a completion.
+            if (pending_park(c, eb) < 0) {
+                load_finish(c, eb);
+            }
+            continue;
+        }
+        int slot = pending_park(c, eb);
+        if (slot < 0) {
+            load_finish(c, eb);
+            continue;
+        }
+        eb->slot = unsigned(slot);
+        if (eb->ios_left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            publish_parked(c, eb);
+        }
+    }
+}
+
 bool fault_in(cache &c, uint64_t off)
 {
+    PAGECACHE_PHASE(fault_ticks);
+    spin_watch spin;
     uintptr_t va = va_of(c, align_down(off, uint64_t(page_size)));
+    bool counted = false;
     for (;;) {
         auto s = mapping::find(va);
         if (s) {
             if (s.present()) {
+                spin.stop();
+                if (!counted) {
+                    PAGECACHE_COUNT(hits, 1);
+                }
                 return true;
             }
+            // Claimed but not published yet
+            if (buffer *p = pending_take(c, off, false)) {
+                spin.stop();
+                PAGECACHE_PHASE(adopt_ticks);
+                PAGECACHE_COUNT(adopted, 1);
+                load_finish(c, p);
+                continue;
+            }
+            spin.tick();
             processor::spin_hint();
             continue;
         }
+        spin.stop();
+        if (!counted) {
+            counted = true;
+            PAGECACHE_COUNT(faults, 1);
+        }
         buffer *b;
-        switch (load_start(c, off, b)) {
+        load_result r;
+        {
+            PAGECACHE_PHASE(claim_ticks);
+            r = load_start(c, off, b);
+        }
+        switch (r) {
         case load_result::started:
-            return load_finish(c, b);
+            break;
         case load_result::taken:
+            spin.tick();
             processor::spin_hint();
             continue;
         case load_result::failed:
+            PAGECACHE_COUNT(nomem, 1);
             return false;
         }
+        PAGECACHE_COUNT(bytes_in, b->bytes);
+
+        // Submitted before this fault waits for its own read, so the device
+        // has the whole batch queued rather than one transfer at a time.
+        prefetch_start(c, *b);
+        PAGECACHE_PHASE(wait_ticks);
+        return load_finish(c, b);
     }
 }
 
@@ -726,6 +948,11 @@ void unmap(void *addr)
     // An evictor that saw the cache before the unlink may still be in it.
     quiesce_manager();
 
+    // Parked prefetches first.
+    while (buffer *p = pending_take(*c, 0, true)) {
+        load_finish(*c, p);
+    }
+
     while (c->resident_bytes.load(std::memory_order_relaxed)) {
         if (!evict_bytes(*c, SIZE_MAX / 2)) {
             abort("pagecache: the policy stranded %zu bytes\n",
@@ -846,6 +1073,11 @@ size_t fetch(void *addr, size_t bytes)
     uint64_t end = std::min<uint64_t>(off + bytes, window_bytes(c->store_bytes));
     if (off >= end) {
         return 0;
+    }
+
+    // Install anything a prefetch parked before looking at the entries
+    while (buffer *p = pending_take(*c, 0, true)) {
+        load_finish(*c, p);
     }
 
     // A transfer is waited for on the cpu that started it.

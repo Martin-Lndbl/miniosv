@@ -41,6 +41,12 @@
 #ifndef CONF_memory_histogram
 #define CONF_memory_histogram 0
 #endif
+#ifndef CONF_pagecache_stats
+#define CONF_pagecache_stats 0
+#endif
+#ifndef CONF_nvme_max_queue_depth
+#define CONF_nvme_max_queue_depth 16
+#endif
 #ifndef CONF_preempt
 #define CONF_preempt 1
 #endif

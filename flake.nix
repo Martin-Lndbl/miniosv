@@ -90,6 +90,12 @@
             // crossFirmware
           );
 
+          build = pkgs.mkShell { # QEMU-less shell to build on x64
+            nativeBuildInputs = buildDeps ++ [ pkgs.qemu ];
+            "${ovmf_prefix}_CODE" = "${pkgs.OVMF.fd}/FV/${ovmf_prefix}_CODE.fd";
+            "${ovmf_prefix}_VARS" = "${pkgs.OVMF.fd}/FV/${ovmf_prefix}_VARS.fd";
+          };
+
           aws = default.overrideAttrs (default: {
             nativeBuildInputs = [
               pkgs.awscli2

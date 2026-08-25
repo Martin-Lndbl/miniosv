@@ -59,7 +59,15 @@ struct buffer {
     uint64_t bytes;
     uint32_t chunks;
     bool hooked, hook_wet;      // the policy's is_dirty verdict, taken mapped
+    bool prefetched;            // brought in by prefetch(), not yet proven hot
+
+    // How many IO ops are still needed
+    std::atomic<uint32_t> ios_left;
+    uint32_t slot;
 };
+
+// Prefetch claims waiting to be installed.
+constexpr unsigned pending_slots = 64;
 
 struct cache {
     vspace::region r;
@@ -71,6 +79,9 @@ struct cache {
     size_t limit;               // memory it may hold, or 0 for whatever there is
     std::atomic<size_t> resident_bytes;
     std::atomic<cache *> next;
+
+    std::atomic<uint64_t> pending_off[pending_slots] = {};
+    std::atomic<buffer *> pending[pending_slots] = {};
 };
 
 inline chunk *chunks_of(buffer *b)
@@ -114,6 +125,9 @@ enum class load_result {
 
 load_result load_start(cache &c, uint64_t off, buffer *&out);
 bool load_finish(cache &c, buffer *b);
+
+// Take a parked prefetch claim, or nullptr if there is none to take.
+buffer *pending_take(cache &c, uint64_t off, bool any);
 
 bool fault_in(cache &c, uint64_t off);
 

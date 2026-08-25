@@ -31,6 +31,9 @@ bool accessed(const buffer &b);
 void clear_accessed(buffer &b);
 bool dirty(const buffer &b);
 
+bool prefetched(const buffer &b);
+void clear_prefetched(buffer &b);
+
 // Where a policy puts the buffers it has chosen. Fixed capacity, because a
 // policy runs when there is no memory to allocate from.
 struct buffer_list {
@@ -41,6 +44,17 @@ struct buffer_list {
     bool add(buffer *b) { return count < max ? (at[count++] = b, true) : false; }
     bool full() const { return count == max; }
 };
+
+// A list of offsets to prefetch
+struct offset_list {
+    uint64_t *at;
+    unsigned count;
+    unsigned max;
+
+    bool add(uint64_t off) { return count < max ? (at[count++] = off, true) : false; }
+};
+
+constexpr unsigned prefetch_max = 512;
 
 // Customizable policies
 struct policy {
@@ -53,11 +67,14 @@ struct policy {
     void *(*create)(uint64_t store_size);
     void (*destroy)(void *state);
 
-    // Fault-size. Clamped to one buffer at least and to the store boundaries */
-    size_t (*fault_size)(void *state, uint64_t offset);
+    // Describes the range of a buffer (enables per-buffer size)
+    void (*fault_extent)(void *state, uint64_t offset, uint64_t *start,
+                         uint64_t *len);
 
     // Read these in the same batch as the buffer that faulted.
-    void (*prefetch)(void *state, buffer &b, buffer_list &also);    
+    void (*prefetch)(void *state, buffer &b, offset_list &also);
+
+    unsigned prefetch_depth;
 
     // Select at least "bytes" worth of candidates for eviction.
     void (*evict)(void *state, size_t bytes, buffer_list &victims);
@@ -86,6 +103,10 @@ bool resident(void *addr);
 
 // Ensures the buffers overlapping with the range are mapped.
 size_t fetch(void *addr, size_t bytes);
+
+// Statistics
+void stats_dump();
+void stats_reset();
 
 }
 }
