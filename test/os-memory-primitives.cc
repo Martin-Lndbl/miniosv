@@ -1437,19 +1437,35 @@ private:
 
 // Reads that ask for more than a page at a time, to check that a buffer is
 // whatever the policy says it is rather than always one page.
-size_t fault_64k(void *, uint64_t) { return 64 * 1024; }
+void fault_64k(void *, uint64_t off, uint64_t *start, uint64_t *len)
+{ *len = 64 * 1024; *start = (off / *len) * *len; }
 
 // Three pages and a bit: bigger than a couple of pages, and no whole number of
 // them, so consecutive buffers begin and end part-way through one.
 const uint64_t ragged_span = 3 * 4096 + 1000;
-size_t fault_ragged(void *, uint64_t) { return ragged_span; }
+void fault_ragged(void *, uint64_t off, uint64_t *start, uint64_t *len)
+{ *len = ragged_span; *start = (off / *len) * *len; }
 
 // Megabytes and misaligned: the analytics-page shape, with whole 2 MiB spans
 // inside every buffer.
 const uint64_t big_span = (5ull << 20) + 12345;
-size_t fault_big(void *, uint64_t) { return big_span; }
+void fault_big(void *, uint64_t off, uint64_t *start, uint64_t *len)
+{ *len = big_span; *start = (off / *len) * *len; }
 
-size_t fault_huge(void *, uint64_t) { return huge; }
+void fault_huge(void *, uint64_t off, uint64_t *start, uint64_t *len)
+{ *len = huge; *start = (off / *len) * *len; }
+
+// A sequential-readahead prefetch: whatever immediately follows the buffer
+// that faulted, out to "also"'s capacity.
+void readahead(void *, mem::pagecache::buffer &b, mem::pagecache::offset_list &also)
+{
+    namespace pc = mem::pagecache;
+    uint64_t step = pc::size(b);
+    uint64_t next = pc::offset(b) + step;
+    for (unsigned i = 0; i < also.max; i++, next += step) {
+        also.add(next);
+    }
+}
 
 /* store ------------------------------------------------------------------- */
 
@@ -1567,8 +1583,9 @@ const mem::pagecache::policy spy_policy = {
     .bytes_per_buffer = sizeof(void *),
     .create = spy_create,
     .destroy = spy_destroy,
-    .fault_size = fault_ragged,
+    .fault_extent = fault_ragged,
     .prefetch = nullptr,
+    .prefetch_depth = 0,
     .evict = spy_evict,
     .on_fault = spy_on_fault,
     .on_evicted = spy_on_evicted,
@@ -1606,7 +1623,7 @@ void pagecache_functional()
     {
         pattern_store s(16 * huge);
         pc::policy p = pc::defaults();
-        p.fault_size = fault_64k;
+        p.fault_extent = fault_64k;
 
         void *m = pc::map(s, p);
         CHECK(m != nullptr);
@@ -1641,7 +1658,7 @@ void pagecache_functional()
         const uint64_t span = ragged_span;
         pattern_store s(16 * huge);
         pc::policy p = pc::defaults();
-        p.fault_size = fault_ragged;
+        p.fault_extent = fault_ragged;
 
         void *m = pc::map(s, p);
         CHECK(m != nullptr);
@@ -1712,7 +1729,7 @@ void pagecache_functional()
         {
             pattern_store s(16 * huge);
             pc::policy p = pc::defaults();
-            p.fault_size = fault_ragged;
+            p.fault_extent = fault_ragged;
             void *m = pc::map(s, p);
             auto *b = static_cast<char *>(m);
 
@@ -1728,7 +1745,7 @@ void pagecache_functional()
         {
             pattern_store s(16 * huge);
             pc::policy p = pc::defaults();
-            p.fault_size = fault_ragged;
+            p.fault_extent = fault_ragged;
             void *m = pc::map(s, p);
             auto *b = static_cast<char *>(m);
 
@@ -1780,6 +1797,53 @@ void pagecache_functional()
         CHECK(ok);
         // Nothing more was read: fetch left the pages mapped, not just fetched.
         CHECK(s.reads.load() == 32 * page);
+        pc::unmap(m);
+    }
+
+    section("a fault reads ahead of itself when the policy asks for it");
+    {
+        /*
+         * What prefetch does and does not do. The read is started with the
+         * fault, so the device has the whole batch at once; the buffer is not
+         * installed by it, because nothing has asked for that tile yet. So
+         * after one touch exactly one tile is present, and four more are paid
+         * for and in flight behind it.
+         */
+        pattern_store s(16 * huge);
+        pc::policy p = pc::defaults();
+        p.prefetch = readahead;
+        p.prefetch_depth = 4;
+
+        void *m = pc::map(s, p);
+        CHECK(m != nullptr);
+        auto *b = static_cast<char *>(m);
+
+        CHECK(*reinterpret_cast<volatile uint64_t *>(b) == pattern_store::word(0));
+        CHECK(pc::resident(b));
+        // Read, all five of them, in one batch.
+        CHECK(s.reads.load() == 5 * page);
+        // Installed: only the one that was asked for.
+        for (unsigned i = 1; i <= 4; i++) {
+            CHECK(!pc::resident(b + i * page));
+        }
+        // And nothing was started past what the policy named.
+        CHECK(!pc::resident(b + 5 * page));
+
+        // Reaching one of them installs it, and the contents are the store's
+        // -- the read that carried them was the prefetch's, not a new one.
+        CHECK(*reinterpret_cast<volatile uint64_t *>(b + page) ==
+              pattern_store::word(page));
+        CHECK(pc::resident(b + page));
+        CHECK(s.reads.load() == 5 * page);
+
+        // The rest likewise: every one of them is served without going back
+        // to the store, which is the whole point of having read them early.
+        for (unsigned i = 2; i <= 4; i++) {
+            CHECK(*reinterpret_cast<volatile uint64_t *>(b + i * page) ==
+                  pattern_store::word(i * page));
+            CHECK(pc::resident(b + i * page));
+        }
+        CHECK(s.reads.load() == 5 * page);
         pc::unmap(m);
     }
 
@@ -1841,7 +1905,7 @@ void pagecache_functional()
     {
         pattern_store s(1ull << 30);
         pc::policy p = pc::defaults();
-        p.fault_size = fault_big;
+        p.fault_extent = fault_big;
         void *m = pc::map(s, p);
         CHECK(m != nullptr);
         auto *b = static_cast<char *>(m);
@@ -1878,7 +1942,7 @@ void pagecache_functional()
         const size_t cap = 64 << 20;
         pattern_store s(1ull << 30);
         pc::policy p = pc::defaults();
-        p.fault_size = fault_big;
+        p.fault_extent = fault_big;
         size_t before = mem::frames::free_bytes();
         void *m = pc::map(s, p, cap);
         CHECK(m != nullptr);
@@ -1954,7 +2018,7 @@ void pagecache_functional()
         // hold under all of it.
         pattern_store s(1ull << 30);
         pc::policy p = pc::defaults();
-        p.fault_size = fault_ragged;
+        p.fault_extent = fault_ragged;
         void *m = pc::map(s, p, 32 << 20);
         CHECK(m != nullptr);
 
@@ -2035,7 +2099,7 @@ void pagecache_functional()
         s.stop_on_wrong = true;
         s.track_frames();
         pc::policy p = pc::defaults();
-        p.fault_size = fault_ragged;
+        p.fault_extent = fault_ragged;
         void *m = pc::map(s, p, 32 << 20);
         CHECK(m != nullptr);
 
@@ -2102,7 +2166,7 @@ void pagecache_functional()
         // the store can move and not one fault per page of it.
         pc::policy p = pc::defaults();
         if (bytes > (8ull << 30)) {
-            p.fault_size = fault_huge;
+            p.fault_extent = fault_huge;
         }
         auto t0 = clk::now();
         void *m = pc::map(s, p, limit);
