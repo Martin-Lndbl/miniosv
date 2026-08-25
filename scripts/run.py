@@ -136,7 +136,7 @@ def start_osv_qemu(options):
         # \EFI\BOOT\BOOT{X64,AA64}.EFI on it, exactly as on AWS Nitro.
         args += [
             "-drive", "id=bootdisk,format=raw,if=none,file=%s" % options.image_file,
-            "-device", "nvme,serial=miniosv,drive=bootdisk"]
+            "-device", "nvme,serial=miniosv,drive=bootdisk,bootindex=0"]
 
         # Extra emulated NVMe drives, in the order given: the guest sees them as
         # controller 1, 2, ... (0 is the boot disk). A drive is either a
@@ -144,9 +144,12 @@ def start_osv_qemu(options):
         # raw namespace -- llama.cpp takes its model that way, with no image to
         # build and no filesystem in between.
         for i, image in enumerate(options.emulated_nvme or [], start=1):
+            dev = "nvme,serial=deadbeef%d,drive=nvm%d,bootindex=%d" % (i, i, i)
+            if options.nvme_mdts is not None:
+                dev += ",mdts=%d" % options.nvme_mdts
             args += [
                 "-drive", "file=%s,if=none,id=nvm%d,format=raw" % (image, i),
-                "-device", "nvme,serial=deadbeef%d,drive=nvm%d" % (i, i)]
+                "-device", dev]
 
         # vAccel offload: the guest reaches a host accelerator through this
         # device.
@@ -257,6 +260,10 @@ if __name__ == "__main__":
     parser.add_argument("--emulated-nvme", action="append", metavar="IMAGE",
                         help="attach a file as an extra emulated NVMe device; repeatable, "
                              "and the guest numbers them 1, 2, ... in the order given")
+    parser.add_argument("--nvme-mdts", type=int, default=None,
+                        help="MDTS for the emulated data drives: one command "
+                             "carries 4 KiB << this, so 7 is 512 KiB and 9 is "
+                             "2 MiB. QEMU's own default is 7.")
     parser.add_argument("--vaccel", action="store_true",
                         help="attach the virtio-accel device; needs the QEMU from the "
                              "lros-qemu flake (uses $QEMU_VACCEL unless --qemu-path is given)")
