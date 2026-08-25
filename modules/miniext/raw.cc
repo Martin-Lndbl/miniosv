@@ -17,6 +17,8 @@
 #include <osv/mem/mapping.hh>
 #include <osv/mem/store.hh>
 
+#include "drivers/nvme.hh"
+
 #include "internal.hh"
 
 namespace miniext {
@@ -26,6 +28,7 @@ struct device {
     miniext::device dev;
     uint32_t lba_size = 0;
     uint64_t bytes = 0;
+    size_t max_transfer = 0;    // what one command may carry; see store_open
 };
 
 device *open(int nvme_id, int *err)
@@ -51,6 +54,12 @@ device *open(int nvme_id, int *err)
 
     d->lba_size = d->dev.lba_size();
     d->bytes = d->dev.lba_count() * static_cast<uint64_t>(d->lba_size);
+
+    constexpr size_t prp_limit = 511 * NVME_PAGESIZE;
+    auto *drv = nvme::nvme_driver::get_nvme_device(nvme_id);
+    const size_t mdts = drv ? drv->max_transfer_bytes() : 0;
+    d->max_transfer = (mdts && mdts < prp_limit) ? mdts : prp_limit;
+
     set(0);
     return d;
 }
@@ -137,7 +146,8 @@ struct raw_io {
 
 class raw_store : public mem::store {
 public:
-    raw_store(device *d, size_t unit) : _d(d), _unit(unit) {}
+    raw_store(device *d, size_t unit, size_t max_transfer)
+        : _d(d), _unit(unit), _max_transfer(max_transfer) {}
 
     uint64_t size() override { return _d->bytes; }
     size_t granularity() override { return _unit; }
@@ -158,16 +168,37 @@ public:
         return r && r->g.settled();
     }
 
+    bool subscribe(mem::io *req, void (*cb)(void *), void *arg) override
+    {
+        auto *r = reinterpret_cast<raw_io *>(req);
+        if (!r) {
+            return false;
+        }
+        r->g.settled_arg = arg;
+        r->g.on_settled.store(cb, std::memory_order_release);
+        if (r->g.settled()) {
+            if (auto f = r->g.on_settled.exchange(nullptr,
+                                                  std::memory_order_acq_rel)) {
+                f(arg);
+            }
+        }
+        return true;
+    }
+
     int64_t wait(mem::io *req) override
     {
         auto *r = reinterpret_cast<raw_io *>(req);
         if (!r) {
             return -EINVAL;
         }
+        r->g.waiter.reset(*sched::thread::current());
         sched::thread::wait_until([r] { return r->g.settled(); });
         r->g.waiter.clear();
         int err = r->err ? r->err : r->g.error.load(std::memory_order_relaxed);
         int64_t moved = r->moved;
+        if (err) {
+            printf("raw_store: transfer failed err=%d moved=%ld\n", err, moved);
+        }
         delete r;
         return err ? err : moved;
     }
@@ -177,6 +208,7 @@ private:
 
     device *_d;
     size_t _unit;
+    size_t _max_transfer;
 };
 
 mem::io *raw_store::start(void *buf, uint64_t offset, size_t bytes, bool write)
@@ -185,7 +217,6 @@ mem::io *raw_store::start(void *buf, uint64_t offset, size_t bytes, bool write)
     if (!r) {
         return nullptr;
     }
-    r->g.waiter.reset(*sched::thread::current());
 
     if (offset >= _d->bytes) {
         bytes = 0;
@@ -199,17 +230,32 @@ mem::io *raw_store::start(void *buf, uint64_t offset, size_t bytes, bool write)
     } else if (offset % lba_size || bytes % lba_size) {
         // The cache faults at granularity boundaries, which are whole LBAs, so
         // anything else is a caller's mistake rather than a case to bounce.
+        printf("raw_store: unaligned %s off=%lu bytes=%zu lba=%u\n",
+               write ? "write" : "read", offset, bytes, lba_size);
         r->err = -EINVAL;
     } else {
-        const uint64_t lba = offset / lba_size;
-        const auto count = static_cast<uint32_t>(bytes / lba_size);
-        int rc = write ? _d->dev.write_async(buf, lba, count, r->g)
-                       : _d->dev.read_async(buf, lba, count, r->g);
-        if (rc < 0) {
-            r->err = rc;
-        } else {
-            r->moved = static_cast<int64_t>(bytes);
+        const size_t max_transfer = _max_transfer;
+
+        size_t done = 0;
+        while (done < bytes) {
+            size_t piece = bytes - done;
+            if (piece > max_transfer) {
+                piece = max_transfer;
+            }
+            const uint64_t lba = (offset + done) / lba_size;
+            const auto count = static_cast<uint32_t>(piece / lba_size);
+            auto *at = static_cast<uint8_t *>(buf) + done;
+            int rc = write ? _d->dev.write_async(at, lba, count, r->g)
+                           : _d->dev.read_async(at, lba, count, r->g);
+            if (rc < 0) {
+                printf("raw_store: %s_async failed rc=%d lba=%lu count=%u buf=%p\n",
+                       write ? "write" : "read", rc, lba, count, at);
+                r->err = rc;
+                break;
+            }
+            done += piece;
         }
+        r->moved = static_cast<int64_t>(done);
     }
 
     r->g.drop();
@@ -226,7 +272,7 @@ mem::store *store_open(device *d)
     // The cache hands out memory, so its unit cannot be smaller than a page
     // however small the device's LBA is.
     size_t unit = std::max<size_t>(d->lba_size, mem::mapping::page_size);
-    return new (std::nothrow) raw_store(d, unit);
+    return new (std::nothrow) raw_store(d, unit, d->max_transfer);
 }
 
 void store_close(mem::store *s)

@@ -28,6 +28,8 @@ struct store {
     virtual bool done(io *req) = 0;
     virtual int64_t wait(io *req) = 0;
 
+    virtual bool subscribe(io *, void (*)(void *), void *) { return false; }
+
     // Sync IO operations
     int64_t read_now(void *buf, uint64_t offset, size_t bytes);
     int64_t write_now(const void *buf, uint64_t offset, size_t bytes);

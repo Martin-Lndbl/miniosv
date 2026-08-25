@@ -12,11 +12,13 @@
  * requests overlap.
  */
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <map>
 
+#include <osv/kernel_config.h>
 #include <osv/sched.hh>
 
 #include "drivers/nvme.hh"
@@ -26,9 +28,6 @@
 #include <osv/mem/mapping.hh>
 
 namespace miniext {
-
-// Queue depth per vCPU queue.
-static const int NVME_QUEUE_DEPTH = 16;
 
 // Largest bounce transfer.
 static const uint32_t BOUNCE_MAX = 128 * 1024;
@@ -57,6 +56,10 @@ void group_complete(void *ctx, const nvme_sq_entry_t *)
 void io_group::drop()
 {
     if (outstanding.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        if (auto f = on_settled.exchange(nullptr, std::memory_order_acq_rel)) {
+            f(settled_arg);
+        }
+        finished.store(true, std::memory_order_release);
         waiter.wake_from_kernel_or_with_irq_disabled();
     }
 }
@@ -109,6 +112,9 @@ std::shared_ptr<device::queue_set> device::queues_for(int nvme_id,
         }
 
         auto set = std::make_shared<queue_set>();
+        unsigned ceiling = drv->max_queue_depth();
+        ceiling = ceiling > 2 ? ceiling - 1 : 2;
+        int depth = std::min<unsigned>(CONF_nvme_max_queue_depth, ceiling);
 
         // One queue per vCPU, each with its completion interrupt pinned to that
         // CPU. create_io_queue asserts on a null cpu despite its doc comment
@@ -121,7 +127,7 @@ std::shared_ptr<device::queue_set> device::queues_for(int nvme_id,
         // queues costs throughput but never correctness.
         for (size_t i = 0; i < sched::cpus.size(); i++) {
             auto *qp = static_cast<nvme::io_queue_pair *>(
-                drv->create_io_queue(NVME_QUEUE_DEPTH, sched::cpus[i]));
+                drv->create_io_queue(depth, sched::cpus[i]));
             if (!qp) {
                 break;
             }

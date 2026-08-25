@@ -29,9 +29,13 @@ struct io_group {
     std::atomic<int> error{0};
     sched::thread_handle waiter;
 
+    std::atomic<void (*)(void *)> on_settled{nullptr};
+    void *settled_arg = nullptr;
+    std::atomic<bool> finished{false};
+
     void hold() { outstanding.fetch_add(1, std::memory_order_relaxed); }
     void drop();
-    bool settled() const { return outstanding.load(std::memory_order_acquire) == 0; }
+    bool settled() const { return finished.load(std::memory_order_acquire); }
 };
 
 // --- device -------------------------------------------------------------

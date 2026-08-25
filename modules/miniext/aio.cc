@@ -210,7 +210,6 @@ aio *aread(file *fp, void *buf, size_t len, uint64_t offset)
         return nullptr;
     }
     a->oi = fp->oi;
-    a->g.waiter.reset(*sched::thread::current());
 
     int64_t rc;
     WITH_LOCK(fp->oi->lock.for_read()) {
@@ -245,7 +244,6 @@ aio *awrite(file *fp, const void *buf, size_t len, uint64_t offset)
     a->oi = fp->oi;
     a->exclusive = true;
     a->ino = fp->oi->ino;
-    a->g.waiter.reset(*sched::thread::current());
 
     // Held all the way to await(): a write excludes everything else on this
     // file, and the lock is recursive for a writer, so a caller batching
@@ -277,6 +275,7 @@ int64_t await(aio *a)
     if (!a) {
         return -EINVAL;
     }
+    a->g.waiter.reset(*sched::thread::current());
     sched::thread::wait_until([a] { return a->g.settled(); });
     a->g.waiter.clear();
 
