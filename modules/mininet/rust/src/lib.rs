@@ -53,6 +53,7 @@ mod ffi;
 mod http;
 mod nic;
 mod rss;
+mod service;
 pub mod stats;
 pub mod thread;
 mod tls;
@@ -64,6 +65,7 @@ pub use endpoint::{Endpoint, Request};
 pub use error::Error;
 pub use http::{BodySink, BufferSink, ContentRange, NullSink, ResponseHead};
 pub use nic::{eth_qstats, eth_stats, NicStats};
+pub use service::{GetResult, Service, ServiceConfig};
 pub use worker::{Worker, WorkerConfig, WorkerHandle};
 
 use alloc::vec::Vec;

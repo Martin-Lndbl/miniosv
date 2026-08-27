@@ -119,6 +119,17 @@ impl Conn {
         self.sink = sink;
     }
 
+    /// Bytes the sink stored, which is not the same as [`Conn::body_bytes`]:
+    /// the body may be larger than the sink had room for.
+    pub fn sink_written(&self) -> u64 {
+        self.sink.written()
+    }
+
+    /// The response body did not fit the buffer it was aimed at.
+    pub fn sink_overflowed(&self) -> bool {
+        self.sink.overflowed()
+    }
+
     /// The HTTP status, or 0 until the head has been parsed.
     pub fn status(&self) -> u16 {
         self.parser.status()

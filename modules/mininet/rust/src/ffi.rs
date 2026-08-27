@@ -75,6 +75,10 @@ extern "C" {
     // --- threads ---
     pub fn shim_thread_spawn(f: extern "C" fn(*mut c_void), arg: *mut c_void, cpu_id: c_int) -> *mut c_void;
     pub fn shim_thread_join(handle: *mut c_void);
+    pub fn shim_thread_current() -> *mut c_void;
+    /// Blocks until `*flag` is nonzero. See shim.hh for why this is not a spin.
+    pub fn shim_thread_park(flag: *const u32);
+    pub fn shim_thread_unpark(handle: *mut c_void);
 }
 
 /// AWS gives a guest exactly one ENA interface, so the port is never in doubt.
