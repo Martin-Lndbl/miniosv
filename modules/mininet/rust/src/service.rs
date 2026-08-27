@@ -13,6 +13,7 @@
 //! and the ceiling is `workers * conns_per_worker` requests in flight.
 
 use alloc::collections::VecDeque;
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
@@ -22,19 +23,26 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use crate::endpoint::{Endpoint, Request};
 use crate::error::Error;
 use crate::ffi::{shim_thread_current, shim_thread_park, shim_thread_unpark};
-use crate::http::BufferSink;
+use crate::http::{BufferSink, ContentRange};
 use crate::thread;
 use crate::worker::{Worker, WorkerConfig, WorkerHandle};
 use crate::Stack;
 
 /// What a completed request delivered.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Not `Copy`: the header values are owned strings. httpfs compares ETags to
+/// notice an object changing under an open handle, so they have to survive the
+/// connection they arrived on.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GetResult {
     pub status: u16,
     /// Bytes written into the caller's buffer.
     pub written: u64,
     /// What the head claimed the body was, when it said.
     pub content_length: Option<u64>,
+    pub content_range: Option<ContentRange>,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
 }
 
 /// Slot lifecycle. The submitter parks until this leaves `PENDING`, then waits
@@ -234,8 +242,9 @@ impl Service {
         }
 
         // SAFETY: the worker wrote this before the release store above, and is
-        // finished with the slot.
-        unsafe { (*slot.outcome.get()).unwrap_or(Err(Error::BadResponse)) }
+        // finished with the slot. `take` rather than a read: GetResult owns
+        // strings now, so the value has to be moved out, not copied.
+        unsafe { (*slot.outcome.get()).take() }.unwrap_or(Err(Error::BadResponse))
     }
 }
 
@@ -291,6 +300,9 @@ fn serve(
                                         status: c.status(),
                                         written: c.sink_written(),
                                         content_length: c.head().content_length,
+                                        content_range: c.head().content_range,
+                                        etag: c.head().etag.clone(),
+                                        last_modified: c.head().last_modified.clone(),
                                     })
                                 }
                             }
