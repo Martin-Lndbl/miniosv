@@ -81,6 +81,20 @@ uint16_t shim_mbuf_rx_burst_n(uint16_t port_id, uint16_t queue_id,
 void *shim_thread_spawn(void (*fn)(void *), void *arg, int cpu_id);
 void shim_thread_join(void *handle);
 
+// Parking a thread that is waiting on a request it submitted.
+//
+// A worker polls its queue without ever yielding, so it cannot afford to have
+// submitters spinning beside it -- on a box where DuckDB's threads outnumber
+// the cores left over, spinning waiters would take the CPU the worker needs.
+//
+// shim_thread_park() blocks until *flag is nonzero. The waker stores the flag
+// and then calls shim_thread_unpark() with the handle the waiter published;
+// the predicate is re-checked after the wake, so a wake that lands before the
+// park does not lose the wakeup.
+void *shim_thread_current(void);
+void shim_thread_park(const unsigned int *flag);
+void shim_thread_unpark(void *handle);
+
 // Wall-clock seconds (for TLS cert validity) and monotonic ns
 // (elapsed-time benchmarks).
 uint64_t shim_time_seconds(void);

@@ -29,6 +29,9 @@ use crate::rss::{Rss, EPH_LEN};
 use crate::tls;
 use crate::Netif;
 
+/// How many source ports a slot rotates through before repeating one.
+const PORT_ROTATION: usize = 8;
+
 /// How a worker is sized, and who it talks to.
 pub struct WorkerConfig {
     /// The server this worker's connections dial. Fixed for the worker's life:
@@ -86,6 +89,8 @@ pub struct Worker {
     handles: Vec<SocketHandle>,
     conns: Vec<Option<Conn>>,
     ports: Vec<u16>,
+    rotation: Vec<u16>,
+    next_port: usize,
     peer: Endpoint,
     tls_config: Arc<ClientConfig>,
     clk: MonoClock,
@@ -101,6 +106,11 @@ impl Worker {
             .rss
             .owned_ports(cfg.peer.ip, cfg.peer.port, netif.ip, h.queue_id);
         let ports = owned.spread(cfg.conns);
+        // A slot that serves request after request cannot keep reusing one
+        // port: even aborted, dialling the same 4-tuple again immediately
+        // risks the peer still holding the old connection. Rotating through a
+        // wider set costs 2 bytes each and removes the question.
+        let rotation = owned.spread(cfg.conns * PORT_ROTATION);
         if ports.is_empty() {
             println!("FAIL: q{}: no ephemeral port steers here", h.queue_id);
             return Err(Error::NoPorts);
@@ -172,6 +182,8 @@ impl Worker {
             handles,
             conns,
             ports,
+            rotation,
+            next_port: 0,
             peer: cfg.peer.clone(),
             tls_config: tls::client_config(),
             clk,
@@ -200,8 +212,43 @@ impl Worker {
     /// socket can carry it -- immediately without TLS, after the handshake
     /// with it.
     pub fn connect(&mut self, slot: usize, req: &Request<'_>) -> Result<(), Error> {
+        let src_port = *self.ports.get(slot).ok_or(Error::ConnectRejected)?;
+        self.connect_on(slot, src_port, req)
+    }
+
+    /// Whether this slot is idle and can take a request.
+    pub fn is_free(&self, slot: usize) -> bool {
+        self.conns.get(slot).map_or(false, |c| c.is_none())
+    }
+
+    /// Tear down whatever is on `slot` and make it available again.
+    ///
+    /// Aborts rather than closes: the response is already in hand, so there is
+    /// nothing left to receive, and a RST leaves no TIME_WAIT holding the
+    /// 4-tuple. A slot that had to wait out TIME_WAIT before its next request
+    /// would cap request rate at a few per minute per port.
+    pub fn release(&mut self, slot: usize) {
+        if let Some(&handle) = self.handles.get(slot) {
+            self.sockets.get_mut::<tcp::Socket>(handle).abort();
+        }
+        if let Some(c) = self.conns.get_mut(slot) {
+            *c = None;
+        }
+    }
+
+    /// Open `slot` on the next port in the rotation. Used when a slot is
+    /// serving a stream of requests rather than one fixed range.
+    pub fn connect_next(&mut self, slot: usize, req: &Request<'_>) -> Result<(), Error> {
+        if self.rotation.is_empty() {
+            return Err(Error::NoPorts);
+        }
+        let src_port = self.rotation[self.next_port % self.rotation.len()];
+        self.next_port = self.next_port.wrapping_add(1);
+        self.connect_on(slot, src_port, req)
+    }
+
+    fn connect_on(&mut self, slot: usize, src_port: u16, req: &Request<'_>) -> Result<(), Error> {
         let handle = *self.handles.get(slot).ok_or(Error::ConnectRejected)?;
-        let src_port = self.ports[slot];
         let dst = (Ipv4Address::from_octets(self.peer.ip), self.peer.port);
 
         {

@@ -16,6 +16,21 @@ use alloc::vec::Vec;
 /// a range into a page -- uses [`BufferSink`] or its own implementation.
 pub trait BodySink {
     fn write(&mut self, data: &[u8]);
+
+    /// Bytes the sink actually stored. Less than the body when the sink
+    /// discards it, or when it ran out of room.
+    ///
+    /// A method on the trait rather than something the caller reads off its
+    /// own sink afterwards, because [`crate::Conn`] owns the sink once it is
+    /// installed and `dyn BodySink` cannot be downcast back.
+    fn written(&self) -> u64 {
+        0
+    }
+
+    /// The sink was handed more than it could store.
+    fn overflowed(&self) -> bool {
+        false
+    }
 }
 
 /// Counts and discards. A ZST, so boxing one does not allocate.
@@ -72,6 +87,14 @@ impl BufferSink {
 }
 
 impl BodySink for BufferSink {
+    fn written(&self) -> u64 {
+        self.written as u64
+    }
+
+    fn overflowed(&self) -> bool {
+        self.overflowed
+    }
+
     fn write(&mut self, data: &[u8]) {
         let room = self.cap - self.written;
         let n = core::cmp::min(room, data.len());

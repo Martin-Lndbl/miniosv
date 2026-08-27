@@ -375,6 +375,21 @@ void shim_thread_join(void *handle) {
   sched::thread::dispose(t);
 }
 
+void *shim_thread_current() { return sched::thread::current(); }
+
+// wait_until re-evaluates the predicate under the wait guard, so a wake that
+// arrives between the caller's last check and the park is not lost: the
+// predicate simply reads true and the park returns immediately.
+void shim_thread_park(const unsigned int *flag) {
+  sched::thread::wait_until([flag] {
+    return __atomic_load_n(flag, __ATOMIC_ACQUIRE) != 0;
+  });
+}
+
+void shim_thread_unpark(void *handle) {
+  static_cast<sched::thread *>(handle)->wake();
+}
+
 void *shim_malloc(uint64_t size) {
   return std::malloc(static_cast<size_t>(size));
 }
