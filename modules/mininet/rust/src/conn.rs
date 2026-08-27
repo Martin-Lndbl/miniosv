@@ -18,7 +18,7 @@ use smoltcp::socket::tcp;
 use crate::clock::MonoClock;
 use crate::endpoint::{Endpoint, Request};
 use crate::error::Error;
-use crate::http::{BodySink, NullSink, ResponseParser};
+use crate::http::{BodySink, NullSink, ResponseHead, ResponseParser};
 use crate::stats;
 use crate::tls::TLS_BUF_CAP;
 
@@ -132,6 +132,13 @@ impl Conn {
         self.parser.headers_done()
     }
 
+    /// The parsed response head. Meaningful once [`Conn::headers_parsed`] is
+    /// true; all-default before that, and for the whole transfer when the
+    /// record layer was stubbed out.
+    pub fn head(&self) -> &ResponseHead {
+        self.parser.head()
+    }
+
     /// Response body bytes. Ciphertext, including framing, when the record
     /// layer was stubbed out.
     pub fn body_bytes(&self) -> u64 {
@@ -225,8 +232,12 @@ impl Conn {
 
         // Without a record layer the socket already holds response bytes.
         if self.tls.is_none() && !self.incoming.is_empty() {
-            self.parser.feed(&self.incoming, self.sink.as_mut());
+            let parsed = self.parser.feed(&self.incoming, self.sink.as_mut());
             self.incoming.clear();
+            if let Err(e) = parsed {
+                println!("FAIL: q{} port {} http: {:?}", self.queue_id, self.src_port, e);
+                return self.finish(Step::Failed(Error::BadResponse));
+            }
         }
 
         if let Some(step) = self.pump_tls() {
@@ -271,7 +282,12 @@ impl Conn {
                 ConnectionState::ReadTraffic(mut rt) => {
                     while let Some(rec) = rt.next_record() {
                         match rec {
-                            Ok(rec) => self.parser.feed(rec.payload, self.sink.as_mut()),
+                            Ok(rec) => {
+                                if let Err(e) = self.parser.feed(rec.payload, self.sink.as_mut()) {
+                                    println!("FAIL: http: {:?}", e);
+                                    return Some(Step::Failed(Error::BadResponse));
+                                }
+                            }
                             Err(e) => {
                                 println!("FAIL: tls record: {:?}", e);
                                 return Some(Step::Failed(Error::Tls));

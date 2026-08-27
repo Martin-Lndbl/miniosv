@@ -62,7 +62,7 @@ pub use clock::MonoClock;
 pub use conn::{Conn, Step};
 pub use endpoint::{Endpoint, Request};
 pub use error::Error;
-pub use http::{BodySink, NullSink};
+pub use http::{BodySink, BufferSink, ContentRange, NullSink, ResponseHead};
 pub use nic::{eth_qstats, eth_stats, NicStats};
 pub use worker::{Worker, WorkerConfig, WorkerHandle};
 

@@ -29,6 +29,13 @@ pub enum Error {
     SynTimeout,
     /// rustls rejected the configuration, the server name, or the session.
     Tls,
+    /// The response could not be read: no status line, a head that never
+    /// ended, or chunked transfer-encoding, which is not implemented.
+    BadResponse,
+    /// The peer sent more body than the caller's buffer could hold. The
+    /// excess was dropped rather than written past the end, so what arrived
+    /// is not the response that was asked for.
+    BufferTooSmall,
 }
 
 impl Error {
@@ -43,6 +50,8 @@ impl Error {
             Error::ConnectRejected => "connect() rejected by the socket",
             Error::SynTimeout => "SYN timeout: no SYN-ACK",
             Error::Tls => "TLS failure",
+            Error::BadResponse => "malformed or unsupported HTTP response",
+            Error::BufferTooSmall => "response body exceeded the caller's buffer",
         }
     }
 }
