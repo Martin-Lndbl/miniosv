@@ -162,8 +162,16 @@ conf_interrupt_stack_size=0x1000
 # --- device drivers --------------------------------------------------------
 conf_drivers_acpi=1
 conf_drivers_pci=1
-# Off until the ENA port is brought up to the current memory and PCI APIs.
-conf_drivers_ena=0
+# On: modules/mininet drives this NIC, and the port to the current memory and
+# PCI APIs works -- verified on a c6in.8xlarge at 30 Gbps, byte-exact.
+#
+# This is only half the switch. Whether arch/x64/arch-setup.cc registers the
+# driver at all is gated separately on CONF_drivers_ena in the checked-in
+# include/osv/drivers_config.h (Makefile:893 -- nothing generates it). Setting
+# only this one compiles and links the driver but never probes it, and the
+# guest then reports "no usable NIC" with no ENA diagnostics at all, because
+# ena_log_level defaults to ENA_WARN and hides them. Change both together.
+conf_drivers_ena=1
 conf_drivers_nvme=1
 # vAccel needs virtio transport drivers (bus, vring, PCI).
 conf_drivers_virtio=1
