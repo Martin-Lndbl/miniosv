@@ -10,6 +10,8 @@
 
 #include "mininet.hh"
 
+#include <cstddef>
+
 extern "C" {
 
 struct mininet_config_abi {
@@ -25,10 +27,17 @@ struct mininet_response_abi {
     uint32_t status;
     uint64_t content_length;
     uint64_t bytes;
+    uint32_t has_range;
+    uint64_t range_first;
+    uint64_t range_last;
+    uint64_t range_total;
+    char etag[128];
+    char last_modified[64];
 };
 
 int mininet_up(const mininet_config_abi *cfg);
 int mininet_is_up(void);
+const char *mininet_host(void);
 int mininet_get(const char *head, uint64_t head_len, void *buf, uint64_t cap,
                 mininet_response_abi *out);
 const char *mininet_strerror(int rc);
@@ -38,6 +47,11 @@ static_assert(sizeof(mininet::config) == sizeof(mininet_config_abi),
               "mininet::config must match capi.rs");
 static_assert(sizeof(mininet::response) == sizeof(mininet_response_abi),
               "mininet::response must match capi.rs");
+static_assert(offsetof(mininet::response, etag) == offsetof(mininet_response_abi, etag),
+              "mininet::response field order must match capi.rs");
+static_assert(offsetof(mininet::response, last_modified) ==
+                  offsetof(mininet_response_abi, last_modified),
+              "mininet::response field order must match capi.rs");
 
 namespace mininet {
 
@@ -49,6 +63,11 @@ int up(const config &c)
 bool is_up()
 {
 	return mininet_is_up() != 0;
+}
+
+const char *host()
+{
+	return mininet_host();
 }
 
 int get(const char *head, size_t head_len, void *buf, size_t cap, response *out)

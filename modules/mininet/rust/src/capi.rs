@@ -58,6 +58,8 @@ fn code(e: Error) -> c_int {
 struct Global {
     _stack: Stack,
     svc: Service,
+    /// NUL-terminated copy of the configured host, for mininet_host().
+    host: alloc::vec::Vec<u8>,
 }
 
 static GLOBAL: AtomicPtr<Global> = AtomicPtr::new(ptr::null_mut());
@@ -82,6 +84,14 @@ pub struct mininet_config {
 }
 
 /// Mirrors `mininet::response`.
+///
+/// The string fields are fixed arrays rather than pointers so the whole thing
+/// crosses by value and there is nothing to free. An ETag longer than this is
+/// truncated; callers compare them for equality, and a truncated one simply
+/// fails to match, which is the safe direction.
+pub const ETAG_MAX: usize = 128;
+pub const DATE_MAX: usize = 64;
+
 #[repr(C)]
 pub struct mininet_response {
     /// HTTP status, or 0 if no head was read.
@@ -90,6 +100,29 @@ pub struct mininet_response {
     pub content_length: u64,
     /// Bytes written into the caller's buffer.
     pub bytes: u64,
+    /// Content-Range, when the response carried one. `has_range` is 0
+    /// otherwise, and the three numbers mean nothing.
+    pub has_range: u32,
+    pub range_first: u64,
+    pub range_last: u64,
+    /// 0 when the server sent `*` for the total.
+    pub range_total: u64,
+    /// NUL-terminated; empty when the header was absent.
+    pub etag: [c_char; ETAG_MAX],
+    pub last_modified: [c_char; DATE_MAX],
+}
+
+/// Copy `src` into a fixed C string field, always NUL-terminating.
+fn set_cstr(dst: &mut [c_char], src: Option<&str>) {
+    dst.fill(0);
+    let src = match src {
+        Some(s) => s.as_bytes(),
+        None => return,
+    };
+    let n = core::cmp::min(src.len(), dst.len() - 1);
+    for i in 0..n {
+        dst[i] = src[i] as c_char;
+    }
 }
 
 unsafe fn cstr<'a>(p: *const c_char) -> Option<&'a str> {
@@ -167,7 +200,14 @@ pub extern "C" fn mininet_up(cfg: *const mininet_config) -> c_int {
         Err(e) => return code(e),
     };
 
-    let global = Box::into_raw(Box::new(Global { _stack: stack, svc }));
+    let mut host_z = alloc::vec::Vec::with_capacity(host.len() + 1);
+    host_z.extend_from_slice(host.as_bytes());
+    host_z.push(0);
+    let global = Box::into_raw(Box::new(Global {
+        _stack: stack,
+        svc,
+        host: host_z,
+    }));
     // Only one caller ever gets here -- up() is a boot-time call -- but losing
     // the race would leak a whole NIC's worth of state, so it is a CAS.
     match GLOBAL.compare_exchange(ptr::null_mut(), global, Ordering::AcqRel, Ordering::Acquire) {
@@ -178,6 +218,18 @@ pub extern "C" fn mininet_up(cfg: *const mininet_config) -> c_int {
             OK
         }
     }
+}
+
+/// The host this stack was brought up for, NUL-terminated, or NULL when it is
+/// not up. One endpoint per image; a caller asked for a different host must
+/// refuse rather than silently fetch from this one.
+#[unsafe(no_mangle)]
+pub extern "C" fn mininet_host() -> *const c_char {
+    let g = GLOBAL.load(Ordering::Acquire);
+    if g.is_null() {
+        return ptr::null();
+    }
+    unsafe { (*g).host.as_ptr() as *const c_char }
 }
 
 #[unsafe(no_mangle)]
@@ -214,9 +266,26 @@ pub extern "C" fn mininet_get(
         Ok(r) => {
             if !out.is_null() {
                 unsafe {
-                    (*out).status = r.status as u32;
-                    (*out).content_length = r.content_length.unwrap_or(0);
-                    (*out).bytes = r.written;
+                    let o = &mut *out;
+                    o.status = r.status as u32;
+                    o.content_length = r.content_length.unwrap_or(0);
+                    o.bytes = r.written;
+                    match r.content_range {
+                        Some(cr) => {
+                            o.has_range = 1;
+                            o.range_first = cr.first;
+                            o.range_last = cr.last;
+                            o.range_total = cr.total.unwrap_or(0);
+                        }
+                        None => {
+                            o.has_range = 0;
+                            o.range_first = 0;
+                            o.range_last = 0;
+                            o.range_total = 0;
+                        }
+                    }
+                    set_cstr(&mut o.etag, r.etag.as_deref());
+                    set_cstr(&mut o.last_modified, r.last_modified.as_deref());
                 }
             }
             OK
@@ -224,9 +293,13 @@ pub extern "C" fn mininet_get(
         Err(e) => {
             if !out.is_null() {
                 unsafe {
-                    (*out).status = 0;
-                    (*out).content_length = 0;
-                    (*out).bytes = 0;
+                    let o = &mut *out;
+                    o.status = 0;
+                    o.content_length = 0;
+                    o.bytes = 0;
+                    o.has_range = 0;
+                    set_cstr(&mut o.etag, None);
+                    set_cstr(&mut o.last_modified, None);
                 }
             }
             code(e)

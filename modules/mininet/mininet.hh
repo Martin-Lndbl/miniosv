@@ -66,6 +66,15 @@ struct config {
     uint64_t rx_buffer;
 };
 
+//! Header values are fixed arrays, not pointers, so a response crosses by
+//! value and there is nothing to free. An ETag longer than this is truncated;
+//! callers compare ETags for equality and a truncated one simply fails to
+//! match, which is the safe direction to be wrong in.
+enum : size_t {
+    ETAG_MAX = 128,
+    DATE_MAX = 64,
+};
+
 struct response {
     //! HTTP status, or 0 if no head was read.
     uint32_t status;
@@ -73,6 +82,16 @@ struct response {
     uint64_t content_length;
     //! Bytes written into the caller's buffer.
     uint64_t bytes;
+    //! Content-Range, when there was one. The three numbers mean nothing when
+    //! this is 0.
+    uint32_t has_range;
+    uint64_t range_first;
+    uint64_t range_last;
+    //! 0 when the server sent `*` for the total.
+    uint64_t range_total;
+    //! NUL-terminated; empty when the header was absent.
+    char etag[ETAG_MAX];
+    char last_modified[DATE_MAX];
 };
 
 //! Configure and start the NIC, take a DHCP lease, resolve the gateway, and
@@ -84,6 +103,12 @@ struct response {
 int up(const config &c);
 
 bool is_up();
+
+//! The host the stack was brought up for, or nullptr when it is not up.
+//!
+//! One endpoint per image, so a caller that wants a different host has to
+//! refuse rather than silently fetch from this one. See the note at the top.
+const char *host();
 
 //! Send `head` and write the response body into `buf`.
 //!
