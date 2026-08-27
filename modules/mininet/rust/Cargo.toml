@@ -3,11 +3,12 @@ name = "mininet"
 version = "0.1.0"
 edition = "2021"
 
-# rlib only for now: nothing calls in over the C ABI yet. When the DuckDB
-# client lands this gains "staticlib" so the kernel can link libmininet.a
-# directly, the way app/miniduckdb links its objects.
+# staticlib for callers that are not Rust -- app/miniduckdb links libmininet.a
+# and talks to it through mininet.hh. rlib for callers that are: the benchmark
+# depends on this crate directly, and would otherwise get a second copy of the
+# allocator and the panic handler.
 [lib]
-crate-type = ["rlib"]
+crate-type = ["staticlib", "rlib"]
 
 [profile.dev]
 panic = "abort"

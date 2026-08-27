@@ -42,6 +42,7 @@ extern crate alloc;
 pub mod print;
 
 mod allocator;
+mod capi;
 mod arp;
 mod clock;
 mod conn;
