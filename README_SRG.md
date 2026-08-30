@@ -4,8 +4,8 @@ One application is linked into the kernel, so *which app* is a build-time choice
 program inside it* is a boot-time one:
 
 ```bash
-make app=duckdb                  # -> build/release.x64/loader.img
-make app=llama arch=aarch64      # -> build/release.aarch64/loader.img
+make app=app/miniduckdb              # -> build/release.x64/loader.img
+make app=app/llama.cpp arch=aarch64  # -> build/release.aarch64/loader.img
 ```
 
 `scripts/run.py --args "<executable> [args...]"` writes those words into the boot image before
@@ -36,7 +36,7 @@ benchmark group that queries them. Files are hardlinked into the staging tree wh
 same filesystem, so nothing is copied twice.
 
 ```bash
-make app=duckdb
+make app=app/miniduckdb
 app/miniduckdb/miniosv/mk-tpch.sh --src [tpch_data_folder] --img [data_img] 1 10
 
 scripts/run.py --image-path build/duckdb.x64/loader.img -m 32G --emulated-nvme [data_img] \
@@ -77,7 +77,7 @@ exits.
 Executables: `llama-cli`, `batched-bench`. Both `exit()` when done, which powers the VM off.
 
 ```bash
-make app=llama
+make app=app/llama.cpp
 MODEL=$(app/llama.cpp/miniosv/get-model.sh llama-3.2-1b-q8)   # --list for the others
 
 scripts/run.py -m 6G --emulated-nvme "$MODEL" \
@@ -95,7 +95,7 @@ then `-m /root/models/<name>.gguf`.
 Matmul offload to a host accelerator, built in by default (`conf_vaccel=0` for a CPU-only image):
 
 ```bash
-make app=llama arch=aarch64 conf_vaccel=1
+make app=app/llama.cpp arch=aarch64 conf_vaccel=1
 scripts/run.py --arch aarch64 --vaccel -m 6G \
     --emulated-nvme build/data.img --emulated-nvme "$MODEL" \
     --args "llama-cli -m nvme:2 -no-cnv -p 'What is a combustion engine' -n 32 -t 4"
