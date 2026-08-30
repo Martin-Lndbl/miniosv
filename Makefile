@@ -171,6 +171,7 @@ conf_drivers_virtio_accel=1
 
 # --- accelerator offload ---------------------------------------------------
 conf_vaccel=1
+conf_lros=1
 
 # miniext talks to the NVMe driver directly, so it cannot be built without it.
 # Catch that here rather than in a wall of missing-header errors.
@@ -867,6 +868,13 @@ endif
 # transport. See modules/vaccel/include/vaccel.h.
 ifeq ($(conf_vaccel),1)
 objects += modules/vaccel/vaccel.o
+endif
+
+# The inference task abstraction the engine submits work through. See
+# modules/lros/include/lros.hh.
+ifeq ($(conf_lros),1)
+objects += modules/lros/sched.o
+objects += modules/lros/worker.o
 endif
 
 # Minimal console-backed stdio lives in libc/io.cc.
