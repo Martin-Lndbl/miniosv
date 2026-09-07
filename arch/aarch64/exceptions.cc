@@ -5,6 +5,8 @@
  * BSD license as described in the LICENSE file in the top-level directory.
  */
 
+#include <atomic>
+
 #include <osv/debug.hh>
 #include <osv/prio.hh>
 #include <osv/sched.hh>
@@ -190,7 +192,21 @@ bool interrupt_table::invoke_interrupt(unsigned int iar)
             interrupt_desc *desc = this->irq_desc[irq].read();
 
             if (!desc || desc->handlers.empty()) {
-                debug_early_u64("unhandled InterruptID irq=", irq);
+                // A level-triggered PPI nobody handles is redelivered forever,
+                // so this path is a flood, not an event: on c7g.large it filled
+                // the 64K console with 1489 identical lines and pushed out the
+                // output that would have explained it. Say which of the two
+                // reasons it was -- no descriptor at all, or a descriptor with
+                // no handlers, which are different bugs -- and then shut up.
+                static std::atomic<unsigned> unhandled_seen{0};
+                unsigned n = unhandled_seen.fetch_add(1);
+                if (n < 8) {
+                    debug_early_u64(desc ? "unhandled (desc, no handlers) irq="
+                                         : "unhandled (no desc) irq=", irq);
+                } else if (n == 8) {
+                    debug_early("unhandled InterruptID: further reports "
+                                "suppressed\n");
+                }
                 return true;
             }
 

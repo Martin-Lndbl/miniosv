@@ -18,6 +18,10 @@
 #include <utility>
 #include <vector>
 
+// For migrate_disable/enable: a sampler holds a per-core resource, so the
+// thread that arms it must stay on the core it armed.
+#include <osv/sched.hh>
+
 namespace perf {
 
 // Class of PMC. ARM has a dedicated cycle counter register; x86 only has CORE.
@@ -71,7 +75,12 @@ struct PMC {
     return *this;
   }
 
-  uint64_t probe() const { return pmc_read(perfCtr); }
+  uint64_t read() const { return pmc_read(perfCtr); }
+
+  // Set the counter's value. Sampling preloads it with minus the period so
+  // the overflow lands where it is wanted; per-thread counting would use it
+  // to save and restore across a context switch.
+  void write(uint64_t value) { pmc_write_counter(perfCtr, value); }
 
   void start_with_conf(uint64_t value, uint64_t initial = 0) {
     pmc_write_counter(perfCtr, initial);
@@ -213,13 +222,13 @@ struct Event {
       return;
     }
     pmc->start_with_conf(pmce.bitmap);
-    before = pmc->probe();
+    before = pmc->read();
   }
 
   void stop() {
     if (!pmc)
       return;
-    after = pmc->probe();
+    after = pmc->read();
     pmc->stop();
     pmcs.release(pmc);
   }
@@ -404,16 +413,35 @@ struct PMCSampler {
   ~PMCSampler() { stop(); }
 
   bool start() {
-    if (pmc || !(pmc = pmcs.acquire(pmce.pmClass)))
+    if (pmc)
       return false;
+    // A PMU belongs to a core, not to a thread. Every register this touches
+    // -- PMINTENSET_EL1 and PMOVSCLR_EL0 on aarch64, the event selects and
+    // LVTPC on x86 -- affects only the cpu that executes the instruction, and
+    // the GIC's PPI enable lives in that cpu's redistributor. If the thread
+    // migrated between arming here and tearing down in stop(), stop() would
+    // disarm a different core and leave the original one asserting a
+    // level-triggered interrupt that no longer has a handler: an unhandled-irq
+    // storm that outlives the measurement. Measured on c7g.large as a flood of
+    // "unhandled irq=23" after the last rep.
+    sched::migrate_disable();
+    if (!(pmc = pmcs.acquire(pmce.pmClass))) {
+      sched::migrate_enable();
+      return false;
+    }
     ack = pmc_overflow_ack_conf(pmc->perfCtr);
+    conf = pmce.bitmap | pmc_int_enable;
     vector = pmc_attach_overflow_handler([this] {
+      pmc_pause(pmc->perfEvtSel, conf);
+      handler(current_interrupt_frame);
       pmc_write_counter(pmc->perfCtr, pmc_period_value(pmc->perfCtr, period));
       pmc_ack_overflow(ack, vector);
-      handler(current_interrupt_frame);
+      pmc_resume(pmc->perfEvtSel, conf);
     });
-    pmc->start_with_conf(pmce.bitmap | pmc_int_enable,
-                         pmc_period_value(pmc->perfCtr, period));
+    // Only now: on aarch64 this asserts a level-triggered PPI, and doing it
+    // before the handler is registered floods the GIC with unhandled IRQs.
+    pmc_arm_overflow_interrupt(ack);
+    pmc->start_with_conf(conf, pmc_period_value(pmc->perfCtr, period));
     return true;
   }
 
@@ -424,13 +452,22 @@ struct PMCSampler {
     pmc_detach_overflow_handler(vector);
     pmcs.release(pmc);
     pmc = nullptr;
+    // Balances the migrate_disable() in start(); only reached when start()
+    // returned true, since the early return above leaves pmc null.
+    sched::migrate_enable();
   }
+
+  // Which hardware counter was acquired. Diagnostics only: whether the
+  // overflow interrupt is armed on the counter that is actually running is
+  // otherwise invisible from outside.
+  uint32_t counter_id() const { return pmc ? pmc->perfCtr : ~0u; }
 
 private:
   PMCSelectCore pmcs{make_default_core_pmcs()};
   uint64_t period;
   std::function<void(exception_frame *)> handler;
   PMCEvent pmce;
+  uint64_t conf = 0;
   PMC *pmc = nullptr;
   PMCIntHandle vector{};
   PMCOverflowAck ack{};

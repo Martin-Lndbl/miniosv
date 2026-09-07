@@ -74,6 +74,19 @@ inline void enable_pmu() {
 
 inline void pmc_stop(uint32_t evt_sel) { processor::wrmsr(evt_sel, 0); }
 
+inline constexpr uint64_t pmc_enable_bit = 1ull << 22;
+
+// Pause counting without disturbing the event select. Not pmc_stop: that
+// zeroes the register, clearing bit 20 (interrupt-enable) too, which inside
+// the overflow handler loses the next delivery. Only bit 22 may move here.
+inline void pmc_pause(uint32_t evt_sel, uint64_t conf) {
+  processor::wrmsr(evt_sel, conf & ~pmc_enable_bit);
+}
+
+inline void pmc_resume(uint32_t evt_sel, uint64_t conf) {
+  processor::wrmsr(evt_sel, conf | pmc_enable_bit);
+}
+
 inline void pmc_write_counter(uint32_t ctr, uint64_t value) {
   processor::wrmsr(ctr, value);
 }
@@ -144,10 +157,28 @@ inline void pmc_detach_overflow_handler(PMCIntHandle vector) {
   idt.unregister_handler(vector);
 }
 
+// x86 carries the interrupt-enable in the event select (pmc_int_enable), which
+// pmc_start_with_conf writes, so there is nothing to arm separately.
+inline void pmc_arm_overflow_interrupt(PMCOverflowAck) {}
+
 inline void pmc_ack_overflow(PMCOverflowAck ack, PMCIntHandle vector) {
   if (ack.mask)
     processor::wrmsr(ack.msr, ack.mask);
   processor::apic->write(processor::apicreg::LVTPC, vector);
+}
+
+// Counterpart of the aarch64 diagnostic so callers need no #ifdef. x86 has no
+// separate interrupt-enable register to read back -- the enable rides in the
+// event select -- so only the global counter-enable is reported here.
+struct PMCIntDebug {
+  unsigned irq_id;
+  uint64_t intenset;
+  uint64_t ovsclr;
+  uint64_t cntenset;
+};
+
+inline PMCIntDebug pmc_int_debug() {
+  return {0, 0, processor::rdmsr(0x38E), processor::rdmsr(0x38F)};
 }
 
 namespace PERF_COUNT_HW {

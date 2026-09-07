@@ -115,8 +115,32 @@ inline void enable_pmu() {
   }
 }
 
-inline void pmc_stop(uint32_t counter_mask) {
-  asm volatile("msr pmcntenclr_el0, %0" : : "r"((uint64_t)counter_mask));
+// pmcntenset/clr take a bitmask; the cycle counter's id is already bit 31.
+inline uint64_t pmc_enable_mask(uint32_t counter) {
+  return (counter & (1u << 31)) ? (1ull << 31) : (1ull << counter);
+}
+
+// Takes the counter id, not a mask. It used to take a mask, but every caller
+// -- PMC::stop() and the pmc-cost primitive loop -- passes an id, and on this
+// architecture ids are 0..5, so the two are not interchangeable: id 0 became
+// the empty mask and stopped nothing at all, while id 1 stopped counter 0.
+// A sampling counter that is never disabled keeps running and overflowing
+// after its handler has been torn down.
+inline void pmc_stop(uint32_t counter) {
+  asm volatile("msr pmcntenclr_el0, %0" : : "r"(pmc_enable_mask(counter)));
+  asm volatile("isb" ::: "memory");
+}
+
+// Pause counting. Event config (pmevtyperN_el0) and interrupt enable
+// (pmintenset_el1) are separate registers here, unlike x86, so neither is
+// touched. `conf` is unused; the signature matches the x86 back-end.
+inline void pmc_pause(uint32_t counter, uint64_t /*conf*/) {
+  asm volatile("msr pmcntenclr_el0, %0" : : "r"(pmc_enable_mask(counter)));
+  asm volatile("isb" ::: "memory");
+}
+
+inline void pmc_resume(uint32_t counter, uint64_t /*conf*/) {
+  asm volatile("msr pmcntenset_el0, %0" : : "r"(pmc_enable_mask(counter)));
   asm volatile("isb" ::: "memory");
 }
 
@@ -189,10 +213,20 @@ inline uint64_t pmc_overflow_bit(uint32_t counter) {
   return counter == (1u << 31) ? (1ull << 31) : (1ull << counter);
 }
 
+// Pure, plus a clear of any stale overflow. Deliberately does NOT enable the
+// interrupt: PMINTENSET asserts a level-triggered PPI, and if that happens
+// before the GIC handler is registered the interrupt is redelivered without
+// end -- measured on c7g.large as 1489 "unhandled InterruptID irq=23" lines
+// and no forward progress. Arming is pmc_arm_overflow_interrupt, below.
 inline PMCOverflowAck pmc_overflow_ack_conf(uint32_t counter) {
   uint64_t bit = pmc_overflow_bit(counter);
-  asm volatile("msr pmintenset_el1, %0\n\tisb" ::"r"(bit) : "memory");
+  asm volatile("msr pmovsclr_el0, %0\n\tisb" ::"r"(bit) : "memory");
   return {bit};
+}
+
+// Call once the overflow handler is attached, never before.
+inline void pmc_arm_overflow_interrupt(PMCOverflowAck ack) {
+  asm volatile("msr pmintenset_el1, %0\n\tisb" ::"r"(ack.mask) : "memory");
 }
 
 inline void pmc_ack_overflow(PMCOverflowAck ack, PMCIntHandle) {
@@ -238,8 +272,30 @@ inline PMCIntHandle pmc_attach_overflow_handler(std::function<void()> handler) {
                            std::move(handler));
 }
 
+// Diagnostics. Three things can each break the overflow interrupt and all
+// three look identical from outside -- the id the handler was registered on,
+// whether the PMU was actually armed to raise the PPI, and whether an
+// overflow was ever latched -- so make each readable instead of inferred.
+struct PMCIntDebug {
+  unsigned irq_id;   // the id we registered the handler on
+  uint64_t intenset; // PMINTENSET_EL1: counters allowed to raise the PPI
+  uint64_t ovsclr;   // PMOVSCLR_EL0: counters that have overflowed
+  uint64_t cntenset; // PMCNTENSET_EL0: counters actually running
+};
+
+inline PMCIntDebug pmc_int_debug() {
+  uint64_t intenset, ovsclr, cntenset;
+  asm volatile("mrs %0, pmintenset_el1" : "=r"(intenset));
+  asm volatile("mrs %0, pmovsclr_el0" : "=r"(ovsclr));
+  asm volatile("mrs %0, pmcntenset_el0" : "=r"(cntenset));
+  return {pmu_irq_id(), intenset, ovsclr, cntenset};
+}
+
 inline void pmc_detach_overflow_handler(PMCIntHandle irq) {
+  // Disable, then drop any latched overflow: the PPI is level-triggered, so a
+  // status bit left set would keep the line asserted after the handler is gone.
   asm volatile("msr pmintenclr_el1, %0\n\tisb" ::"r"(~0ull) : "memory");
+  asm volatile("msr pmovsclr_el0, %0\n\tisb" ::"r"(~0ull) : "memory");
   delete irq;
 }
 
