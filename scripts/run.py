@@ -132,6 +132,9 @@ def start_osv_qemu(options):
             "-drive", "if=pflash,format=raw,readonly=on,file=%s" % code_copy,
             "-drive", "if=pflash,format=raw,file=%s" % vars_copy]
 
+        # Skip the firmware's boot-menu countdown.
+        args += ["-boot", "menu=on,splash-time=0"]
+
         # Boot disk: the GPT/ESP image as an NVMe drive. The firmware finds
         # \EFI\BOOT\BOOT{X64,AA64}.EFI on it, exactly as on AWS Nitro.
         args += [
