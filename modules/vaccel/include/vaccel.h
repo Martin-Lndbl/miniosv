@@ -9,5 +9,6 @@
 #include "session.h"
 #include "ops/vaccel_ops.h"
 #include "ops/matmul.h"
+#include "ops/exec.h"
 
 #endif /* __VACCEL_H__ */

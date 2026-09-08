@@ -182,9 +182,9 @@ endif
 endif
 
 # vAccel reaches its device through the virtio-accel driver.
-ifeq ($(conf_vaccel),1)
+ifneq (,$(filter 1,$(conf_vaccel) $(conf_viai)))
 ifneq ($(conf_drivers_virtio_accel),1)
-$(error conf_vaccel=1 needs conf_drivers_virtio_accel=1)
+$(error conf_vaccel/conf_viai need conf_drivers_virtio_accel=1)
 endif
 endif
 
@@ -858,7 +858,7 @@ endif
 
 # The vAccel operations the application calls, on top of the virtio-accel
 # transport. See modules/vaccel/include/vaccel.h.
-ifeq ($(conf_vaccel),1)
+ifneq (,$(filter 1,$(conf_vaccel) $(conf_viai)))
 objects += modules/vaccel/vaccel.o
 endif
 

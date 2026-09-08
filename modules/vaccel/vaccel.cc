@@ -12,6 +12,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 #include "drivers/virtio-accel.hh"
 
@@ -241,6 +242,37 @@ int vaccel_matmul_get_props(struct vaccel_session *sess, char *props,
         {props, (uint32_t)nbytes},
     };
     return op(sess, out, 2, in, 1);
+}
+
+// --- exec ----------------------------------------------------------------
+
+// The host pops library and fn_symbol and hands the rest to the plugin
+// unchanged, so this carries operations vAccel core has no opcode for.
+int vaccel_exec(struct vaccel_session *sess, const char *library,
+                const char *fn_symbol, struct vaccel_arg *read, size_t nr_read,
+                struct vaccel_arg *write, size_t nr_write)
+{
+    if (!library || !fn_symbol || (nr_read && !read) || (nr_write && !write)) {
+        return VACCEL_EINVAL;
+    }
+
+    const size_t out_nr = 3 + nr_read;
+    std::vector<arg> out(out_nr);
+    std::vector<arg> in(nr_write);
+
+    vaccel_op_type type = VACCEL_EXEC;
+    out[0] = {&type, sizeof(type)};
+    out[1] = {const_cast<char *>(library), (uint32_t)(strlen(library) + 1)};
+    out[2] = {const_cast<char *>(fn_symbol), (uint32_t)(strlen(fn_symbol) + 1)};
+    for (size_t i = 0; i < nr_read; i++) {
+        out[3 + i] = {read[i].buf, read[i].size};
+    }
+    for (size_t i = 0; i < nr_write; i++) {
+        in[i] = {write[i].buf, write[i].size};
+    }
+
+    return op(sess, out.data(), (uint32_t)out_nr,
+              nr_write ? in.data() : nullptr, (uint32_t)nr_write);
 }
 
 } // extern "C"
