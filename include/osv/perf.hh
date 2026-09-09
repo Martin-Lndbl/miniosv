@@ -18,6 +18,10 @@
 #include <utility>
 #include <vector>
 
+// For thread::pinned(): a counter belongs to a core, so its holder must
+// not move. Enforced in PMCSelect::acquire().
+#include <osv/sched.hh>
+
 namespace perf {
 
 // Class of PMC. ARM has a dedicated cycle counter register; x86 only has CORE.
@@ -109,7 +113,20 @@ struct PMCSelect {
 
   // Try to reserve any free PMC of the given class. Retries a bounded number
   // of times to tolerate transient contention with another thread.
+  //
+  // Refuses a thread that can migrate. A counter belongs to a core, so a
+  // thread that moves while holding one starts it on one cpu and reads it on
+  // another: counting returns a different core's total, and a sampler arms one
+  // core and tears down another, leaving the first asserting an interrupt with
+  // no handler. Both fail silently, so the requirement is enforced here, where
+  // every counter -- counted or sampled -- is handed out.
   PMC *acquire(PMClass cls) {
+    if (!sched::thread::current()->pinned()) {
+      std::cerr << "[ERROR] a PMC needs a pinned thread: call "
+                   "sched::thread::pin(cpu) first. Not measuring."
+                << std::endl;
+      return nullptr;
+    }
     constexpr int max_retries = 7;
     for (int attempt = 0; attempt < max_retries; ++attempt) {
       for (auto &pmc : pmcs) {
@@ -207,10 +224,10 @@ struct Event {
   void start() {
     pmc = pmcs.acquire(pmce.pmClass);
     if (!pmc) {
-      std::cerr << "[ERROR] All hardware counters are occupied ("
-                << pmcs.size_of_x(pmce.pmClass) << "/"
-                << pmcs.size_of_x(pmce.pmClass) << "). Event " << pmce.name
-                << " will not be measured." << std::endl;
+      std::cerr << "[ERROR] no counter available for event " << pmce.name
+                << " (" << pmcs.size_of_x(pmce.pmClass)
+                << " of its class exist); it will not be measured."
+                << std::endl;
       valid = false;
       return;
     }
@@ -406,16 +423,24 @@ struct PMCSampler {
   ~PMCSampler() { stop(); }
 
   bool start() {
-    if (pmc || !(pmc = pmcs.acquire(pmce.pmClass)))
+    if (pmc)
+      return false;
+    if (!(pmc = pmcs.acquire(pmce.pmClass)))
       return false;
     ack = pmc_overflow_ack_conf(pmc->perfCtr, pmc->pmClass);
+    conf = pmce.bitmap | pmc_int_enable;
     vector = pmc_attach_overflow_handler([this] {
+      pmc_pause(pmc->perfEvtSel, pmc->pmClass, conf);
+      handler(current_interrupt_frame);
       pmc_write_counter(pmc->perfCtr, pmc->pmClass,
                         pmc_period_value(pmc->perfCtr, pmc->pmClass, period));
       pmc_ack_overflow(ack, vector);
-      handler(current_interrupt_frame);
+      pmc_resume(pmc->perfEvtSel, pmc->pmClass, conf);
     });
-    pmc->start_with_conf(pmce.bitmap | pmc_int_enable,
+    // Only now: on aarch64 this asserts a level-triggered PPI, and doing it
+    // before the handler is registered floods the GIC with unhandled IRQs.
+    pmc_arm_overflow_interrupt(ack);
+    pmc->start_with_conf(conf,
                          pmc_period_value(pmc->perfCtr, pmc->pmClass, period));
     return true;
   }
@@ -434,6 +459,7 @@ private:
   uint64_t period;
   std::function<void(exception_frame *)> handler;
   PMCEvent pmce;
+  uint64_t conf = 0;
   PMC *pmc = nullptr;
   PMCIntHandle vector{};
   PMCOverflowAck ack{};

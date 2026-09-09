@@ -79,6 +79,18 @@ inline void pmc_stop(uint32_t evt_sel, PMClass) {
   processor::wrmsr(evt_sel, 0);
 }
 
+inline constexpr uint64_t pmc_enable_bit = 1ull << 22;
+
+// Not pmc_stop: that zeroes the event select, clearing the interrupt-enable
+// with it and losing the next delivery. Only the enable bit may move here.
+inline void pmc_pause(uint32_t evt_sel, PMClass, uint64_t conf) {
+  processor::wrmsr(evt_sel, conf & ~pmc_enable_bit);
+}
+
+inline void pmc_resume(uint32_t evt_sel, PMClass, uint64_t conf) {
+  processor::wrmsr(evt_sel, conf | pmc_enable_bit);
+}
+
 inline void pmc_write_counter(uint32_t ctr, PMClass, uint64_t value) {
   processor::wrmsr(ctr, value);
 }
@@ -150,6 +162,9 @@ inline void pmc_detach_overflow_handler(PMCIntHandle vector) {
   processor::apic->write(processor::apicreg::LVTPC, 1u << 16);
   idt.unregister_handler(vector);
 }
+
+// The interrupt-enable rides in the event select, so nothing to arm separately.
+inline void pmc_arm_overflow_interrupt(PMCOverflowAck) {}
 
 inline void pmc_ack_overflow(PMCOverflowAck ack, PMCIntHandle vector) {
   if (ack.mask)

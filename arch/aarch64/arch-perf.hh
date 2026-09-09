@@ -132,6 +132,18 @@ inline void pmc_stop(uint32_t counter, PMClass cls) {
   asm volatile("isb" ::: "memory");
 }
 
+// Event config and interrupt enable are separate registers here, so neither is
+// disturbed. `conf` is unused; the signature matches the x86 back-end.
+inline void pmc_pause(uint32_t counter, PMClass cls, uint64_t /*conf*/) {
+  asm volatile("msr pmcntenclr_el0, %0" : : "r"(pmc_bit(counter, cls)));
+  asm volatile("isb" ::: "memory");
+}
+
+inline void pmc_resume(uint32_t counter, PMClass cls, uint64_t /*conf*/) {
+  asm volatile("msr pmcntenset_el0, %0" : : "r"(pmc_bit(counter, cls)));
+  asm volatile("isb" ::: "memory");
+}
+
 inline void pmc_write_counter(uint32_t counter, PMClass cls, uint64_t value) {
   if (cls == PMClass::CYCLES) {
     asm volatile("msr pmccntr_el0, %0" : : "r"(value));
@@ -208,10 +220,18 @@ inline uint64_t pmc_overflow_bit(uint32_t counter, PMClass cls) {
   return pmc_bit(counter, cls);
 }
 
+// Clears a stale overflow but deliberately does not enable the interrupt:
+// PMINTENSET asserts a level-triggered PPI, and asserting it before the
+// handler is registered redelivers forever. Arming is below.
 inline PMCOverflowAck pmc_overflow_ack_conf(uint32_t counter, PMClass cls) {
   uint64_t bit = pmc_overflow_bit(counter, cls);
-  asm volatile("msr pmintenset_el1, %0\n\tisb" ::"r"(bit) : "memory");
+  asm volatile("msr pmovsclr_el0, %0\n\tisb" ::"r"(bit) : "memory");
   return {bit};
+}
+
+// Call once the overflow handler is attached, never before.
+inline void pmc_arm_overflow_interrupt(PMCOverflowAck ack) {
+  asm volatile("msr pmintenset_el1, %0\n\tisb" ::"r"(ack.mask) : "memory");
 }
 
 inline void pmc_ack_overflow(PMCOverflowAck ack, PMCIntHandle) {
@@ -259,7 +279,10 @@ inline PMCIntHandle pmc_attach_overflow_handler(std::function<void()> handler) {
 }
 
 inline void pmc_detach_overflow_handler(PMCIntHandle irq) {
+  // Disable, then drop any latched overflow: the PPI is level-triggered, so a
+  // status bit left set would keep the line asserted after the handler is gone.
   asm volatile("msr pmintenclr_el1, %0\n\tisb" ::"r"(~0ull) : "memory");
+  asm volatile("msr pmovsclr_el0, %0\n\tisb" ::"r"(~0ull) : "memory");
   delete irq;
 }
 
