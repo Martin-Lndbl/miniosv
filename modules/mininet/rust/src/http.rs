@@ -17,12 +17,10 @@ use alloc::vec::Vec;
 pub trait BodySink {
     fn write(&mut self, data: &[u8]);
 
-    /// Bytes the sink actually stored. Less than the body when the sink
-    /// discards it, or when it ran out of room.
-    ///
-    /// A method on the trait rather than something the caller reads off its
-    /// own sink afterwards, because [`crate::Conn`] owns the sink once it is
-    /// installed and `dyn BodySink` cannot be downcast back.
+    /// Bytes the sink actually stored, less than the body if it discarded
+    /// some or ran out of room. A trait method, not something the caller
+    /// reads off its own sink afterwards, because [`crate::Conn`] owns the
+    /// sink once installed and `dyn BodySink` cannot be downcast back.
     fn written(&self) -> u64 {
         0
     }
@@ -42,12 +40,10 @@ impl BodySink for NullSink {
 
 /// Writes the body straight into a caller-owned buffer.
 ///
-/// Holds a raw pointer rather than a slice: the buffer belongs to whoever
-/// submitted the request -- a DuckDB page, eventually -- and giving the sink a
-/// lifetime would put that lifetime on [`crate::Conn`] and on the worker that
-/// owns it. The caller keeps the buffer alive and unaliased until the request
-/// reports done; that is the contract, and it is why the constructor is
-/// unsafe.
+/// Holds a raw pointer rather than a slice: a lifetime here would put that
+/// lifetime on [`crate::Conn`] and on the worker that owns it. The caller
+/// keeps the buffer alive and unaliased until the request reports done --
+/// that contract is why the constructor is unsafe.
 pub struct BufferSink {
     buf: *mut u8,
     cap: usize,
@@ -146,8 +142,6 @@ pub struct ResponseHead {
 const MAX_HEAD: usize = 64 * 1024;
 
 pub(crate) struct ResponseParser {
-    /// Head bytes seen so far. Dropped once parsed -- the fields worth keeping
-    /// are in `head`.
     pending: Vec<u8>,
     headers_done: bool,
     /// How much of the CRLFCRLF terminator has been seen. Carried across calls

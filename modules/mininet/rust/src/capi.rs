@@ -58,7 +58,6 @@ fn code(e: Error) -> c_int {
 struct Global {
     _stack: Stack,
     svc: Service,
-    /// NUL-terminated copy of the configured host, for mininet_host().
     host: alloc::vec::Vec<u8>,
 }
 
@@ -67,52 +66,31 @@ static GLOBAL: AtomicPtr<Global> = AtomicPtr::new(ptr::null_mut());
 /// Mirrors `mininet::config`.
 #[repr(C)]
 pub struct mininet_config {
-    /// `Host:` header and TLS server name. Must be the name the certificate
-    /// is issued for, even though it is not what gets dialled.
     pub host: *const c_char,
-    /// Dotted quad. There is no resolver in the guest, so the caller supplies
-    /// the address it already knows.
     pub address: *const c_char,
-    /// 0 dials plain HTTP on port 80.
     pub tls: c_int,
-    /// RSS queues, and therefore worker threads, to ask the device for.
     pub workers: u32,
     pub conns_per_worker: u32,
-    /// Per-socket receive buffer. Dominates the stack's memory:
-    /// `workers * conns_per_worker * rx_buffer`.
     pub rx_buffer: u64,
 }
 
 /// Mirrors `mininet::response`.
-///
-/// The string fields are fixed arrays rather than pointers so the whole thing
-/// crosses by value and there is nothing to free. An ETag longer than this is
-/// truncated; callers compare them for equality, and a truncated one simply
-/// fails to match, which is the safe direction.
 pub const ETAG_MAX: usize = 128;
 pub const DATE_MAX: usize = 64;
 
 #[repr(C)]
 pub struct mininet_response {
-    /// HTTP status, or 0 if no head was read.
     pub status: u32,
-    /// What the head claimed the body was; 0 when it said nothing.
     pub content_length: u64,
-    /// Bytes written into the caller's buffer.
     pub bytes: u64,
-    /// Content-Range, when the response carried one. `has_range` is 0
-    /// otherwise, and the three numbers mean nothing.
     pub has_range: u32,
     pub range_first: u64,
     pub range_last: u64,
-    /// 0 when the server sent `*` for the total.
     pub range_total: u64,
-    /// NUL-terminated; empty when the header was absent.
     pub etag: [c_char; ETAG_MAX],
     pub last_modified: [c_char; DATE_MAX],
 }
 
-/// Copy `src` into a fixed C string field, always NUL-terminating.
 fn set_cstr(dst: &mut [c_char], src: Option<&str>) {
     dst.fill(0);
     let src = match src {
@@ -161,8 +139,6 @@ fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
     }
 }
 
-/// Bring the stack up and start serving. Idempotent in the sense that a second
-/// call while already up is refused rather than starting a second NIC.
 #[unsafe(no_mangle)]
 pub extern "C" fn mininet_up(cfg: *const mininet_config) -> c_int {
     if cfg.is_null() {
@@ -220,9 +196,6 @@ pub extern "C" fn mininet_up(cfg: *const mininet_config) -> c_int {
     }
 }
 
-/// The host this stack was brought up for, NUL-terminated, or NULL when it is
-/// not up. One endpoint per image; a caller asked for a different host must
-/// refuse rather than silently fetch from this one.
 #[unsafe(no_mangle)]
 pub extern "C" fn mininet_host() -> *const c_char {
     let g = GLOBAL.load(Ordering::Acquire);
@@ -237,11 +210,7 @@ pub extern "C" fn mininet_is_up() -> c_int {
     !GLOBAL.load(Ordering::Acquire).is_null() as c_int
 }
 
-/// Send `head` and write the response body into `buf`. Blocks the calling
-/// thread, parked rather than spinning.
-///
-/// `head` is the complete request head, rendered by the caller -- request
-/// line, headers, blank line. The stack carries HTTP; it does not build it.
+/// Blocks the calling thread, parked rather than spinning.
 #[unsafe(no_mangle)]
 pub extern "C" fn mininet_get(
     head: *const c_char,
@@ -307,7 +276,7 @@ pub extern "C" fn mininet_get(
     }
 }
 
-/// Human-readable form of a code from this API. Never null.
+/// Never null.
 #[unsafe(no_mangle)]
 pub extern "C" fn mininet_strerror(rc: c_int) -> *const c_char {
     let s: &str = match rc {

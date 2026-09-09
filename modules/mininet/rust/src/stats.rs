@@ -33,7 +33,6 @@ pub struct Stats {
     /// the SYN-ACK provably comes back on the right queue, which leaves real
     /// packet loss as the only cause.
     pub syn_retries: u64,
-    /// Summed time from connect() to Established, over every connection.
     pub setup_ms_total: u64,
 }
 

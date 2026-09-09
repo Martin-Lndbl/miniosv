@@ -24,9 +24,8 @@ pub(crate) const RX_BURST: usize = 32;
 pub(crate) struct DpdkDevice {
     pub(crate) queue_id: u16,
     pub(crate) pool: *mut rte_pktmbuf_pool,
-    /// One fabricated frame to return on the next poll. Used to seed the
-    /// neighbour cache with the gateway's MAC without an ARP exchange that
-    /// RSS would misroute -- ARP replies are not hashed onto our queue.
+    /// One fabricated frame to return on the next poll, seeding the neighbour
+    /// cache with the gateway's MAC without an ARP exchange RSS would misroute.
     pub(crate) pending_synth: Option<Vec<u8>>,
     /// Which destination ports this queue owns, i.e. those whose return
     /// traffic RSS steers here. `None` accepts everything, which is what the

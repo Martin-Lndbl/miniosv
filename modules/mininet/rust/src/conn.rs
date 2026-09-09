@@ -30,12 +30,10 @@ const SYN_TIMEOUT_MS: i64 = 5_000;
 /// What one [`Conn::step`] concluded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
-    /// Still in flight.
     Pending,
     /// The peer closed after the whole response had been requested and the
     /// receive buffer had been drained.
     Complete,
-    /// Terminated early. The response, if any, is incomplete.
     Failed(Error),
 }
 
@@ -57,7 +55,6 @@ pub struct Conn {
 
     outcome: Option<Step>,
     connect_start_ms: i64,
-    /// Identity, for diagnostics that have to name the failing flow.
     queue_id: u16,
     src_port: u16,
     /// Total SYNs sent, and whether this connection has left SynSent yet --
@@ -114,7 +111,6 @@ impl Conn {
         })
     }
 
-    /// Deliver the body somewhere instead of only counting it.
     pub fn set_sink(&mut self, sink: Box<dyn BodySink>) {
         self.sink = sink;
     }
@@ -125,7 +121,6 @@ impl Conn {
         self.sink.written()
     }
 
-    /// The response body did not fit the buffer it was aimed at.
     pub fn sink_overflowed(&self) -> bool {
         self.sink.overflowed()
     }
@@ -135,17 +130,13 @@ impl Conn {
         self.parser.status()
     }
 
-    /// Whether a response head was actually read. False both before the first
-    /// bytes arrive and, for the whole transfer, when the record layer was
-    /// stubbed out -- there is no plaintext head to parse in that case, so
-    /// [`Conn::status`] stays 0 and means nothing.
+    /// False before the first bytes arrive, and for the whole transfer when
+    /// the record layer was stubbed out -- there is no plaintext head to
+    /// parse in that case.
     pub fn headers_parsed(&self) -> bool {
         self.parser.headers_done()
     }
 
-    /// The parsed response head. Meaningful once [`Conn::headers_parsed`] is
-    /// true; all-default before that, and for the whole transfer when the
-    /// record layer was stubbed out.
     pub fn head(&self) -> &ResponseHead {
         self.parser.head()
     }
@@ -160,7 +151,6 @@ impl Conn {
         self.src_port
     }
 
-    /// The terminal outcome, or `None` while still in flight.
     pub fn outcome(&self) -> Option<Step> {
         self.outcome
     }
@@ -184,18 +174,16 @@ impl Conn {
         let s = sockets.get_mut::<tcp::Socket>(self.handle);
         let state = s.state();
 
-        // Leaving SynSent for Established is the moment the SYN-ACK finally
-        // came back on the right queue. Record how many SYNs that took and
-        // how long it burned.
+        // Leaving SynSent for Established means the SYN-ACK came back on the
+        // right queue; record how many SYNs it took and how long it burned.
         if !self.settled && state == tcp::State::Established {
             self.settled = true;
             stats::conn_established(self.attempts, now_ms - self.start_ms);
         }
 
-        // A SYN that goes unanswered is a real failure -- a lost packet or an
-        // unreachable peer -- not the "wrong port hash, roll again" case the
-        // old retry loop existed to paper over. Give it a generous window and
-        // then fail loudly rather than silently abandoning the range.
+        // A SYN that goes unanswered now is a real failure -- lost packet or
+        // unreachable peer, not a wrong port hash -- so fail loudly rather
+        // than abandon it silently.
         if state == tcp::State::SynSent && now_ms - self.connect_start_ms > SYN_TIMEOUT_MS {
             s.abort();
             println!(
@@ -209,8 +197,6 @@ impl Conn {
             return self.finish(Step::Failed(Error::SynTimeout));
         }
 
-        // No handshake to wait on, so the request goes out as soon as the
-        // socket is open.
         if self.tls.is_none() && !self.request_queued && s.may_send() {
             self.outgoing.extend_from_slice(&self.head);
             self.request_queued = true;
@@ -256,11 +242,9 @@ impl Conn {
         }
 
         // Re-read the state: `state` was sampled before this iteration drained
-        // the socket and advanced TLS. Requiring the receive buffer to be
-        // empty as well is what stops a connection being called complete while
-        // bytes are still sitting in it -- the peer's FIN can arrive with data
-        // still buffered, and declaring done there silently drops the tail of
-        // the transfer.
+        // the socket. Requiring the receive buffer to be empty too stops a
+        // connection being called complete while the peer's FIN arrived with
+        // data still buffered.
         let s = sockets.get_mut::<tcp::Socket>(self.handle);
         let ended = matches!(
             s.state(),

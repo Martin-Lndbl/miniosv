@@ -150,7 +150,6 @@ impl Queue {
     }
 }
 
-/// How a [`Service`] sizes its workers.
 pub struct ServiceConfig {
     pub peer: Endpoint,
     pub conns_per_worker: usize,
@@ -287,7 +286,6 @@ fn serve(
         for slot in 0..w.slots() {
             match pending[slot] {
                 Some(p) => {
-                    // Finished? Publish and give the slot back.
                     let done = w.conn(slot).and_then(|c| c.outcome());
                     if let Some(step) = done {
                         let res = match step {

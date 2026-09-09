@@ -62,8 +62,7 @@ fn acquire(
     }
 }
 
-/// DHCP plus gateway ARP on queue 0. Returns `(ip, prefix_len, gateway_ip,
-/// gateway_mac)`; every worker inherits all four.
+/// DHCP plus gateway ARP on queue 0.
 pub(crate) fn learn_network(
     pool: *mut rte_pktmbuf_pool,
     mac: [u8; 6],

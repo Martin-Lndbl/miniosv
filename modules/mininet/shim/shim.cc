@@ -279,7 +279,6 @@ int shim_rss_hash_key(uint16_t port_id, uint8_t *out_key, uint16_t out_len) {
   return info.hash_key_size;
 }
 
-// Number of indirection-table entries the device is using.
 int shim_rss_reta_size(uint16_t port_id) {
   rte_eth_dev *dev = lookup_dev(port_id);
   if (dev == nullptr) return -1;

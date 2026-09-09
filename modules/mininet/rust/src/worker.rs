@@ -101,7 +101,6 @@ impl Worker {
         let clk = MonoClock::new();
         let netif = h.netif;
 
-        // Which source ports steer back to this queue, for this peer.
         let owned = h
             .rss
             .owned_ports(cfg.peer.ip, cfg.peer.port, netif.ip, h.queue_id);
