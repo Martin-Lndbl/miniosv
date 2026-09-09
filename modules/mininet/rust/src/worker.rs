@@ -235,6 +235,32 @@ impl Worker {
         }
     }
 
+    /// Whether `slot` holds a finished connection the peer hasn't closed --
+    /// reusable for a new request instead of a fresh connect. Only [`Service`]
+    /// calls this; the raw benchmark API (`connect`/`release`) is unaffected.
+    ///
+    /// [`Service`]: crate::service::Service
+    pub(crate) fn idle_reusable(&self, slot: usize) -> bool {
+        self.conns
+            .get(slot)
+            .and_then(|c| c.as_ref())
+            .map_or(false, |c| c.idle_reusable(&self.sockets))
+    }
+
+    /// Reuse the connection already open on `slot` for `req`. Only call when
+    /// [`Worker::idle_reusable`] was just true for this slot.
+    pub(crate) fn reuse(&mut self, slot: usize, req: &Request<'_>) -> Result<(), Error> {
+        let now_ms = self.clk.elapsed_ms();
+        match self.conns.get_mut(slot).and_then(|c| c.as_mut()) {
+            Some(c) => {
+                c.reset_for(req, now_ms);
+                crate::stats::request_started(true);
+                Ok(())
+            }
+            None => Err(Error::ConnectRejected),
+        }
+    }
+
     /// Open `slot` on the next port in the rotation. Used when a slot is
     /// serving a stream of requests rather than one fixed range.
     pub fn connect_next(&mut self, slot: usize, req: &Request<'_>) -> Result<(), Error> {
@@ -257,6 +283,7 @@ impl Worker {
                 return Err(Error::ConnectRejected);
             }
         }
+        crate::stats::request_started(false);
 
         let conn = Conn::new(
             handle,

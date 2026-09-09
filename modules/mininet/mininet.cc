@@ -35,12 +35,18 @@ struct mininet_response_abi {
     char last_modified[64];
 };
 
+struct mininet_conn_stats_abi {
+    uint64_t requests_served;
+    uint64_t requests_reused;
+};
+
 int mininet_up(const mininet_config_abi *cfg);
 int mininet_is_up(void);
 const char *mininet_host(void);
 int mininet_get(const char *head, uint64_t head_len, void *buf, uint64_t cap,
                 mininet_response_abi *out);
 const char *mininet_strerror(int rc);
+mininet_conn_stats_abi mininet_conn_stats(void);
 }
 
 static_assert(sizeof(mininet::config) == sizeof(mininet_config_abi),
@@ -80,6 +86,12 @@ int get(const char *head, size_t head_len, void *buf, size_t cap, response *out)
 const char *strerror(int rc)
 {
 	return mininet_strerror(rc);
+}
+
+conn_stats stats()
+{
+	auto s = mininet_conn_stats();
+	return conn_stats{s.requests_served, s.requests_reused};
 }
 
 } // namespace mininet

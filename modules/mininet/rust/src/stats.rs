@@ -15,6 +15,8 @@ static CONNS_ESTABLISHED: AtomicU64 = AtomicU64::new(0);
 static CONNS_FAILED: AtomicU64 = AtomicU64::new(0);
 static SYN_RETRIES: AtomicU64 = AtomicU64::new(0);
 static SETUP_MS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static REQUESTS_SERVED: AtomicU64 = AtomicU64::new(0);
+static REQUESTS_REUSED: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Stats {
@@ -34,6 +36,10 @@ pub struct Stats {
     /// packet loss as the only cause.
     pub syn_retries: u64,
     pub setup_ms_total: u64,
+    /// Requests served on a connection that was already open, versus one that
+    /// had to be dialled fresh. The gap between the two is the M3 win.
+    pub requests_served: u64,
+    pub requests_reused: u64,
 }
 
 pub fn snapshot() -> Stats {
@@ -45,6 +51,8 @@ pub fn snapshot() -> Stats {
         conns_failed: CONNS_FAILED.load(Ordering::Relaxed),
         syn_retries: SYN_RETRIES.load(Ordering::Relaxed),
         setup_ms_total: SETUP_MS_TOTAL.load(Ordering::Relaxed),
+        requests_served: REQUESTS_SERVED.load(Ordering::Relaxed),
+        requests_reused: REQUESTS_REUSED.load(Ordering::Relaxed),
     }
 }
 
@@ -65,4 +73,10 @@ pub(crate) fn conn_established(attempts: u16, setup_ms: i64) {
 pub(crate) fn conn_failed(setup_ms: i64) {
     CONNS_FAILED.fetch_add(1, Ordering::Relaxed);
     SETUP_MS_TOTAL.fetch_add(setup_ms.max(0) as u64, Ordering::Relaxed);
+}
+pub(crate) fn request_started(reused: bool) {
+    REQUESTS_SERVED.fetch_add(1, Ordering::Relaxed);
+    if reused {
+        REQUESTS_REUSED.fetch_add(1, Ordering::Relaxed);
+    }
 }

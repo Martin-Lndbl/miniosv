@@ -62,6 +62,21 @@ pub struct Conn {
     attempts: u16,
     settled: bool,
     start_ms: i64,
+    /// HEAD (and, defensively, 1xx/204/304) responses have no body regardless
+    /// of what Content-Length says -- needed now that completion can't just
+    /// wait for the peer to close.
+    is_head: bool,
+}
+
+fn is_head_request(head: &[u8]) -> bool {
+    head.starts_with(b"HEAD ")
+}
+
+/// Whether a response with this status ever carries a body, per RFC 7230
+/// 3.3.3. Under keep-alive there is no FIN to fall back on, so this has to be
+/// right rather than assumed.
+fn has_body(status: u16, is_head: bool) -> bool {
+    !is_head && !matches!(status, 100..=199 | 204 | 304)
 }
 
 impl Conn {
@@ -108,7 +123,32 @@ impl Conn {
             attempts: 1,
             settled: false,
             start_ms: now_ms,
+            is_head: is_head_request(req.head),
         })
+    }
+
+    /// Whether this connection finished successfully and the peer hasn't
+    /// closed it -- the socket is still Established, so the next request can
+    /// reuse it instead of paying for a fresh handshake (and, over TLS, a
+    /// fresh key exchange).
+    pub(crate) fn idle_reusable(&self, sockets: &SocketSet<'_>) -> bool {
+        self.outcome == Some(Step::Complete) && sockets.get::<tcp::Socket>(self.handle).state() == tcp::State::Established
+    }
+
+    /// Reuse this connection's socket (and, over TLS, its session) for a new
+    /// request. Only valid when [`Conn::idle_reusable`] was just true; the TCP
+    /// and TLS handshakes are not repeated.
+    pub(crate) fn reset_for(&mut self, req: &Request<'_>, now_ms: i64) {
+        self.incoming.clear();
+        self.outgoing.clear();
+        self.head = req.head.to_vec();
+        self.request_queued = false;
+        self.discard_ciphertext = req.discard_ciphertext && self.tls.is_some();
+        self.parser = ResponseParser::new();
+        self.sink = Box::new(NullSink);
+        self.outcome = None;
+        self.connect_start_ms = now_ms;
+        self.is_head = is_head_request(&self.head);
     }
 
     pub fn set_sink(&mut self, sink: Box<dyn BodySink>) {
@@ -241,10 +281,31 @@ impl Conn {
             return self.finish(step);
         }
 
+        // Keep-alive: the peer does not close after one response, so
+        // completion has to come from the framing rather than a FIN.
+        // `discard_ciphertext` never reaches this -- it bypasses the parser
+        // via count_opaque above -- and falls through to the FIN check below,
+        // same as always: there is no length to compare against ciphertext.
+        if self.parser.headers_done() && self.outgoing.is_empty() {
+            let done = if has_body(self.parser.status(), self.is_head) {
+                self.parser
+                    .head()
+                    .content_length
+                    .map_or(false, |want| self.parser.body_bytes() >= want)
+            } else {
+                true
+            };
+            if done {
+                return self.finish(Step::Complete);
+            }
+        }
+
         // Re-read the state: `state` was sampled before this iteration drained
         // the socket. Requiring the receive buffer to be empty too stops a
         // connection being called complete while the peer's FIN arrived with
-        // data still buffered.
+        // data still buffered. Fallback for anything the length check above
+        // couldn't decide -- a response with no Content-Length, or the
+        // discard_ciphertext path, which has no head to read one from.
         let s = sockets.get_mut::<tcp::Socket>(self.handle);
         let ended = matches!(
             s.state(),
