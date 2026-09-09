@@ -1,10 +1,3 @@
-// The OSv application.
-//
-// Unlike upstream OSv, the application is not a separate ELF shared object
-// loaded at runtime from a filesystem image. It is compiled and statically
-// linked directly into the kernel image (app.o in loader.elf). The kernel
-// calls osv_app_main() once, after early initialization, on a dedicated thread.
-//
 // This demo exemplifies interrupt-based sampling leveraging hardware
 // performance counter overflows. Every overflow records a call chain,
 // similar to `perf record -g`.
