@@ -309,7 +309,13 @@ fn serve(
                         };
                         unsafe { Slot::complete(p, res) };
                         pending[slot] = None;
-                        w.release(slot);
+                        // A connection the peer hasn't closed stays open for
+                        // the next request on this slot instead of paying for
+                        // a fresh handshake; one that failed, or that the peer
+                        // already closed, still frees its port.
+                        if !w.idle_reusable(slot) {
+                            w.release(slot);
+                        }
                     }
                 }
                 None => {
@@ -325,7 +331,12 @@ fn serve(
                         head,
                         discard_ciphertext: s.discard_ciphertext,
                     };
-                    match w.connect_next(slot, &req) {
+                    let opened = if w.idle_reusable(slot) {
+                        w.reuse(slot, &req)
+                    } else {
+                        w.connect_next(slot, &req)
+                    };
+                    match opened {
                         Ok(()) => {
                             let sink = unsafe { BufferSink::new(s.buf, s.buf_cap) };
                             if let Some(c) = w.conn_mut(slot) {

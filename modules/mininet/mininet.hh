@@ -123,6 +123,15 @@ int get(const char *head, size_t head_len, void *buf, size_t cap, response *out)
 //! Never null.
 const char *strerror(int rc);
 
+struct conn_stats {
+    //! Requests served, and how many of those reused a connection the peer
+    //! hadn't closed instead of paying for a fresh handshake.
+    uint64_t requests_served;
+    uint64_t requests_reused;
+};
+
+conn_stats stats();
+
 } // namespace mininet
 
 #endif /* MININET_HH */

@@ -276,6 +276,21 @@ pub extern "C" fn mininet_get(
     }
 }
 
+#[repr(C)]
+pub struct mininet_conn_stats {
+    pub requests_served: u64,
+    pub requests_reused: u64,
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mininet_conn_stats() -> mininet_conn_stats {
+    let s = crate::stats::snapshot();
+    mininet_conn_stats {
+        requests_served: s.requests_served,
+        requests_reused: s.requests_reused,
+    }
+}
+
 /// Never null.
 #[unsafe(no_mangle)]
 pub extern "C" fn mininet_strerror(rc: c_int) -> *const c_char {
