@@ -48,8 +48,8 @@ const suite suites[] = {
 	{"libc",     os_libc_main,     "C libc surface conformance"},
 	{"iostream", os_iostream_main, "C++ iostreams and localization"},
 	{"memmove",  os_memmove_main,  "memmove() overlap correctness"},
-	{"memory",   os_memory_main,   "memory an application can see: malloc, mmap, faults"},
-	{"memory-primitives", os_memory_primitives_main, "frame and address-space primitives"},
+	{"memory",   os_memory_main,   "the memory clients: early, heap, page cache"},
+	{"memory-primitives", os_memory_primitives_main, "the memory primitives: vspace, frames, mapping"},
 #if CONF_fs_miniext
 	{"miniext",  os_miniext_main,  "miniext filesystem (needs --emulated-nvme)"},
 #endif

@@ -45,6 +45,21 @@ inline void section(const char *s)
     fflush(stdout);
 }
 
+// A function under test: the header its tests are listed under.
+inline void function(const char *s)
+{
+    printf("\n%s\n", s);
+    fflush(stdout);
+}
+
+// One test of that function.
+inline void test(const char *s)
+{
+    current = s;
+    printf("\t%s\n", s);
+    fflush(stdout);
+}
+
 inline int summary(const char *what)
 {
     int bad = fails.load();
