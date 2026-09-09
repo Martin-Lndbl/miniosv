@@ -195,9 +195,17 @@ def start_osv_qemu(options):
             print(format_args(cmdline))
             return
 
+        # --preload scopes the library to qemu itself. Putting LD_PRELOAD on
+        # this script instead would load it into every helper subprocess too
+        # (stty, setargs.py); the boot-time benchmark preloads a library whose
+        # exit-time stop must catch qemu, not whichever helper exits first.
+        env = os.environ.copy()
+        if options.preload:
+            env["LD_PRELOAD"] = options.preload
+
         try:
             stty_save()
-            ret = subprocess.call(cmdline, env=os.environ.copy())
+            ret = subprocess.call(cmdline, env=env)
             if ret != 0:
                 sys.exit("qemu failed.")
         except OSError as e:
@@ -274,6 +282,9 @@ if __name__ == "__main__":
                         help="passthrough PCI device(s) bound to vfio-pci, e.g. 0000:01:00.0")
     parser.add_argument("--gic-version", action="store", default="3",
                         help="aarch64 GIC version under TCG (default 3)")
+    parser.add_argument("--preload", action="store", metavar="LIB",
+                        help="LD_PRELOAD this library into qemu (only qemu, "
+                             "not this script's helper subprocesses)")
     parser.add_argument("--args", action="store", metavar="STRING",
                         help="application arguments; written into the boot "
                              "image before starting (see scripts/setargs.py). "
