@@ -649,6 +649,17 @@ $(app_mode_dep): app_mode_phony
 	@if [ "$$(cat $(app_mode_dep) 2>/dev/null)" != "$(app)" ]; then \
 		echo -n "$(app)" > $(app_mode_dep); \
 	fi
+
+# Set the location of the application for the defered constructors.
+# see .init_array_late in arch/$(arch)/loader.ld)
+app_init_late = $(out)/app_init_late.ld
+app_objs = *$(patsubst %/,%,$(app))/*
+app_init_late_pattern = KEEP($(app_objs)(SORT_BY_INIT_PRIORITY(.init_array.*) SORT_BY_INIT_PRIORITY(.ctors.*))) KEEP($(app_objs)(.init_array .ctors))
+$(app_init_late): app_mode_phony
+	$(call very-quiet, $(makedir))
+	@if [ "$$(cat $(app_init_late) 2>/dev/null)" != "$(app_init_late_pattern)" ]; then \
+		echo '$(app_init_late_pattern)' > $(app_init_late); \
+	fi
 # Minimal boot-time self-relocator (replaces the relocation half of the old
 # ELF loader). Per-arch: the relocation-type switch differs (x64 vs aarch64).
 objects += arch/$(arch)/relocate.o
@@ -1028,13 +1039,15 @@ define newline
 
 endef
 
-link-inputs = $(patsubst %.ld,-T %.ld,$(filter-out $(app_mode_dep) $(llvm_libc_dep) $(libcxx_dep) $(compiler_rt_dep),$^))
+link-inputs = $(patsubst %.ld,-T %.ld,$(filter-out $(app_mode_dep) $(app_init_late) $(llvm_libc_dep) $(libcxx_dep) $(compiler_rt_dep),$^))
 
-$(out)/loader.elf: $(stage1_targets) arch/$(arch)/loader.ld $(app_mode_dep) $(llvm_libc_dep) $(libcxx_dep) $(compiler_rt_dep)
+# -L$(out): app_init_late.ld is generated there, and the INCLUDE in
+# arch/$(arch)/loader.ld names it without a path.
+$(out)/loader.elf: $(stage1_targets) arch/$(arch)/loader.ld $(app_mode_dep) $(app_init_late) $(llvm_libc_dep) $(libcxx_dep) $(compiler_rt_dep)
 	$(call very-quiet, $(makedir))
 	$(file > $@.objects,$(subst $(space),$(newline),$(link-inputs)))
 	$(call quiet, $(LD) -o $@ $(def_symbols) \
-		-static --eh-frame-hdr -L$(out)/arch/$(arch) \
+		-static --eh-frame-hdr -L$(out)/arch/$(arch) -L$(out) \
 	    @$@.objects \
 	    $(linker_archives_options) $(conf_linker_extra_options), \
 		LINK loader.elf)
