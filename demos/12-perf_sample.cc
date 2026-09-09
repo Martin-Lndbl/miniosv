@@ -6,6 +6,7 @@
 #include <osv/execinfo.hh>
 #include <osv/perf.hh>
 #include <osv/power.hh>
+#include <osv/sched.hh>
 
 #include <cstdio>
 
@@ -40,6 +41,9 @@ __attribute__((noinline)) unsigned middle() { return inner() + 1; }
 __attribute__((noinline)) unsigned outer() { return middle() + 1; }
 
 extern "C" void osv_app_main() {
+  // Pin main thread to core
+  sched::thread::pin(sched::cpu::current());
+
   perf::PMCSampler sampler{sample_period, on_sample,
                            perf::PERF_COUNT_HW::CPU_CYCLES};
 

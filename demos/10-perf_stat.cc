@@ -3,10 +3,14 @@
 
 #include <osv/power.hh>
 #include <osv/perf.hh>
+#include <osv/sched.hh>
 
 constexpr unsigned iterations{1u << 20};
 
 extern "C" void osv_app_main() {
+  // Pin main thread to core
+  sched::thread::pin(sched::cpu::current());
+
   // Use default counters
   perf::PerfEvent e{true};
   // Add additional counter (LLC accesses)
