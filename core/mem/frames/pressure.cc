@@ -41,7 +41,7 @@ void watch_pressure(pressure_watcher &w, pressure_fn cb, unsigned order)
     }
 }
 
-bool reclaim()
+bool reclaim(size_t bytes)
 {
     pressure_watcher *head = watchers.load(std::memory_order_acquire);
     if (!head) {
@@ -53,12 +53,15 @@ bool reclaim()
     if (!in_callback.compare_exchange_strong(expected, true)) {
         return false;
     }
+    size_t have = free_bytes();
+    size_t target = bytes > SIZE_MAX - have ? SIZE_MAX : have + bytes;
     bool gave = false;
     unsigned level = ~0u;
     for (pressure_watcher *w = head; w; w = w->next) {
         level = std::min(level, w->order);
     }
-    while (level != ~0u) {
+    // Lowest order first, and no further once the request is covered.
+    while (level != ~0u && free_bytes() < target) {
         unsigned next = ~0u;
         for (pressure_watcher *w = head; w; w = w->next) {
             if (w->order == level) {
@@ -80,10 +83,11 @@ bool under_pressure()
 
 void check_pressure()
 {
-    if (!under_pressure()) {
+    size_t have = free_bytes();
+    if (!threshold || have >= threshold) {
         return;
     }
-    reclaim();
+    reclaim(threshold - have);
 }
 
 } // namespace frames

@@ -120,11 +120,23 @@ bool is_contiguous(const void *addr, size_t bytes)
     if (frames::in_linear_map(addr, bytes)) {
         return true;
     }
-    auto e = find(start);
-    if (!e) {
-        return false;
+    // Leaf by leaf: each one has to pick up where the last left off.
+    uintptr_t end = start + bytes;
+    frames::phys_addr expect = frames::no_memory;
+    for (uintptr_t va = start; va < end;) {
+        auto e = find(va);
+        if (!e) {
+            return false;
+        }
+        frames::phys_addr p = e.addr() + (va & (e.size() - 1));
+        if (va != start && p != expect) {
+            return false;
+        }
+        uintptr_t next = (va & ~(e.size() - 1)) + e.size();
+        expect = p + (next - va);
+        va = next;
     }
-    return (start & (e.size() - 1)) + bytes <= e.size();
+    return true;
 }
 
 pte_ref prepare(uintptr_t addr, size_t leaf_size)
@@ -150,9 +162,21 @@ pte_ref prepare(uintptr_t addr, size_t leaf_size)
         slot = &table_of(e)[level_index(addr, level)];
     }
 
+    // An empty table left behind by a smaller mapping gives way to the leaf.
+    walk_result res;
+    if (target > 0) {
+        pte e = slot->load(std::memory_order_acquire);
+        if (!pte_empty(e) && !pte_is_leaf(e, target) && table_is_empty(table_of(e))) {
+            if (slot->compare_exchange_strong(e, 0, std::memory_order_acq_rel)) {
+                res.retire(pte_table_addr(e));
+                split = true;
+            }
+        }
+    }
     if (split) {
         flush_all();
     }
+    res.settle();
     return {slot, target};
 }
 
@@ -163,6 +187,7 @@ bool prepare(range r, size_t leaf_size)
     if (res.split) {
         flush_all();
     }
+    res.settle();
     return res.complete;
 }
 

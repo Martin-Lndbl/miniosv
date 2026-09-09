@@ -194,7 +194,7 @@ phys_addr alloc(size_t bytes, size_t align)
     // Clients hold memory they are willing to give back rather than handing it
     // over the moment they stop using it, so running out is a question to ask
     // them rather than an answer. Keep asking while they keep giving.
-    while (p == no_memory && reclaim()) {
+    while (p == no_memory && reclaim(need << mem::mapping::page_size_shift)) {
         p = try_alloc(need, align);
     }
     if (p != no_memory) {
