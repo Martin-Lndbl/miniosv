@@ -69,6 +69,11 @@ extern "C" {
 
 void premain()
 {
+    // Slot 0 is the chart's baseline: without this, "Booted up in" counts
+    // from counter zero rather than from kernel entry. It also mirrors the
+    // kernel-start marker to the host (see core/chart.cc).
+    boot_time.event(0, "premain");
+
     arch_init_early_console();
 
     /* besides reporting the OSV version, this string has the function
