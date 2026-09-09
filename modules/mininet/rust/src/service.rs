@@ -334,6 +334,13 @@ fn serve(
                     let opened = if w.idle_reusable(slot) {
                         w.reuse(slot, &req)
                     } else {
+                        // The socket can still be open here. It was reusable
+                        // when the last request finished, so it was kept
+                        // rather than released -- and the peer closed it in
+                        // the meantime, leaving it in CloseWait. connect()
+                        // refuses anything that is not Closed, so hand the
+                        // socket back before dialling on it again.
+                        w.release(slot);
                         w.connect_next(slot, &req)
                     };
                     match opened {
