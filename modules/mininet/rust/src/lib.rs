@@ -166,13 +166,12 @@ impl Stack {
         })
     }
 
-    /// Build a worker for `queue_id` on the calling thread.
     pub fn worker(&self, queue_id: u16, cfg: &WorkerConfig) -> Result<Worker, Error> {
         let handle = self.handle(queue_id).ok_or(Error::NoDevice)?;
         Worker::new(handle, cfg)
     }
 
-    /// Stop the device. The pools go with `self`.
+    /// The pools go with `self`.
     pub fn down(self) {
         nic::dev_stop();
     }

@@ -47,8 +47,7 @@ pub(crate) fn clamp_queues(requested: u16) -> u16 {
 }
 
 /// Configure and start port 0 with `n_queues` RX+TX queues, RSS-hashing the
-/// TCP/IPv4 4-tuple when there is more than one. Returns one mempool per queue
-/// plus the MAC.
+/// TCP/IPv4 4-tuple when there is more than one.
 ///
 /// Per-queue mempools eliminate cross-worker contention on the pool spinlock,
 /// which choked throughput badly at 8 queues and made it unstable at 4 under

@@ -15,7 +15,6 @@ pub struct rte_pktmbuf_pool {
 }
 
 extern "C" {
-    // --- heap, console, clock ---
     pub fn shim_malloc(size: u64) -> *mut u8;
     pub fn shim_free(ptr: *mut u8);
     pub fn shim_realloc(ptr: *mut u8, size: u64) -> *mut u8;
@@ -25,7 +24,6 @@ extern "C" {
     pub fn shim_time_ns() -> u64;
     pub fn write(fd: c_int, buf: *const u8, count: usize) -> isize;
 
-    // --- device setup ---
     pub fn shim_get_dev_info(port_id: u16, max_rx_queues: *mut u16, max_tx_queues: *mut u16) -> c_int;
     pub fn shim_pktmbuf_pool_create(
         name: *const u8,
@@ -48,7 +46,6 @@ extern "C" {
     pub fn shim_dev_stop(port_id: u16);
     pub fn shim_macaddr_get(port_id: u16, addr_bytes: *mut u8);
 
-    // --- data path ---
     pub fn shim_mbuf_alloc_tx(
         pool: *mut rte_pktmbuf_pool,
         queue_id: u16,
@@ -66,13 +63,11 @@ extern "C" {
         max: u16,
     ) -> u16;
 
-    // --- introspection ---
     pub fn shim_rss_hash_key(port_id: u16, out_key: *mut u8, out_len: u16) -> c_int;
     pub fn shim_rss_reta(port_id: u16, out: *mut u16, out_entries: u16) -> c_int;
     pub fn shim_eth_stats(port_id: u16, out: *mut u64, n: u16) -> c_int;
     pub fn shim_eth_qstats(port_id: u16, ipkts: *mut u64, errs: *mut u64, nq: u16) -> c_int;
 
-    // --- threads ---
     pub fn shim_thread_spawn(f: extern "C" fn(*mut c_void), arg: *mut c_void, cpu_id: c_int) -> *mut c_void;
     pub fn shim_thread_join(handle: *mut c_void);
     pub fn shim_thread_current() -> *mut c_void;

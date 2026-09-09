@@ -8,33 +8,25 @@ use core::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
-    /// No usable NIC: no port, or configure/queue-setup/start was rejected.
     NoDevice,
-    /// A mempool could not be created. Sizing is fixed, so this is memory.
+    /// Sizing is fixed, so a failed mempool allocation is a memory shortage.
     NoMemory,
     /// The Toeplitz key or the indirection table could not be read, or the
     /// table is not a power of two. Without both, source ports cannot be
     /// chosen to steer, and every worker would see other workers' traffic.
     RssUnavailable,
-    /// No lease. Usually means the queue-0 RX path is not delivering.
+    /// Usually means the queue-0 RX path is not delivering.
     DhcpTimeout,
-    /// The gateway never answered ARP.
     ArpTimeout,
-    /// No ephemeral port steers to this worker's queue. Only possible with a
-    /// pathological indirection table.
+    /// Only possible with a pathological indirection table.
     NoPorts,
-    /// smoltcp refused the connect: the socket was not in a state to open.
     ConnectRejected,
-    /// The peer never answered the SYN within the timeout.
     SynTimeout,
-    /// rustls rejected the configuration, the server name, or the session.
     Tls,
-    /// The response could not be read: no status line, a head that never
-    /// ended, or chunked transfer-encoding, which is not implemented.
+    /// Includes chunked transfer-encoding, which is not implemented.
     BadResponse,
-    /// The peer sent more body than the caller's buffer could hold. The
-    /// excess was dropped rather than written past the end, so what arrived
-    /// is not the response that was asked for.
+    /// The excess was dropped rather than written past the end, so what
+    /// arrived is not the response that was asked for.
     BufferTooSmall,
 }
 

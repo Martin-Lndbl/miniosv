@@ -195,7 +195,6 @@ impl OwnedPorts {
     }
 }
 
-/// Toeplitz hash, sliding-window form.
 fn toeplitz(key: &[u8], data: &[u8]) -> u32 {
     if key.len() < 4 {
         return 0;

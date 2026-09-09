@@ -1,18 +1,15 @@
 /*
  * mininet: a userspace network stack for miniOSv.
  *
- * The application calls these functions directly. No sockets, no file
- * descriptors, no libc networking involved -- mininet polls the NIC queues
- * itself, the way modules/miniext drives NVMe itself.
- *
- * The implementation is Rust (modules/mininet/rust): smoltcp for TCP/IP,
- * rustls for TLS, over minidpdk. This header is the whole C++ surface.
+ * No sockets, no file descriptors, no libc networking -- mininet polls the
+ * NIC queues itself, the way modules/miniext drives NVMe itself. Implemented
+ * in Rust (modules/mininet/rust): smoltcp for TCP/IP, rustls for TLS, over
+ * minidpdk. This header is the whole C++ surface.
  *
  * One endpoint per image. A worker owns an RSS queue outright, and the source
- * ports it may use are a function of the *peer's* address -- that is what lets
- * it poll one queue with nothing shared and nothing locked. Serving a second
- * host means a second set of workers, which is not implemented; see
- * PLAN_duckdb_net.md.
+ * ports it may use are a function of the *peer's* address -- that is what
+ * lets it poll one queue with nothing shared and nothing locked. Serving a
+ * second host would mean a second set of workers; not implemented.
  *
  * There is no resolver: up() takes the address the caller already knows.
  */
@@ -113,16 +110,14 @@ const char *host();
 //! Send `head` and write the response body into `buf`.
 //!
 //! `head` is the complete request head -- request line, headers, blank line --
-//! rendered by the caller. mininet carries HTTP, it does not build it, which
-//! is what keeps request signing, range arithmetic and header policy where
-//! they belong.
+//! rendered by the caller; mininet carries HTTP, it does not build it.
 //!
 //! Blocks. The calling thread is parked, not spun, so it does not compete for
 //! the CPU a worker is using. Any thread may call this, and many may at once.
 //!
 //! A body larger than `cap` is E_BUFFER_TOO_SMALL: the excess is dropped
-//! rather than written past the end, and the response is reported as the
-//! failure it is rather than as a short read.
+//! rather than written past the end, so this is reported as the failure it
+//! is rather than as a short read.
 int get(const char *head, size_t head_len, void *buf, size_t cap, response *out);
 
 //! Never null.

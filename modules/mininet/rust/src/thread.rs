@@ -17,8 +17,6 @@ pub struct JoinHandle(*mut c_void);
 // the shim.
 unsafe impl Send for JoinHandle {}
 
-/// Run `f` on a new thread, pinned to `cpu` when given.
-///
 /// The closure is boxed and handed across the FFI boundary; the trampoline
 /// takes it back and runs it exactly once.
 pub fn spawn<F: FnOnce() + Send + 'static>(f: F, cpu: Option<usize>) -> JoinHandle {
