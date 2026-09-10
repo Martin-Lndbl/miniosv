@@ -311,6 +311,16 @@ pub extern "C" fn mininet_conn_stats() -> mininet_conn_stats {
     }
 }
 
+/// Run the stack's pure-logic unit tests and return how many checks failed.
+///
+/// Needs no NIC and no network: it is the parser, the body sink and the
+/// completion rule, exercised against buffers this function allocates itself.
+/// Driven by `test/os-mininet.cc` under `make app=test`.
+#[unsafe(no_mangle)]
+pub extern "C" fn mininet_selftest(verbose: c_int) -> u32 {
+    crate::selftest::run(verbose != 0)
+}
+
 /// Never null.
 #[unsafe(no_mangle)]
 pub extern "C" fn mininet_strerror(rc: c_int) -> *const c_char {
