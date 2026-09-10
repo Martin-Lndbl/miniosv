@@ -179,6 +179,7 @@ conf_drivers_virtio_accel=1
 
 # --- accelerator offload ---------------------------------------------------
 conf_vaccel=1
+conf_lros=1
 
 # miniext talks to the NVMe driver directly, so it cannot be built without it.
 # Catch that here rather than in a wall of missing-header errors.
@@ -189,9 +190,9 @@ endif
 endif
 
 # vAccel reaches its device through the virtio-accel driver.
-ifeq ($(conf_vaccel),1)
+ifneq (,$(filter 1,$(conf_vaccel) $(conf_viai)))
 ifneq ($(conf_drivers_virtio_accel),1)
-$(error conf_vaccel=1 needs conf_drivers_virtio_accel=1)
+$(error conf_vaccel/conf_viai need conf_drivers_virtio_accel=1)
 endif
 endif
 
@@ -608,30 +609,22 @@ endif
 # The application is statically linked into the kernel image and entered via
 # osv_app_main(). There is no separate app .so or filesystem image.
 #
-# "app" names a directory holding a Makefile fragment that lists the
-# application's objects in $(app-objects); the kernel compiles and links them
-# with its own flags. Only one can be linked at a time -- two osv_app_main()
-# would collide.
+# "app" names a directory holding a Makefile that lists the application's
+# objects in $(app-objects); the kernel compiles and links them with its own
+# flags. Only one can be linked at a time -- two osv_app_main() would collide.
 #
-#   make                 -> app/, the placeholder app.cc
-#   make app=test        -> the test suite in test/
-#   make app=duckdb      -> DuckDB    (the app/miniduckdb submodule)
-#   make app=llama       -> llama.cpp (the app/llama.cpp submodule)
-#   make app=<directory> -> that directory, in the tree or out of it
+#   make                    -> app/, the placeholder app.cc
+#   make app=test           -> the test suite in test/
+#   make app=app/miniduckdb -> DuckDB    (submodule)
+#   make app=app/llama.cpp  -> llama.cpp (submodule)
+#   make app=<directory>    -> that directory, in the tree or out of it
 #
-# The submodules keep their fragment beside their own miniOSv port, so the two
-# names below are shorthands for it. Paths in a fragment are relative to the
-# miniOSv root.
+# A directory is all an application is: its Makefile derives the rest of the
+# tree from its own path, so the same source builds in place or copied to app/.
+# The nix layer relies on the latter -- it stages an app source there and runs
+# plain `make`. A submodule needs 'git submodule update --init' first.
 app ?= app
-app-mk-duckdb = app/miniduckdb/miniosv/miniosv.mk
-app-mk-llama = app/llama.cpp/miniosv/miniosv.mk
-app-mk := $(or $(app-mk-$(app)),$(app)/Makefile)
-ifeq ($(wildcard $(app-mk)),)
-$(error no $(app-mk) for app '$(app)': give a directory holding a Makefile, or \
-        one of duckdb, llama. A submodule needs 'git submodule update --init', \
-        and its port may not be wired up yet)
-endif
-include $(app-mk)
+include $(app)/Makefile
 objects += $(app-objects)
 
 # Record the selected app so that switching between `make` and `make app=test`
@@ -873,8 +866,15 @@ endif
 
 # The vAccel operations the application calls, on top of the virtio-accel
 # transport. See modules/vaccel/include/vaccel.h.
-ifeq ($(conf_vaccel),1)
+ifneq (,$(filter 1,$(conf_vaccel) $(conf_viai)))
 objects += modules/vaccel/vaccel.o
+endif
+
+# The inference task abstraction the engine submits work through. See
+# modules/lros/include/lros.hh.
+ifeq ($(conf_lros),1)
+objects += modules/lros/sched.o
+objects += modules/lros/worker.o
 endif
 
 # Minimal console-backed stdio lives in libc/io.cc.

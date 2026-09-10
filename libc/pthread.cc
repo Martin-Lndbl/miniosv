@@ -1104,7 +1104,14 @@ static int setaffinity(sched::thread* t, size_t cpusetsize,
         for (size_t i = 0; i < cpusetsize * 8; i++) {
             if (CPU_ISSET(i, cpuset)) {
                 if (i < sched::cpus.size()) {
-                    sched::thread::pin(t, sched::cpus[i]);
+                    // pin(thread*, cpu*) migrates another thread and waits for
+                    // it; used on the calling thread it waits for itself. Every
+                    // ggml worker pins itself, so this path matters.
+                    if (t == sched::thread::current()) {
+                        sched::thread::pin(sched::cpus[i]);
+                    } else {
+                        sched::thread::pin(t, sched::cpus[i]);
+                    }
                     break;
                 } else {
                     return EINVAL;

@@ -1,11 +1,15 @@
 #pragma once
 
 // ARMv8-A PMU back-end for osv/perf.hh.
-// Targets Ampere-1a, Neoverse V1 and Neoverse V2.
+// Targets Ampere-1a, Neoverse V1/V2 and Cortex-A76/A55.
 
+#include "drivers/acpi.hh"
+#include "exceptions.hh"
 #include "osv/perf.hh"
 #include <cstdint>
+#include <functional>
 #include <iostream>
+#include <osv/interrupt.hh>
 
 namespace perf {
 
@@ -18,12 +22,19 @@ inline uint32_t pmu_num_counters() {
   return (pmcr >> 11) & 0x1F;
 }
 
-// Match against MIDR_EL1 (implementer/arch/part bits).
-inline bool is_midr(uint32_t to_check) {
+// Implementer=0x41 (Arm), Arch=0xF, Part=0xD0B/0xD05. The RK3588 pairs four
+// A55s with four A76s; both implement the same PMUv3 event subset.
+inline constexpr uint32_t midr_cortex_a76 = 0x410F'D0B0u;
+inline constexpr uint32_t midr_cortex_a55 = 0x410F'D050u;
+
+inline uint32_t midr_read() {
   uint64_t midr;
   asm volatile("mrs %0, midr_el1" : "=r"(midr));
-  return (static_cast<uint32_t>(midr) & midr_fixed_mask) == to_check;
+  return static_cast<uint32_t>(midr) & midr_fixed_mask;
 }
+
+// Match against MIDR_EL1 (implementer/arch/part bits).
+inline bool is_midr(uint32_t to_check) { return midr_read() == to_check; }
 
 // SMCCC vendor hypervisor UID (function 0x8600FF01); KVM's UUID comes from
 // Linux arch/arm64/kvm/hypercalls.c.
@@ -37,63 +48,97 @@ inline bool is_kvm_guest() {
          x2 == 0x564bcaa9ull && x3 == 0x743a004dull;
 }
 
-// Whether the requested event is supported on this CPU (per PMCEID{0,1}_EL0).
-// Events 0x00..0x3F and 0x4000..0x403F have a validation bit; higher IDs would
-// need PMCEID3, which is not available in 64-bit mode, so we warn and accept.
-inline bool is_event_supported(uint64_t value) {
-  uint64_t pmceid;
-  uint64_t cmp;
-  if (value < 0x20) {
-    cmp = value;
-    asm volatile("mrs %0, pmceid0_el0" : "=r"(pmceid));
-  } else if (value < 0x40) {
-    cmp = value - 0x20;
-    asm volatile("mrs %0, pmceid1_el0" : "=r"(pmceid));
-  } else if (value < 0x4000) {
-    std::cout << "Warning: Requested event 0x" << std::hex << value
-              << " could not be checked for compatibility" << std::endl;
-    return true;
-  } else if (value < 0x4020) {
-    cmp = value - 0x4000;
-    asm volatile("mrs %0, pmceid0_el0" : "=r"(pmceid));
-  } else if (value < 0x4040) {
-    cmp = value - 0x4020;
-    asm volatile("mrs %0, pmceid1_el0" : "=r"(pmceid));
-  } else {
-    std::cout << "Warning: Requested event 0x" << std::hex << value
-              << " could not be checked for compatibility" << std::endl;
-    return true;
-  }
+inline uint64_t pmceid0_read() {
+  uint64_t v;
+  asm volatile("mrs %0, pmceid0_el0" : "=r"(v));
+  return v;
+}
 
-  if (((1ull << cmp) & pmceid) == 0) {
-    std::cerr << "Requested event 0x" << std::hex << value
-              << " is not supported." << std::endl;
-    return false;
+inline uint64_t pmceid1_read() {
+  uint64_t v;
+  asm volatile("mrs %0, pmceid1_el0" : "=r"(v));
+  return v;
+}
+
+enum class event_support { yes, no, unknown };
+
+inline event_support pmu_event_support(uint64_t value) {
+  uint64_t pmceid;
+  uint64_t bit;
+  if (value < 0x20) {
+    bit = value;
+    pmceid = pmceid0_read();
+  } else if (value < 0x40) {
+    bit = value - 0x20;
+    pmceid = pmceid1_read();
+  } else if (value < 0x4000) {
+    return event_support::unknown;
+  } else if (value < 0x4020) {
+    bit = value - 0x4000 + 32;
+    pmceid = pmceid0_read();
+  } else if (value < 0x4040) {
+    bit = value - 0x4020 + 32;
+    pmceid = pmceid1_read();
+  } else {
+    return event_support::unknown;
   }
-  return true;
+  return ((1ull << bit) & pmceid) ? event_support::yes : event_support::no;
+}
+
+inline bool is_event_supported(uint64_t value) {
+  switch (pmu_event_support(value)) {
+  case event_support::yes:
+    return true;
+  case event_support::no:
+    std::cerr << "Requested event 0x" << std::hex << value
+              << " is not implemented by this PMU." << std::dec << std::endl;
+    return false;
+  default:
+    std::cout << "Warning: Requested event 0x" << std::hex << value
+              << " could not be checked for compatibility" << std::dec
+              << std::endl;
+    return true;
+  }
+}
+
+// PMCR_EL0 control bits.
+inline constexpr uint64_t pmcr_e = 1ull << 0;
+inline constexpr uint64_t pmcr_p = 1ull << 1;
+inline constexpr uint64_t pmcr_c = 1ull << 2;
+inline constexpr uint64_t pmcr_d = 1ull << 3;
+inline constexpr uint64_t pmcr_lc = 1ull << 6;
+inline constexpr uint64_t pmcr_lp = 1ull << 7;
+
+inline uint64_t pmcr_read() {
+  uint64_t pmcr;
+  asm volatile("mrs %0, pmcr_el0" : "=r"(pmcr));
+  return pmcr;
 }
 
 inline void enable_pmu() {
-  uint64_t pmcr;
-
-  // Clear all counter enables.
   asm volatile("msr pmcntenclr_el0, %0\n\t"
+               "msr pmintenclr_el1, %0\n\t"
+               "msr pmovsclr_el0, %0\n\t"
                "isb" ::"r"((uint64_t)0xFFFFFFFF)
                : "memory");
-  // PMCR_EL0: set E|P|C (enable, reset event counters, reset cycle counter);
-  // clear D (cycle counter divider).
-  asm volatile("mrs %0, pmcr_el0\n\t"
-               "orr %0, %0, #0b111\n\t"
-               "and %0, %0, #~0b1000\n\t"
-               "msr pmcr_el0, %0\n\t"
-               "isb\n\t"
-               : "=&r"(pmcr)
-               :
-               : "memory");
+
+  // LC|LP widen the counters to 64 bits; LP is RES0 before FEAT_PMUv3p5.
+  uint64_t pmcr = (pmcr_read() | pmcr_e | pmcr_p | pmcr_c | pmcr_lc | pmcr_lp) &
+                  ~pmcr_d;
+  asm volatile("msr pmcr_el0, %0\n\tisb" ::"r"(pmcr) : "memory");
+
+  static bool warned = false;
+  if (!warned && !(pmcr_read() & pmcr_lp)) {
+    warned = true;
+    std::cout << "This PMU has no FEAT_PMUv3p5: the event counters are 32 bits "
+                 "wide and wrap after 2^32 events."
+              << std::endl;
+  }
 }
 
-inline void pmc_stop(uint32_t counter_mask) {
-  asm volatile("msr pmcntenclr_el0, %0" : : "r"((uint64_t)counter_mask));
+inline void pmc_stop(uint32_t counter) {
+  uint64_t mask = counter == (1u << 31) ? (1ull << 31) : (1ull << counter);
+  asm volatile("msr pmcntenclr_el0, %0" : : "r"(mask));
   asm volatile("isb" ::: "memory");
 }
 
@@ -111,10 +156,11 @@ inline void pmc_write_counter(uint32_t counter, uint64_t value) {
   }
 }
 
-inline void pmc_start_with_conf(uint32_t counter, uint32_t evt_sel,
+inline bool pmc_start_with_conf(uint32_t counter, uint32_t evt_sel,
                                 uint64_t value) {
-  if (!is_event_supported(value))
-    return;
+  // PMEVTYPER<n>_EL0.evtCount is bits [15:0]; the rest are exception filters.
+  if (!is_event_supported(value & 0xFFFF))
+    return false;
 
   // Write event config into the counter's pmevtyperN_el0.
   switch (evt_sel) {
@@ -130,11 +176,12 @@ inline void pmc_start_with_conf(uint32_t counter, uint32_t evt_sel,
     asm volatile("msr pmcntenset_el0, %0\n\t"
                  "isb" ::"r"((uint64_t)(1u << 31))
                  : "memory");
-    return;
+    return true;
   }
   asm volatile("isb" ::: "memory");
   asm volatile("msr pmcntenset_el0, %0" : : "r"(1ull << counter));
   asm volatile("isb" ::: "memory");
+  return true;
 }
 
 inline uint64_t pmc_read(uint32_t counter) {
@@ -151,6 +198,96 @@ inline uint64_t pmc_read(uint32_t counter) {
     // clang-format on
   }
   return value;
+}
+
+inline constexpr uint64_t pmc_int_enable = 0;
+inline constexpr unsigned pmu_default_irq_id = 23;
+
+using PMCIntHandle = ppi_interrupt *;
+
+struct PMCOverflowAck {
+  uint64_t mask;
+};
+
+inline uint64_t pmc_overflow_bit(uint32_t counter) {
+  return counter == (1u << 31) ? (1ull << 31) : (1ull << counter);
+}
+
+inline PMCOverflowAck pmc_overflow_ack_conf(uint32_t counter) {
+  uint64_t bit = pmc_overflow_bit(counter);
+  asm volatile("msr pmintenset_el1, %0\n\tisb" ::"r"(bit) : "memory");
+  return {bit};
+}
+
+inline void pmc_ack_overflow(PMCOverflowAck ack, PMCIntHandle) {
+  asm volatile("msr pmovsclr_el0, %0\n\tisb" ::"r"(ack.mask) : "memory");
+}
+
+inline void pmc_ack_overflow_mask(uint64_t mask, PMCIntHandle) {
+  asm volatile("msr pmovsclr_el0, %0\n\tisb" ::"r"(mask) : "memory");
+}
+
+inline uint32_t pmu_probe_event_counter_width() {
+  static const uint32_t width = [] {
+    uint64_t saved = pmc_read(0);
+    pmc_write_counter(0, 1ull << 32);
+    uint64_t back = pmc_read(0);
+    pmc_write_counter(0, saved);
+    return back ? 64u : 32u;
+  }();
+  return width;
+}
+
+// Where overflow is recorded, not the register size: PMCCNTR_EL0 counts 64-bit
+// whatever LC says, only PMEVCNTR<n>_EL0 is 32-bit when LP is clear.
+inline uint32_t pmc_overflow_width(uint32_t counter) {
+  if (counter == (1u << 31))
+    return (pmcr_read() & pmcr_lc) ? 64 : 32;
+  return (pmcr_read() & pmcr_lp) ? pmu_probe_event_counter_width() : 32;
+}
+
+// PMOVSCLR_EL0 reads as the overflow status; writing clears the bits set.
+inline uint64_t pmu_overflow_status() {
+  uint64_t v;
+  asm volatile("mrs %0, pmovsclr_el0" : "=r"(v));
+  return v;
+}
+
+inline uint64_t pmc_period_value(uint32_t counter, uint64_t period) {
+  uint32_t width = pmc_overflow_width(counter);
+  return width >= 64 ? -period : (-period & ((1ull << width) - 1));
+}
+
+// The PMU overflow interrupt is a PPI whose id the firmware reports per cpu in
+// the MADT GICC entries.
+inline unsigned pmu_irq_id() {
+  auto madt =
+      reinterpret_cast<const acpi::madt *>(acpi::find_table(ACPI_SIG_MADT));
+  if (!madt)
+    return pmu_default_irq_id;
+  auto subtable = reinterpret_cast<const char *>(madt + 1);
+  auto madt_end = reinterpret_cast<const char *>(madt) + madt->header.length;
+  while (subtable < madt_end) {
+    auto s = reinterpret_cast<const acpi::madt_subtable *>(subtable);
+    if (s->type == acpi::MADT_GICC) {
+      auto gicc = reinterpret_cast<const acpi::madt_gicc *>(s);
+      if ((gicc->flags & acpi::MADT_ENABLED) &&
+          gicc->performance_interrupt_gsiv)
+        return gicc->performance_interrupt_gsiv;
+    }
+    subtable += s->length;
+  }
+  return pmu_default_irq_id;
+}
+
+inline PMCIntHandle pmc_attach_overflow_handler(std::function<void()> handler) {
+  return new ppi_interrupt(gic::irq_type::IRQ_TYPE_LEVEL, pmu_irq_id(),
+                           std::move(handler));
+}
+
+inline void pmc_detach_overflow_handler(PMCIntHandle irq) {
+  asm volatile("msr pmintenclr_el1, %0\n\tisb" ::"r"(~0ull) : "memory");
+  delete irq;
 }
 
 namespace PERF_COUNT_HW {
@@ -180,6 +317,9 @@ constexpr PMCEvent EXC_TAKEN = {0x9, CORE, "exceptions-taken"};
 // Instruction architecturally executed, condition code check pass,
 // exception return
 constexpr PMCEvent EXC_RETURN = {0xA, CORE, "exceptions-return"};
+// Instruction architecturally executed, condition code check pass, write to
+// CONTEXTIDR
+constexpr PMCEvent CID_WRITE_RETIRED = {0xB, CORE, "context-id-writes"};
 // Instruction architecturally executed, condition code check pass, software
 // change of the PC
 constexpr PMCEvent PC_WRITE_RETIRED = {0xC, CORE, "software-pc-writes"};
@@ -218,6 +358,9 @@ constexpr PMCEvent BUS_ACCESS = {0x19, CORE, "bus-accesses"};
 constexpr PMCEvent MEMORY_ERROR = {0x1A, CORE, "memory-errors"};
 // Operation speculatively executed
 constexpr PMCEvent INST_SPEC = {0x1B, CORE, "speculative-instructions"};
+// Instruction architecturally executed, condition code check pass, write to
+// TTBR
+constexpr PMCEvent TTBR_WRITE_RETIRED = {0x1C, CORE, "ttbr-writes"};
 // Bus cycle
 constexpr PMCEvent BUS_CYCLES = {0x1D, CORE, "bus-cycles"};
 // For an odd numbered counter, increment when an overflow occurs on the
@@ -235,6 +378,10 @@ constexpr PMCEvent BRANCH_MISS = {0x22, CORE, "branch-misses"};
 constexpr PMCEvent STALL_FRONTEND = {0x23, CORE, "frontend-stalls"};
 // No operation issued because of the backend
 constexpr PMCEvent STALL_BACKEND = {0x24, CORE, "backend-stalls"};
+// Attributable Level 1 data TLB access
+constexpr PMCEvent L1D_TLB = {0x25, CORE, "l1d-tlb-accesses"};
+// Attributable Level 1 instruction TLB access
+constexpr PMCEvent L1I_TLB = {0x26, CORE, "l1i-tlb-accesses"};
 // Attributable Level 2 instruction cache access
 constexpr PMCEvent L2I_CACHE = {0x27, CORE, "l2i-cache-accesses"};
 // Attributable Level 2 instruction cache refill
@@ -247,6 +394,16 @@ constexpr PMCEvent L3D_CACHE_REFILL = {0x2A, CORE, "l3d-cache-refills"};
 constexpr PMCEvent L3D_CACHE = {0x2B, CORE, "l3d-cache-accesses"};
 // Attributable Level 3 data cache access write-back
 constexpr PMCEvent L3D_CACHE_WB = {0x2C, CORE, "l3d-cache-writebacks"};
+// Attributable Level 2 unified TLB refill
+constexpr PMCEvent L2D_TLB_REFILL = {0x2D, CORE, "l2d-tlb-refills"};
+// Attributable Level 2 unified TLB access
+constexpr PMCEvent L2D_TLB = {0x2F, CORE, "l2d-tlb-accesses"};
+// Access to another socket in a multi-socket system
+constexpr PMCEvent REMOTE_ACCESS = {0x31, CORE, "remote-accesses"};
+// Data TLB access with at least one translation table walk
+constexpr PMCEvent DTLB_WALK = {0x34, CORE, "dtlb-walks"};
+// Instruction TLB access with at least one translation table walk
+constexpr PMCEvent ITLB_WALK = {0x35, CORE, "itlb-walks"};
 // Last level data cache read
 constexpr PMCEvent LL_CACHE = {0x36, CORE, "ll-cache-accesses"};
 // Last level data cache read miss
@@ -267,7 +424,32 @@ constexpr PMCEvent STALL_OP_FRONTEND = {0x3E, CORE, ""};
 constexpr PMCEvent STALL_OP = {0x3F, CORE, ""};
 
 // Level 2 data cache long-latency read miss (Armv8.4/Armv9 0x40xx range).
-constexpr PMCEvent L2D_CACHE_MISS = {0x4009, CORE, "l2d-cache-misses"};
+constexpr PMCEvent L2D_CACHE_LMISS_RD = {0x4009, CORE, "l2d-cache-misses"};
+
+inline const PMCEvent L2D_CACHE_MISS =
+    pmu_event_support(L2D_CACHE_LMISS_RD.bitmap) == event_support::yes
+        ? L2D_CACHE_LMISS_RD
+        : L2D_CACHE_REFILL;
 } // namespace PERF_COUNT_HW
+
+inline void pmu_dump_state() {
+  uint64_t pmcnten;
+  asm volatile("mrs %0, pmcntenset_el0" : "=r"(pmcnten));
+  std::cout << "PMU: midr=0x" << std::hex << midr_read() << " pmcr=0x"
+            << pmcr_read() << " pmceid0=0x" << pmceid0_read() << " pmceid1=0x"
+            << pmceid1_read() << " pmcntenset=0x" << pmcnten << std::dec
+            << " counters=" << pmu_num_counters()
+            << " event-counter-width=" << pmu_probe_event_counter_width()
+            << std::endl;
+
+  std::cout << "PMU implemented events:";
+  for (uint64_t e = 0; e < 0x40; ++e)
+    if (pmu_event_support(e) == event_support::yes)
+      std::cout << " 0x" << std::hex << e;
+  for (uint64_t e = 0x4000; e < 0x4040; ++e)
+    if (pmu_event_support(e) == event_support::yes)
+      std::cout << " 0x" << std::hex << e;
+  std::cout << std::dec << std::endl;
+}
 
 } // namespace perf

@@ -54,7 +54,9 @@ void watch_pressure(pressure_watcher &w, pressure_fn cb, unsigned order);
 
 bool under_pressure();
 void check_pressure();
-bool reclaim();
+// Ask the watchers, lowest order first, until free memory has grown by "bytes"
+// or all have been asked. True if any gave something.
+bool reclaim(size_t bytes);
 
 // Boot. add_region() collects memory before there is an allocator to put it in;
 // init() builds llfree and hands it everything still unused.

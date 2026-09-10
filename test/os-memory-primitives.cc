@@ -1,62 +1,800 @@
 /*
- * The memory primitives, which only miniOSv has: the frame allocator and the
- * address space layer, called directly rather than through malloc and mmap.
+ * The memory primitives: vspace, frames and mapping, plus map_phys, map_phys_at
+ * and vm_fault. One header per function of the public interface, with the
+ * tests of that function listed under it, in the order of docs/memory-primitives.md.
+ * What the heap and the page cache make of these is in os-memory.cc.
  *
- * The test application is linked into the kernel, so it can call them at all;
- * that it can is itself part of what is being checked, since the point of the
- * layers is that an application can reach past the defaults and manage memory
- * itself. What an ordinary program sees is in os-memory.cc.
+ * The test application is linked into the kernel, which is what lets it call
+ * them. The boot-only functions (frames::add_region, init, enable_percpu,
+ * boot_alloc) have run by the time anything here does and are not covered.
  */
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <map>
+#include <set>
 #include <thread>
 #include <vector>
 
-#include <malloc.h>
-#include <sys/mman.h>
-
 #include <osv/align.hh>
 #include <osv/debug.hh>
-#include <osv/mem/early.hh>
+#include <osv/mem/fault.hh>
 #include <osv/mem/frames.hh>
-#include <osv/mem/heap.hh>
 #include <osv/mem/mapping.hh>
-#include <osv/mem/pagecache.hh>
 #include <osv/mem/phys.hh>
-#include <osv/mem/store.hh>
 #include <osv/mem/vspace.hh>
 
-#include "core/mem/linear.hh"
 #include "mem-test.hh"
 
 using namespace memtest;
 
 namespace {
 
-const size_t page = mem::frames::page_size;
-const size_t huge = mem::mapping::huge_page_size;
+namespace vs = mem::vspace;
+namespace fr = mem::frames;
+namespace map = mem::mapping;
+using resa = vs::resa_result;
 
-using resa = mem::vspace::resa_result;
+const size_t page = fr::page_size;
+const size_t huge = map::huge_page_size;
+
+// Physical memory the allocator handed out, through the documented route.
+char *view(fr::phys_addr pa, size_t bytes = page)
+{
+    return static_cast<char *>(mem::map_phys(pa, bytes));
+}
+
+// A read the compiler cannot hoist, for what a TLB may still hold.
+char peek(uintptr_t addr)
+{
+    return *reinterpret_cast<volatile char *>(addr);
+}
+
+// A reservation to write translations into. Nothing else hands these addresses
+// out, and no test leaves one attached, so no fault ever lands in one.
+struct scratch {
+    vs::region r;
+    explicit scratch(size_t bytes, size_t align = page)
+    {
+        CHECK(vs::reserve(r, bytes, align) == resa::success);
+    }
+    ~scratch() { vs::release(r); }
+    uintptr_t start() const { return r.span.start; }
+    char *ptr(size_t off = 0) const { return reinterpret_cast<char *>(r.span.start + off); }
+    mem::range range(size_t off, size_t len) const
+    {
+        return {r.span.start + off, r.span.start + off + len};
+    }
+};
+
+// Frames taken to push the allocator somewhere: 2 MiB blocks while they last,
+// then pages. Everything goes back when it is destroyed.
+struct hoard {
+    std::vector<fr::phys_addr> blocks, pages;
+    size_t bytes = 0;
+
+    hoard()
+    {
+        blocks.reserve(fr::total_available_bytes() / huge + 1);
+        pages.reserve(std::min<size_t>(fr::total_available_bytes() / page, 1u << 20));
+    }
+    ~hoard()
+    {
+        for (auto p : pages) {
+            fr::free(p);
+        }
+        for (auto b : blocks) {
+            fr::free(b, huge);
+        }
+    }
+    // Takes until stop() says so. False if the allocator emptied first.
+    template <typename F>
+    bool take_until(F stop)
+    {
+        while (!stop()) {
+            auto b = fr::alloc(huge, huge);
+            if (b != fr::no_memory) {
+                blocks.push_back(b);
+                bytes += huge;
+                continue;
+            }
+            auto p = fr::alloc();
+            if (p == fr::no_memory || pages.size() == pages.capacity()) {
+                if (p != fr::no_memory) {
+                    fr::free(p);
+                }
+                return false;
+            }
+            pages.push_back(p);
+            bytes += page;
+        }
+        return true;
+    }
+};
+
+/* vspace ------------------------------------------------------------------ */
+
+// A registered region may not move, so the churn tests keep theirs in vectors
+// sized up front.
+uint32_t lcg(uint32_t &seed)
+{
+    seed = seed * 1103515245u + 12345u;
+    return seed >> 8;
+}
+
+void vspace_app_window()
+{
+    function("vspace::app_window");
+
+    test("the window is the documented range, page aligned and not empty");
+    {
+        mem::range w = vs::app_window();
+        CHECK(w.start == 0x200000000000ul);
+        CHECK(w.end == 0x400000000000ul);
+        CHECK(w.start % page == 0);
+        CHECK(w.end % page == 0);
+        CHECK(!w.empty());
+    }
+
+    test("every reservation lands inside it");
+    {
+        vs::region r{};
+        for (size_t bytes : {page, huge, 1ul << 30}) {
+            CHECK(vs::reserve(r, bytes, page) == resa::success);
+            CHECK(vs::app_window().contains(r.span));
+            vs::release(r);
+        }
+    }
+}
+
+void vspace_reserve()
+{
+    function("vspace::reserve");
+
+    test("the span is as long as asked and aligned as asked");
+    {
+        for (size_t align : {page, huge, 1ul << 30}) {
+            vs::region r{};
+            CHECK(vs::reserve(r, huge, align) == resa::success);
+            CHECK((r.span.start & (align - 1)) == 0);
+            CHECK(r.span.size() == huge);
+            vs::release(r);
+        }
+    }
+
+    test("bytes and align are rounded up to a page");
+    {
+        vs::region r{};
+        CHECK(vs::reserve(r, 1, 1) == resa::success);
+        CHECK(r.span.size() == page);
+        CHECK(r.span.start % page == 0);
+        vs::release(r);
+        CHECK(vs::reserve(r, page + 1, 64) == resa::success);
+        CHECK(r.span.size() == 2 * page);
+        vs::release(r);
+    }
+
+    test("zero bytes is no_space and the region is left alone");
+    {
+        vs::region r{};
+        r.span = {7, 7};
+        CHECK(vs::reserve(r, 0, page) == resa::no_space);
+        CHECK(r.span.start == 7);
+        CHECK(r.span.end == 7);
+    }
+
+    test("more than the window holds is no_space");
+    {
+        vs::region r{};
+        CHECK(vs::reserve(r, vs::app_window().size() + page, page) == resa::no_space);
+    }
+
+    test("only span is written: perm and ops are the caller's");
+    {
+        static const vs::region_ops ops = {nullptr};
+        vs::region r{};
+        r.perm = 0x77;
+        r.ops = &ops;
+        CHECK(vs::reserve(r, page, page) == resa::success);
+        CHECK(r.perm == 0x77);
+        CHECK(r.ops == &ops);
+        vs::release(r);
+    }
+
+    test("reserving costs no physical memory");
+    {
+        vs::region r{};
+        size_t before = fr::free_bytes();
+        CHECK(vs::reserve(r, 64ul << 20, page) == resa::success);
+        CHECK(before - fr::free_bytes() < (1ul << 20));
+        vs::release(r);
+    }
+
+    test("reservations do not overlap");
+    {
+        const int n = 64;
+        std::vector<vs::region> r(n);
+        for (int i = 0; i < n; i++) {
+            CHECK(vs::reserve(r[i], (i % 4 + 1) * page, page) == resa::success);
+        }
+        for (int i = 0; i < n; i++) {
+            for (int j = i + 1; j < n; j++) {
+                CHECK(!r[i].span.intersects(r[j].span));
+            }
+        }
+        for (int i = 0; i < n; i++) {
+            vs::release(r[i]);
+        }
+    }
+
+    test("reservations from several threads do not overlap");
+    {
+        const int per_thread = 16;
+        unsigned threads = n_cpus();
+        std::vector<vs::region> r(threads * per_thread);
+        parallel(threads, [&](unsigned id) {
+            for (int i = 0; i < per_thread; i++) {
+                vs::reserve(r[id * per_thread + i], 1ul << 20, page);
+            }
+        });
+        std::vector<mem::range> spans;
+        for (auto &e : r) {
+            CHECK(!e.span.empty());
+            spans.push_back(e.span);
+        }
+        std::sort(spans.begin(), spans.end(),
+                  [](const mem::range &a, const mem::range &b) { return a.start < b.start; });
+        for (size_t i = 1; i < spans.size(); i++) {
+            CHECK(spans[i - 1].end <= spans[i].start);
+        }
+        for (auto &e : r) {
+            vs::release(e);
+        }
+    }
+
+    test("10000 live reservations are all found");
+    {
+        const int n = 10000;
+        std::vector<vs::region> r(n);
+        int got = 0;
+        for (int i = 0; i < n; i++) {
+            got += vs::reserve(r[i], page, page) == resa::success;
+        }
+        CHECK(got == n);
+        CHECK(vs::self_check());
+        bool found = true;
+        for (int i = 0; i < n; i += 97) {
+            found = found && vs::lookup(r[i].span.start) == &r[i];
+        }
+        CHECK(found);
+        for (int i = 0; i < n; i++) {
+            vs::release(r[i]);
+        }
+        CHECK(vs::self_check());
+    }
+}
+
+void vspace_reserve_at()
+{
+    function("vspace::reserve_at");
+
+    test("an exact range is reserved at that address");
+    {
+        vs::region a{}, b{};
+        CHECK(vs::reserve(a, huge, huge) == resa::success);
+        mem::range span = a.span;
+        vs::release(a);
+        CHECK(vs::reserve_at(b, span) == resa::success);
+        CHECK(b.span.start == span.start);
+        CHECK(b.span.end == span.end);
+        CHECK(vs::lookup(span.start) == &b);
+        vs::release(b);
+    }
+
+    test("the range is rounded outward to whole pages");
+    {
+        vs::region a{}, b{};
+        CHECK(vs::reserve(a, 4 * page, page) == resa::success);
+        mem::range span = a.span;
+        vs::release(a);
+        CHECK(vs::reserve_at(b, {span.start + 100, span.end - 100}) == resa::success);
+        CHECK(b.span.start == span.start);
+        CHECK(b.span.end == span.end);
+        vs::release(b);
+    }
+
+    test("an empty range is no_space");
+    {
+        vs::region a{}, b{};
+        CHECK(vs::reserve(a, page, page) == resa::success);
+        uintptr_t at = a.span.start;
+        vs::release(a);
+        CHECK(vs::reserve_at(b, {at, at}) == resa::no_space);
+        CHECK(vs::reserve_at(b, {at + page, at}) == resa::no_space);
+        CHECK(vs::lookup(at) == nullptr);
+    }
+
+    test("a range already taken, wholly or in part, is already_reserved");
+    {
+        vs::region a{}, b{};
+        CHECK(vs::reserve(a, huge, huge) == resa::success);
+        CHECK(vs::reserve_at(b, a.span) == resa::already_reserved);
+        CHECK(vs::reserve_at(b, {a.span.start + huge / 2, a.span.end + huge}) ==
+              resa::already_reserved);
+        CHECK(vs::reserve_at(b, {a.span.start - page, a.span.start + page}) ==
+              resa::already_reserved);
+        CHECK(vs::lookup(a.span.start) == &a);
+        vs::release(a);
+    }
+
+    test("two exact ranges side by side are both reserved");
+    {
+        vs::region a{}, lo{}, hi{};
+        CHECK(vs::reserve(a, 2 * page, page) == resa::success);
+        mem::range span = a.span;
+        vs::release(a);
+        CHECK(vs::reserve_at(lo, {span.start, span.start + page}) == resa::success);
+        CHECK(vs::reserve_at(hi, {span.start + page, span.end}) == resa::success);
+        CHECK(vs::lookup(span.start) == &lo);
+        CHECK(vs::lookup(span.start + page) == &hi);
+        vs::release(lo);
+        vs::release(hi);
+    }
+}
+
+void vspace_release()
+{
+    function("vspace::release");
+
+    test("a released range is free again");
+    {
+        vs::region a{}, b{};
+        CHECK(vs::reserve(a, huge, page) == resa::success);
+        mem::range span = a.span;
+        vs::release(a);
+        CHECK(!vs::reserved(span));
+        CHECK(vs::lookup(span.start) == nullptr);
+        CHECK(vs::reserve_at(b, span) == resa::success);
+        vs::release(b);
+    }
+
+    test("releasing one region leaves its neighbours");
+    {
+        std::vector<vs::region> r(3);
+        for (auto &e : r) {
+            CHECK(vs::reserve(e, page, page) == resa::success);
+        }
+        vs::release(r[1]);
+        CHECK(vs::lookup(r[0].span.start) == &r[0]);
+        CHECK(vs::lookup(r[2].span.start) == &r[2]);
+        CHECK(vs::lookup(r[1].span.start) == nullptr);
+        vs::release(r[0]);
+        vs::release(r[2]);
+    }
+
+    test("the index survives a random reserve/release sequence");
+    {
+        const int n = 512;
+        std::vector<vs::region> r(n);
+        std::vector<bool> live(n, false);
+        uint32_t seed = 20260819;
+        for (int i = 0; i < 4000; i++) {
+            int at = lcg(seed) % n;
+            if (live[at]) {
+                vs::release(r[at]);
+                live[at] = false;
+            } else {
+                size_t size = (lcg(seed) % 16 + 1) * page;
+                live[at] = vs::reserve(r[at], size, page) == resa::success;
+            }
+        }
+        CHECK(vs::self_check());
+        for (int i = 0; i < n; i++) {
+            if (live[i]) {
+                vs::release(r[i]);
+            }
+        }
+        CHECK(vs::self_check());
+    }
+}
+
+void vspace_lookup()
+{
+    function("vspace::lookup");
+
+    test("the region holding an address, edges included, and nothing outside");
+    {
+        vs::region r{};
+        CHECK(vs::reserve(r, huge, page) == resa::success);
+        uintptr_t a = r.span.start;
+        CHECK(vs::lookup(a) == &r);
+        CHECK(vs::lookup(a + huge - 1) == &r);
+        CHECK(vs::lookup(a + huge) != &r);
+        CHECK(vs::lookup(a - 1) != &r);
+        vs::release(r);
+        CHECK(vs::lookup(a) == nullptr);
+    }
+
+    test("every page of a region resolves to it, and the pointer is the caller's region");
+    {
+        vs::region r{};
+        CHECK(vs::reserve(r, huge, page) == resa::success);
+        bool inside = true;
+        for (size_t off = 0; off < huge; off += page) {
+            inside = inside && vs::lookup(r.span.start + off) == &r;
+        }
+        CHECK(inside);
+        r.perm = mem::perm_read;
+        CHECK(vs::lookup(r.span.start)->perm == mem::perm_read);
+        vs::release(r);
+    }
+
+    test("lookups stay correct while the index is rebuilt underneath them");
+    {
+        const int stable_n = 256;
+        const int churn_n = 256;
+        std::vector<vs::region> stable(stable_n);
+        std::vector<vs::region> churn(churn_n);
+        for (int i = 0; i < stable_n; i++) {
+            CHECK(vs::reserve(stable[i], page, page) == resa::success);
+        }
+
+        std::atomic<bool> stop{false};
+        std::atomic<long> wrong{0};
+        std::atomic<long> missing{0};
+        std::atomic<long> done{0};
+        unsigned threads = std::max(2u, std::min(n_cpus(), 16u));
+
+        parallel(threads, [&](unsigned id) {
+            if (id == 0) {
+                std::vector<bool> live(churn_n, false);
+                uint32_t seed = 99194853;
+                for (int round = 0; round < 20000; round++) {
+                    int at = lcg(seed) % churn_n;
+                    if (live[at]) {
+                        vs::release(churn[at]);
+                        live[at] = false;
+                    } else {
+                        live[at] = vs::reserve(churn[at], page, page) == resa::success;
+                    }
+                }
+                for (int i = 0; i < churn_n; i++) {
+                    if (live[i]) {
+                        vs::release(churn[i]);
+                    }
+                }
+                stop.store(true);
+                return;
+            }
+            uint32_t seed = id * 2654435761u + 1;
+            while (!stop.load(std::memory_order_relaxed)) {
+                for (int k = 0; k < 64; k++) {
+                    int i = lcg(seed) % stable_n;
+                    auto *found = vs::lookup(stable[i].span.start);
+                    if (!found) {
+                        missing.fetch_add(1, std::memory_order_relaxed);
+                    } else if (found != &stable[i]) {
+                        wrong.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    done.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        });
+
+        CHECK(done.load() > 0);
+        CHECK(missing.load() == 0);
+        CHECK(wrong.load() == 0);
+        CHECK(vs::self_check());
+        printf("\t  %ld lookups against 20000 reserve/release rounds\n", done.load());
+        for (int i = 0; i < stable_n; i++) {
+            vs::release(stable[i]);
+        }
+    }
+}
+
+void vspace_reserved()
+{
+    function("vspace::reserved");
+
+    test("a region, and any part of it, is reserved");
+    {
+        vs::region r{};
+        CHECK(vs::reserve(r, 4 * page, page) == resa::success);
+        uintptr_t a = r.span.start;
+        CHECK(vs::reserved(r.span));
+        CHECK(vs::reserved({a + page, a + 2 * page}));
+        CHECK(vs::reserved({a + 1, a + 2}));
+        vs::release(r);
+        CHECK(!vs::reserved({a, a + page}));
+    }
+
+    test("a range reaching past a region is not");
+    {
+        // The middle page of three, so that both sides are known to be free.
+        vs::region wide{}, r{};
+        CHECK(vs::reserve(wide, 3 * page, page) == resa::success);
+        uintptr_t a = wide.span.start + page;
+        vs::release(wide);
+        CHECK(vs::reserve_at(r, {a, a + page}) == resa::success);
+        CHECK(!vs::reserved({a - page, a + page}));
+        CHECK(!vs::reserved({a, a + 2 * page}));
+        CHECK(!vs::reserved({a - page, a + 2 * page}));
+        CHECK(vs::reserved({a, a + page}));
+        vs::release(r);
+    }
+
+    test("a range covered by several regions is, and not once one of them goes");
+    {
+        vs::region a{}, lo{}, hi{};
+        CHECK(vs::reserve(a, 2 * page, page) == resa::success);
+        mem::range span = a.span;
+        vs::release(a);
+        CHECK(vs::reserve_at(lo, {span.start, span.start + page}) == resa::success);
+        CHECK(vs::reserve_at(hi, {span.start + page, span.end}) == resa::success);
+        CHECK(vs::reserved(span));
+        vs::release(hi);
+        CHECK(!vs::reserved(span));
+        CHECK(vs::reserved({span.start, span.start + page}));
+        vs::release(lo);
+    }
+}
+
+void vspace_accounting()
+{
+    function("vspace::reserved_bytes, vspace::count");
+
+    test("both rise with a reservation and fall with its release");
+    {
+        const size_t size = 1ul << 20;
+        const int n = 8;
+        std::vector<vs::region> r(n);
+        size_t regions_before = vs::count();
+        size_t bytes_before = vs::reserved_bytes();
+        for (int i = 0; i < n; i++) {
+            CHECK(vs::reserve(r[i], size, page) == resa::success);
+            CHECK(vs::count() == regions_before + i + 1);
+            CHECK(vs::reserved_bytes() == bytes_before + (i + 1) * size);
+        }
+        for (int i = 0; i < n; i++) {
+            vs::release(r[i]);
+        }
+        CHECK(vs::count() == regions_before);
+        CHECK(vs::reserved_bytes() == bytes_before);
+    }
+
+    test("the rounded size is what is counted");
+    {
+        vs::region r{};
+        size_t before = vs::reserved_bytes();
+        CHECK(vs::reserve(r, 1, 1) == resa::success);
+        CHECK(vs::reserved_bytes() == before + page);
+        vs::release(r);
+    }
+}
+
+void vspace_for_each()
+{
+    function("vspace::for_each");
+
+    test("every live region is visited once, as the caller's object, with the argument");
+    {
+        struct visit {
+            std::set<const vs::region *> seen;
+            size_t calls = 0;
+            size_t bytes = 0;
+        };
+        const int n = 8;
+        std::vector<vs::region> r(n);
+        for (int i = 0; i < n; i++) {
+            CHECK(vs::reserve(r[i], (i + 1) * page, page) == resa::success);
+        }
+        visit v;
+        vs::for_each([](const vs::region &e, void *arg) {
+            auto *s = static_cast<visit *>(arg);
+            s->calls++;
+            s->seen.insert(&e);
+            s->bytes += e.span.size();
+        }, &v);
+        CHECK(v.calls == vs::count());
+        CHECK(v.seen.size() == v.calls);
+        CHECK(v.bytes == vs::reserved_bytes());
+        bool ours = true;
+        for (int i = 0; i < n; i++) {
+            ours = ours && v.seen.count(&r[i]);
+        }
+        CHECK(ours);
+        for (int i = 0; i < n; i++) {
+            vs::release(r[i]);
+        }
+    }
+}
+
+void vspace_self_check()
+{
+    function("vspace::self_check");
+
+    test("the index is consistent now, and after a burst of reservations");
+    {
+        CHECK(vs::self_check());
+        const int n = 1000;
+        std::vector<vs::region> r(n);
+        for (int i = 0; i < n; i++) {
+            CHECK(vs::reserve(r[i], page, page) == resa::success);
+        }
+        CHECK(vs::self_check());
+        for (int i = 0; i < n; i += 2) {
+            vs::release(r[i]);
+        }
+        CHECK(vs::self_check());
+        for (int i = 1; i < n; i += 2) {
+            vs::release(r[i]);
+        }
+        CHECK(vs::self_check());
+    }
+}
+
+void vspace_perf()
+{
+    group("vspace - performance");
+
+    section("reserve + release");
+    {
+        struct { const char *name; size_t size; int n; } cases[] = {
+            {"4 KiB",  4ul << 10, 20000},
+            {"2 MiB",  2ul << 20, 20000},
+            {"64 MiB", 64ul << 20, 2000},
+        };
+        for (auto &c : cases) {
+            vs::region r{};
+            auto t0 = clk::now();
+            for (int i = 0; i < c.n; i++) {
+                vs::reserve(r, c.size, page);
+                vs::release(r);
+            }
+            char label[64];
+            snprintf(label, sizeof(label), "reserve + release %s", c.name);
+            report_ns(label, since(t0), c.n);
+        }
+    }
+
+    section("reserve + release, scaling");
+    {
+        const int total = 40000;
+        for (unsigned t = 1; t <= n_cpus(); t *= 2) {
+            const int n = share(total, t, 64);
+            double s = parallel(t, [&](unsigned) {
+                vs::region r{};
+                for (int i = 0; i < n; i++) {
+                    vs::reserve(r, 2ul << 20, page);
+                    vs::release(r);
+                }
+            });
+            report_scale("reserve + release 2 MiB", t, static_cast<double>(n) * t, s);
+        }
+    }
+
+    section("lookup");
+    {
+        for (int live : {1, 100, 1000, 10000}) {
+            std::vector<vs::region> r(live);
+            for (int i = 0; i < live; i++) {
+                vs::reserve(r[i], page, page);
+            }
+            const int probes = 200000;
+            uintptr_t target = r[live / 2].span.start;
+            auto t0 = clk::now();
+            for (int i = 0; i < probes; i++) {
+                escape(vs::lookup(target));
+            }
+            char label[64];
+            snprintf(label, sizeof(label), "lookup with %d live regions", live);
+            report_ns(label, since(t0), probes);
+            for (int i = 0; i < live; i++) {
+                vs::release(r[i]);
+            }
+        }
+    }
+
+    section("lookup, scaling");
+    {
+        const int live = 1000;
+        std::vector<vs::region> r(live);
+        for (int i = 0; i < live; i++) {
+            vs::reserve(r[i], page, page);
+        }
+        const int probes = 200000;
+        for (unsigned t = 1; t <= n_cpus(); t *= 2) {
+            double s = parallel(t, [&](unsigned id) {
+                uintptr_t target = r[(id * 37) % live].span.start;
+                for (int i = 0; i < probes; i++) {
+                    escape(vs::lookup(target));
+                }
+            });
+            report_scale("lookup, 1000 live regions", t,
+                         static_cast<double>(probes) * t, s);
+        }
+        for (int i = 0; i < live; i++) {
+            vs::release(r[i]);
+        }
+    }
+}
 
 /* frames ------------------------------------------------------------------ */
 
-void frames_functional()
-{
-    group("frames");
+// Two pressure watchers of the test's own, either side of the cache and the
+// heap. The list keeps them forever, so they are armed only while a test
+// looks, and can hold blocks to give back when asked.
+std::atomic<int> tick{0};
 
-    section("frames are distinct, aligned and writable");
+struct spy {
+    fr::pressure_watcher w;
+    std::atomic<bool> armed{false};
+    std::atomic<int> calls{0}, last{0};
+    std::atomic<bool> inner{true};      // what reclaim() answered from inside
+    std::vector<fr::phys_addr> blocks;
+
+    void reset()
+    {
+        calls = 0;
+        last = 0;
+        inner = true;
+    }
+    bool asked()
+    {
+        if (!armed.load()) {
+            return false;
+        }
+        calls.fetch_add(1);
+        last.store(tick.fetch_add(1) + 1);
+        inner.store(fr::reclaim(page));
+        bool gave = !blocks.empty();
+        for (auto b : blocks) {
+            fr::free(b, huge);
+        }
+        blocks.clear();
+        return gave;
+    }
+};
+
+spy low, high;
+bool low_asked() { return low.asked(); }
+bool high_asked() { return high.asked(); }
+
+void register_spies()
+{
+    static bool done = false;
+    if (!done) {
+        done = true;
+        fr::watch_pressure(low.w, low_asked, 5);
+        fr::watch_pressure(high.w, high_asked, 99);
+    }
+}
+
+// The pool a watcher hands back when asked.
+void stock(spy &s, unsigned blocks)
+{
+    for (unsigned i = 0; i < blocks; i++) {
+        auto b = fr::alloc(huge, huge);
+        CHECK(b != fr::no_memory);
+        s.blocks.push_back(b);
+    }
+}
+
+void frames_alloc()
+{
+    function("frames::alloc");
+
+    test("frames are page aligned, distinct and writable");
     {
         const int n = 64;
-        void *p[n];
+        fr::phys_addr p[n];
         for (int i = 0; i < n; i++) {
-            p[i] = mem::frames::to_linear(mem::frames::alloc());
-            CHECK(p[i] != nullptr);
-            CHECK((reinterpret_cast<uintptr_t>(p[i]) % page) == 0);
-            memset(p[i], 0xa5, page);
+            p[i] = fr::alloc();
+            CHECK(p[i] != fr::no_memory);
+            CHECK(p[i] % page == 0);
+            memset(view(p[i]), 0xa5, page);
         }
         for (int i = 0; i < n; i++) {
             for (int j = i + 1; j < n; j++) {
@@ -64,90 +802,429 @@ void frames_functional()
             }
         }
         for (int i = 0; i < n; i++) {
-            CHECK(static_cast<unsigned char *>(p[i])[page - 1] == 0xa5);
-            mem::frames::free(mem::frames::from_linear(p[i]));
+            CHECK(static_cast<unsigned char>(view(p[i])[page - 1]) == 0xa5);
+            fr::free(p[i]);
         }
     }
 
-    section("a frame is in the linear map and round-trips to its address");
+    test("align below a page is a page, and above it is honoured");
     {
-        mem::frames::phys_addr pa = mem::frames::alloc();
-        CHECK(pa != mem::frames::no_memory);
-        void *v = mem::frames::to_linear(pa);
-        CHECK(mem::frames::from_linear(v) == pa);
-        CHECK(mem::frames::in_linear_map(v, page));
-        CHECK((pa & (page - 1)) == 0);
-        mem::frames::free(pa);
-    }
-
-    section("a 2 MiB frame is 2 MiB aligned");
-    {
-        void *h = mem::frames::to_linear(mem::frames::alloc(huge, huge));
-        CHECK(h != nullptr);
-        if (h) {
-            CHECK((reinterpret_cast<uintptr_t>(h) & (huge - 1)) == 0);
-            memset(h, 0x5a, huge);
-            mem::frames::free(mem::frames::from_linear(h), huge);
+        struct { size_t bytes, align; } cases[] = {
+            {page, 1}, {page, huge}, {page, 4 * huge}, {huge, huge}, {3 * huge, 4 * huge},
+        };
+        for (auto &c : cases) {
+            auto p = fr::alloc(c.bytes, c.align);
+            CHECK(p != fr::no_memory);
+            CHECK(p % std::max(c.align, page) == 0);
+            memset(view(p, c.bytes), 0x5a, c.bytes);
+            fr::free(p, c.bytes);
         }
     }
 
-    section("a contiguous allocation really is contiguous");
+    test("zero bytes is no_memory");
     {
-        const size_t sizes[] = {1ul << 20, 8ul << 20};
-        for (size_t size : sizes) {
-            mem::frames::phys_addr pa = mem::frames::alloc(size, page);
-            void *p = pa ? mem::map_phys(pa, size) : nullptr;
-            CHECK(p != nullptr);
-            if (!p) {
-                continue;
+        CHECK(fr::alloc(0) == fr::no_memory);
+        CHECK(fr::alloc(0, huge) == fr::no_memory);
+    }
+
+    test("bytes is rounded to whole frames");
+    {
+        size_t before = fr::free_bytes();
+        auto p = fr::alloc(1);
+        CHECK(p != fr::no_memory);
+        CHECK(before - fr::free_bytes() == page);
+        memset(view(p), 0x11, page);
+        fr::free(p, 1);
+        CHECK(fr::free_bytes() == before);
+    }
+
+    test("up to one block the count is rounded to a power of two");
+    {
+        // Three frames are served as four: the accounting says so, and the
+        // fourth is the caller's to use.
+        size_t before = fr::free_bytes();
+        auto p = fr::alloc(3 * page);
+        CHECK(p != fr::no_memory);
+        CHECK(before - fr::free_bytes() == 4 * page);
+        memset(view(p, 4 * page), 0x22, 4 * page);
+        auto q = fr::alloc(3 * page);
+        CHECK(q >= p + 4 * page || q + 4 * page <= p);
+        fr::free(q, 3 * page);
+        fr::free(p, 3 * page);
+        CHECK(fr::free_bytes() == before);
+
+        before = fr::free_bytes();
+        p = fr::alloc(huge - page);
+        CHECK(before - fr::free_bytes() == huge);
+        fr::free(p, huge - page);
+    }
+
+    test("above one block the count is exact");
+    {
+        size_t before = fr::free_bytes();
+        auto p = fr::alloc(513 * page);
+        CHECK(p != fr::no_memory);
+        CHECK(before - fr::free_bytes() == 513 * page);
+        memset(view(p, 513 * page), 0x33, 513 * page);
+        fr::free(p, 513 * page);
+        CHECK(fr::free_bytes() == before);
+    }
+
+    test("a contiguous run is the caller's from end to end");
+    {
+        // Nothing handed out afterwards falls inside it, and what was written
+        // is still there.
+        const size_t size = 8ul << 20;
+        auto p = fr::alloc(size, page);
+        CHECK(p != fr::no_memory);
+        char *v = view(p, size);
+        memset(v, 0x44, size);
+        std::vector<fr::phys_addr> others(4096);
+        bool inside = false;
+        for (auto &o : others) {
+            o = fr::alloc();
+            inside = inside || (o >= p && o < p + size);
+        }
+        CHECK(!inside);
+        for (auto o : others) {
+            fr::free(o);
+        }
+        bool kept = true;
+        for (size_t off = 0; off < size; off += page) {
+            kept = kept && static_cast<unsigned char>(v[off]) == 0x44;
+        }
+        CHECK(kept);
+        fr::free(p, size);
+    }
+
+    test("nothing free after reclaim is no_memory");
+    {
+        // Taken down to nothing, the allocator says so rather than failing
+        // some other way, and gives everything back in one piece.
+        register_spies();
+        size_t before = fr::free_bytes();
+        {
+            hoard h;
+            bool emptied = !h.take_until([] { return false; });
+            if (emptied) {
+                CHECK(fr::alloc() == fr::no_memory);
+                CHECK(fr::alloc(huge, huge) == fr::no_memory);
+            } else {
+                printf("\t  not emptied: the page list filled first\n");
             }
-            mem::frames::phys_addr base = mem::mapping::to_phys(p);
-            bool ok = true;
-            for (size_t off = 0; off < size; off += page) {
-                ok = ok && mem::mapping::to_phys(static_cast<char *>(p) + off) == base + off;
-            }
-            CHECK(ok);
-            mem::frames::free(pa, size);
+            printf("\t  %zu MiB taken before the allocator was empty\n", h.bytes >> 20);
         }
+        // The hoard's own lists cost the heap a page or two.
+        CHECK(fr::free_bytes() + (4ul << 20) >= before);
+    }
+}
+
+void frames_free()
+{
+    function("frames::free");
+
+    test("a freed frame is counted free again and handed out again");
+    {
+        size_t before = fr::free_bytes();
+        auto p = fr::alloc();
+        CHECK(fr::free_bytes() == before - page);
+        fr::free(p);
+        CHECK(fr::free_bytes() == before);
+        // Out and back 4096 times: an allocator that never reused a frame
+        // would touch 4096 of them.
+        std::set<fr::phys_addr> seen;
+        for (int i = 0; i < 4096; i++) {
+            auto q = fr::alloc();
+            seen.insert(q);
+            fr::free(q);
+        }
+        CHECK(seen.size() < 4096);
     }
 
-    section("a pressure watcher registered by the application is asked");
+    test("free takes the size alloc was given");
     {
-        // The list keeps the watcher forever, so it must not live on the stack.
-        static std::atomic<int> asked{0};
-        static mem::frames::pressure_watcher w;
-        mem::frames::watch_pressure(w, [] {
-            asked.fetch_add(1);
-            return false;
-        }, 99);
-        int before = asked.load();
-        mem::frames::reclaim();
-        CHECK(asked.load() > before);
+        size_t before = fr::free_bytes();
+        auto p = fr::alloc(3 * page);
+        auto q = fr::alloc(513 * page);
+        CHECK(before - fr::free_bytes() == 517 * page);
+        fr::free(p, 3 * page);
+        CHECK(before - fr::free_bytes() == 513 * page);
+        fr::free(q, 513 * page);
+        CHECK(fr::free_bytes() == before);
     }
 
-    section("free memory falls while frames are out and returns after");
+    test("no_memory and zero bytes are ignored");
     {
-        // The per-cpu pools sit between frames::alloc and the accounting, so the
-        // counter lags by up to a pool's worth. The drift is printed rather than
-        // asserted tightly.
-        const size_t slack = 64ul << 20;
-        size_t before = mem::frames::free_bytes();
+        size_t before = fr::free_bytes();
+        fr::free(fr::no_memory);
+        auto p = fr::alloc();
+        fr::free(p, 0);
+        CHECK(fr::free_bytes() == before - page);
+        fr::free(p);
+        CHECK(fr::free_bytes() == before);
+    }
+
+    test("4096 frames out and back leave the count where it was");
+    {
+        size_t before = fr::free_bytes();
         const int n = 4096;
-        std::vector<void *> p(n);
+        std::vector<fr::phys_addr> p(n);
         for (int i = 0; i < n; i++) {
-            p[i] = mem::frames::to_linear(mem::frames::alloc());
+            p[i] = fr::alloc();
         }
-        size_t during = mem::frames::free_bytes();
-        CHECK(during <= before);
+        CHECK(fr::free_bytes() == before - n * page);
         for (int i = 0; i < n; i++) {
-            mem::frames::free(mem::frames::from_linear(p[i]));
+            fr::free(p[i]);
         }
-        size_t after = mem::frames::free_bytes();
-        CHECK(after >= during);
-        CHECK(after + slack >= before);
-        printf("      total %zu MiB, free %zu MiB, drift after %d pages: %ld KiB\n",
-               mem::frames::total_available_bytes() >> 20, after >> 20, n,
-               (static_cast<long>(before) - static_cast<long>(after)) >> 10);
+        CHECK(fr::free_bytes() == before);
+    }
+
+    test("frames freed on another cpu than they came from");
+    {
+        unsigned threads = std::max(2u, std::min(n_cpus(), 8u));
+        const int per_thread = 512;
+        std::vector<fr::phys_addr> p(threads * per_thread);
+        parallel(threads, [&](unsigned id) {
+            for (int i = 0; i < per_thread; i++) {
+                p[id * per_thread + i] = fr::alloc();
+            }
+        });
+        // Thread stacks come from the heap, which keeps what it took, so the
+        // count is compared from here and with room for that.
+        size_t during = fr::free_bytes();
+        parallel(threads, [&](unsigned id) {
+            unsigned from = (id + 1) % threads;
+            for (int i = 0; i < per_thread; i++) {
+                fr::free(p[from * per_thread + i]);
+            }
+        });
+        CHECK(fr::free_bytes() + (4ul << 20) >= during + threads * per_thread * page);
+    }
+}
+
+void frames_accounting()
+{
+    function("frames::free_bytes, frames::total_available_bytes, frames::phys_mem_size");
+
+    test("free is at most what the allocator holds, which is less than the RAM reported");
+    {
+        CHECK(fr::free_bytes() > 0);
+        CHECK(fr::free_bytes() <= fr::total_available_bytes());
+        CHECK(fr::total_available_bytes() < fr::phys_mem_size);
+        printf("\t  reported %zu MiB, allocator %zu MiB, free %zu MiB\n",
+               fr::phys_mem_size >> 20, fr::total_available_bytes() >> 20,
+               fr::free_bytes() >> 20);
+    }
+
+    test("free follows allocations, the total does not");
+    {
+        size_t total = fr::total_available_bytes();
+        size_t before = fr::free_bytes();
+        auto p = fr::alloc(huge, huge);
+        CHECK(fr::free_bytes() == before - huge);
+        CHECK(fr::total_available_bytes() == total);
+        fr::free(p, huge);
+        CHECK(fr::free_bytes() == before);
+        CHECK(fr::total_available_bytes() == total);
+    }
+
+    test("ready() is true once the allocator exists");
+    {
+        CHECK(fr::ready());
+    }
+}
+
+void frames_watch_pressure()
+{
+    function("frames::watch_pressure");
+
+    test("a registered watcher is asked when memory is reclaimed");
+    {
+        register_spies();
+        low.reset();
+        low.armed = true;
+        fr::reclaim(fr::total_available_bytes());
+        low.armed = false;
+        CHECK(low.calls.load() == 1);
+    }
+
+    test("watchers are asked lowest order first");
+    {
+        register_spies();
+        low.reset();
+        high.reset();
+        low.armed = high.armed = true;
+        fr::reclaim(fr::total_available_bytes());
+        low.armed = high.armed = false;
+        CHECK(low.calls.load() == 1);
+        CHECK(high.calls.load() == 1);
+        CHECK(low.last.load() < high.last.load());
+    }
+}
+
+void frames_under_pressure()
+{
+    function("frames::under_pressure");
+
+    test("false with memory to spare, true below the threshold, false again after");
+    {
+        register_spies();
+        // Start from a quiet allocator: anything the clients hold is asked back.
+        while (fr::reclaim(fr::total_available_bytes())) {
+        }
+        CHECK(!fr::under_pressure());
+        {
+            hoard h;
+            bool reached = h.take_until([] { return fr::under_pressure(); });
+            CHECK(reached);
+            CHECK(fr::under_pressure());
+            printf("\t  under pressure after taking %zu of %zu MiB\n",
+                   h.bytes >> 20, fr::total_available_bytes() >> 20);
+        }
+        CHECK(!fr::under_pressure());
+    }
+}
+
+void frames_check_pressure()
+{
+    function("frames::check_pressure");
+
+    test("above the threshold nobody is asked");
+    {
+        register_spies();
+        while (fr::reclaim(fr::total_available_bytes())) {
+        }
+        low.reset();
+        low.armed = true;
+        fr::check_pressure();
+        low.armed = false;
+        CHECK(!fr::under_pressure());
+        CHECK(low.calls.load() == 0);
+    }
+
+    test("below it the watchers are asked until the shortfall is covered");
+    {
+        register_spies();
+        hoard h;
+        // The heap holds nothing it could give, so what is asked is visible.
+        while (fr::reclaim(fr::total_available_bytes())) {
+        }
+        CHECK(h.take_until([] { return fr::under_pressure(); }));
+        low.reset();
+        high.reset();
+        low.armed = high.armed = true;
+        fr::check_pressure();
+        low.armed = high.armed = false;
+        CHECK(low.calls.load() == 1);
+        // Nothing gave anything, so every order was asked.
+        CHECK(high.calls.load() == 1);
+
+        // Enough in the lowest order to cover it, and nobody after it is asked.
+        low.reset();
+        high.reset();
+        size_t shortfall = fr::total_available_bytes() / 10;
+        for (size_t i = 0; i < shortfall / huge + 8 && !h.blocks.empty(); i++) {
+            low.blocks.push_back(h.blocks.back());
+            h.blocks.pop_back();
+            h.bytes -= huge;
+        }
+        low.armed = high.armed = true;
+        fr::check_pressure();
+        low.armed = high.armed = false;
+        CHECK(low.calls.load() == 1);
+        CHECK(high.calls.load() == 0);
+        CHECK(!fr::under_pressure());
+    }
+}
+
+void frames_reclaim()
+{
+    function("frames::reclaim");
+
+    test("stops once free memory has grown by the request");
+    {
+        register_spies();
+        low.reset();
+        high.reset();
+        stock(low, 8);
+        low.armed = high.armed = true;
+        size_t before = fr::free_bytes();
+        bool gave = fr::reclaim(4 * huge);
+        low.armed = high.armed = false;
+        CHECK(gave);
+        CHECK(fr::free_bytes() >= before + 4 * huge);
+        CHECK(low.calls.load() == 1);
+        CHECK(high.calls.load() == 0);
+    }
+
+    test("asks every watcher once when the request is not covered");
+    {
+        register_spies();
+        low.reset();
+        high.reset();
+        low.armed = high.armed = true;
+        fr::reclaim(fr::total_available_bytes());
+        low.armed = high.armed = false;
+        CHECK(low.calls.load() == 1);
+        CHECK(high.calls.load() == 1);
+    }
+
+    test("a request of nothing asks nobody and reports nothing given");
+    {
+        register_spies();
+        low.reset();
+        low.armed = true;
+        CHECK(!fr::reclaim(0));
+        low.armed = false;
+        CHECK(low.calls.load() == 0);
+    }
+
+    test("returns whether a watcher gave something back");
+    {
+        register_spies();
+        low.reset();
+        stock(low, 1);
+        low.armed = true;
+        CHECK(fr::reclaim(huge));
+        low.armed = false;
+    }
+
+    test("a call from inside a watcher returns false");
+    {
+        register_spies();
+        low.reset();
+        low.armed = true;
+        fr::reclaim(fr::total_available_bytes());
+        low.armed = false;
+        CHECK(low.calls.load() == 1);
+        CHECK(!low.inner.load());
+    }
+
+    test("alloc asks the watchers before giving up");
+    {
+        // Every block is taken, and two of them are the watcher's to give
+        // back: an allocation that would fail is served from those.
+        register_spies();
+        hoard h;
+        bool emptied = !h.take_until([] { return false; });
+        low.reset();
+        for (int i = 0; i < 2 && !h.blocks.empty(); i++) {
+            low.blocks.push_back(h.blocks.back());
+            h.blocks.pop_back();
+            h.bytes -= huge;
+        }
+        low.armed = true;
+        auto p = fr::alloc(huge, huge);
+        low.armed = false;
+        if (emptied) {
+            CHECK(p != fr::no_memory);
+            CHECK(low.calls.load() >= 1);
+        } else {
+            printf("\t  not emptied: the page list filled first\n");
+        }
+        if (p != fr::no_memory) {
+            fr::free(p, huge);
+        }
     }
 }
 
@@ -160,25 +1237,23 @@ void frames_perf()
 
     section("4 KiB, scaling");
     {
-        // Warm the per-cpu pools so the first measurement is not the only one
-        // paying for a refill.
-        std::vector<mem::frames::phys_addr> p(batch);
+        std::vector<fr::phys_addr> p(batch);
         for (int i = 0; i < batch; i++) {
-            p[i] = mem::frames::alloc();
+            p[i] = fr::alloc();
         }
         for (int i = 0; i < batch; i++) {
-            mem::frames::free(p[i]);
+            fr::free(p[i]);
         }
 
         for (unsigned t = 1; t <= n_cpus(); t *= 2) {
             double s = parallel(t, [&](unsigned) {
-                std::vector<mem::frames::phys_addr> q(batch);
+                std::vector<fr::phys_addr> q(batch);
                 for (int r = 0; r < rounds; r++) {
                     for (int i = 0; i < batch; i++) {
-                        q[i] = mem::frames::alloc();
+                        q[i] = fr::alloc();
                     }
                     for (int i = 0; i < batch; i++) {
-                        mem::frames::free(q[i]);
+                        fr::free(q[i]);
                     }
                 }
             });
@@ -212,10 +1287,10 @@ void frames_perf()
             const int n = share(hbatch * rounds, t, 8);
             double s = parallel(t, [&](unsigned) {
                 for (int i = 0; i < n; i++) {
-                    void *h = mem::frames::to_linear(mem::frames::alloc(huge, huge));
-                    escape(h);
-                    if (h) {
-                        mem::frames::free(mem::frames::from_linear(h), huge);
+                    auto h = fr::alloc(huge, huge);
+                    escape(reinterpret_cast<void *>(h));
+                    if (h != fr::no_memory) {
+                        fr::free(h, huge);
                     }
                 }
             });
@@ -230,13 +1305,12 @@ void frames_perf()
             auto t0 = clk::now();
             int got = 0;
             for (int i = 0; i < n; i++) {
-                mem::frames::phys_addr qa = mem::frames::alloc(size, page);
-                void *q = qa ? mem::map_phys(qa, size) : nullptr;
-                if (!q) {
+                auto q = fr::alloc(size, page);
+                if (q == fr::no_memory) {
                     break;
                 }
-                escape(q);
-                mem::frames::free(qa, size);
+                escape(view(q, size));
+                fr::free(q, size);
                 got++;
             }
             char label[64];
@@ -250,532 +1324,626 @@ void frames_perf()
     }
 }
 
-/* vspace ------------------------------------------------------------------ */
-
-// A region whose faults the test answers itself: one page per fault, counted.
-struct probe_region {
-    mem::vspace::region r;
-    std::atomic<int> faults{0};
-};
-
-bool probe_fault(mem::vspace::region &r, uintptr_t addr, unsigned)
-{
-    auto *pr = reinterpret_cast<probe_region *>(&r);
-    pr->faults.fetch_add(1);
-    uintptr_t s = align_down(addr, uintptr_t(page));
-    return mem::mapping::populate({s, s + page}, r.perm) ||
-           mem::mapping::find(s);
-}
-
-const mem::vspace::region_ops probe_ops = { probe_fault };
-
-void vspace_functional()
-{
-    group("vspace");
-
-    section("a fault in a region goes to the handler its owner plugged in");
-    {
-        probe_region pr;
-        pr.r.ops = &probe_ops;
-        pr.r.perm = mem::perm_rw;
-        CHECK(mem::vspace::reserve(pr.r, 16 * page, page) == resa::success);
-
-        auto *p = reinterpret_cast<volatile char *>(pr.r.span.start);
-        p[0] = 1;
-        p[3 * page] = 3;
-        CHECK(pr.faults.load() == 2);
-        CHECK(p[0] == 1);
-        CHECK(p[3 * page] == 3);
-        // The pages the handler did not map are still absent.
-        CHECK(!mem::mapping::find(pr.r.span.start + page));
-
-        mem::mapping::depopulate({pr.r.span.start, pr.r.span.end});
-        mem::vspace::release(pr.r);
-    }
-
-    section("reserving costs no physical memory");
-    {
-        mem::vspace::region r{};
-        size_t before = mem::frames::free_bytes();
-        CHECK(mem::vspace::reserve(r, 64ul << 20, page) == resa::success);
-        CHECK(before - mem::frames::free_bytes() < (1ul << 20));
-        CHECK(mem::vspace::reserved(r.span));
-        mem::range span = r.span;
-        mem::vspace::release(r);
-        CHECK(!mem::vspace::reserved(span));
-    }
-
-    section("a reservation is aligned as asked and lands in the window");
-    {
-        for (size_t align : {page, huge, 1ul << 30}) {
-            mem::vspace::region r{};
-            CHECK(mem::vspace::reserve(r, huge, align) == resa::success);
-            CHECK((r.span.start & (align - 1)) == 0);
-            CHECK(r.span.size() == huge);
-            CHECK(mem::vspace::app_window().contains(r.span));
-            mem::vspace::release(r);
-        }
-    }
-
-    section("reserve_at is exact, and refuses a range already taken");
-    {
-        const size_t size = 2ul << 20;
-        mem::vspace::region a{}, b{};
-        CHECK(mem::vspace::reserve(a, size, size) == resa::success);
-        CHECK(mem::vspace::reserve_at(b, a.span) == resa::already_reserved);
-        CHECK(mem::vspace::reserve_at(b, {a.span.start + size / 2, a.span.end + size}) ==
-              resa::already_reserved);
-        mem::range span = a.span;
-        mem::vspace::release(a);
-        CHECK(mem::vspace::reserve_at(b, span) == resa::success);
-        CHECK(b.span.start == span.start);
-        mem::vspace::release(b);
-    }
-
-    section("lookup finds the region holding an address, edges included");
-    {
-        mem::vspace::region r{};
-        const size_t size = 2ul << 20;
-        CHECK(mem::vspace::reserve(r, size, page) == resa::success);
-        uintptr_t a = r.span.start;
-        CHECK(mem::vspace::lookup(a) == &r);
-        CHECK(mem::vspace::lookup(a + size - 1) == &r);
-        CHECK(mem::vspace::lookup(a + size) != &r);
-        CHECK(mem::vspace::lookup(a - 1) != &r);
-        mem::vspace::release(r);
-        CHECK(mem::vspace::lookup(a) == nullptr);
-    }
-
-    section("lookup answers for every address in a region, and none outside");
-    {
-        mem::vspace::region r{};
-        const size_t size = 2ul << 20;
-        CHECK(mem::vspace::reserve(r, size, page) == resa::success);
-        bool inside = true;
-        for (size_t off = 0; off < size; off += page) {
-            inside = inside && mem::vspace::lookup(r.span.start + off) == &r;
-        }
-        CHECK(inside);
-        CHECK(mem::vspace::lookup(r.span.end) != &r);
-        r.perm = mem::perm_read;
-        CHECK(mem::vspace::lookup(r.span.start)->perm == mem::perm_read);
-        mem::vspace::release(r);
-    }
-
-    section("the index holds up with 10000 live reservations");
-    {
-        const int n = 10000;
-        // A registered region may not move: the index holds a pointer to it.
-        std::vector<mem::vspace::region> r(n);
-        int got = 0;
-        for (int i = 0; i < n; i++) {
-            if (mem::vspace::reserve(r[i], page, page) == resa::success) {
-                got++;
-            }
-        }
-        CHECK(got == n);
-        CHECK(mem::vspace::self_check());
-        for (int i = 0; i < n; i += 97) {
-            CHECK(mem::vspace::lookup(r[i].span.start) == &r[i]);
-        }
-        for (int i = 0; i < n; i++) {
-            mem::vspace::release(r[i]);
-        }
-        CHECK(mem::vspace::self_check());
-    }
-
-    section("the index survives a random reserve/release sequence");
-    {
-        const int n = 512;
-        std::vector<mem::vspace::region> r(n);
-        std::vector<bool> live(n, false);
-        uint32_t seed = 20260819;
-        auto rnd = [&seed] {
-            seed = seed * 1103515245u + 12345u;
-            return seed >> 8;
-        };
-        for (int i = 0; i < 4000; i++) {
-            int at = rnd() % n;
-            if (live[at]) {
-                mem::vspace::release(r[at]);
-                live[at] = false;
-            } else {
-                size_t size = (rnd() % 16 + 1) * page;
-                live[at] = mem::vspace::reserve(r[at], size, page) == resa::success;
-            }
-        }
-        CHECK(mem::vspace::self_check());
-        for (int i = 0; i < n; i++) {
-            if (live[i]) {
-                mem::vspace::release(r[i]);
-            }
-        }
-        CHECK(mem::vspace::self_check());
-    }
-
-    section("lookups stay correct while the index is rebuilt underneath them");
-    {
-        const int stable_n = 256;
-        const int churn_n = 256;
-        std::vector<mem::vspace::region> stable(stable_n);
-        std::vector<mem::vspace::region> churn(churn_n);
-        for (int i = 0; i < stable_n; i++) {
-            CHECK(mem::vspace::reserve(stable[i], page, page) == resa::success);
-        }
-
-        std::atomic<bool> stop{false};
-        std::atomic<long> wrong{0};
-        std::atomic<long> missing{0};
-        std::atomic<long> done{0};
-        unsigned threads = std::max(2u, std::min(n_cpus(), 16u));
-
-        parallel(threads, [&](unsigned id) {
-            if (id == 0) {
-                std::vector<bool> live(churn_n, false);
-                uint32_t seed = 99194853;
-                for (int round = 0; round < 20000; round++) {
-                    seed = seed * 1103515245u + 12345u;
-                    int at = (seed >> 8) % churn_n;
-                    if (live[at]) {
-                        mem::vspace::release(churn[at]);
-                        live[at] = false;
-                    } else {
-                        live[at] = mem::vspace::reserve(churn[at], page, page) == resa::success;
-                    }
-                }
-                for (int i = 0; i < churn_n; i++) {
-                    if (live[i]) {
-                        mem::vspace::release(churn[i]);
-                    }
-                }
-                stop.store(true);
-                return;
-            }
-            uint32_t seed = id * 2654435761u + 1;
-            while (!stop.load(std::memory_order_relaxed)) {
-                for (int k = 0; k < 64; k++) {
-                    seed = seed * 1103515245u + 12345u;
-                    int i = (seed >> 8) % stable_n;
-                    uintptr_t a = stable[i].span.start;
-                    auto *found = mem::vspace::lookup(a);
-                    if (!found) {
-                        missing.fetch_add(1, std::memory_order_relaxed);
-                    } else if (found != &stable[i]) {
-                        wrong.fetch_add(1, std::memory_order_relaxed);
-                    }
-                    done.fetch_add(1, std::memory_order_relaxed);
-                }
-            }
-        });
-
-        CHECK(done.load() > 0);
-        CHECK(missing.load() == 0);
-        CHECK(wrong.load() == 0);
-        CHECK(mem::vspace::self_check());
-        printf("      %ld lookups against 20000 reserve/release rounds\n", done.load());
-        for (int i = 0; i < stable_n; i++) {
-            mem::vspace::release(stable[i]);
-        }
-        CHECK(mem::vspace::self_check());
-    }
-
-    section("reservations from several threads do not overlap");
-    {
-        const int per_thread = 16;
-        unsigned threads = n_cpus();
-        std::vector<mem::vspace::region> r(threads * per_thread);
-        parallel(threads, [&](unsigned id) {
-            for (int i = 0; i < per_thread; i++) {
-                mem::vspace::reserve(r[id * per_thread + i], 1ul << 20, page);
-            }
-        });
-        std::vector<mem::range> spans;
-        for (auto &e : r) {
-            CHECK(!e.span.empty());
-            spans.push_back(e.span);
-        }
-        std::sort(spans.begin(), spans.end(),
-                  [](const mem::range &a, const mem::range &b) { return a.start < b.start; });
-        for (size_t i = 1; i < spans.size(); i++) {
-            CHECK(spans[i - 1].end <= spans[i].start);
-        }
-        CHECK(mem::vspace::self_check());
-        for (auto &e : r) {
-            mem::vspace::release(e);
-        }
-    }
-
-    section("the layer counts what it holds");
-    {
-        struct counter {
-            size_t regions;
-            size_t bytes;
-            uintptr_t last_end;
-            bool ordered;
-        };
-        const size_t size = 1ul << 20;
-        const int n = 8;
-        std::vector<mem::vspace::region> r(n);
-        size_t regions_before = mem::vspace::count();
-        size_t bytes_before = mem::vspace::reserved_bytes();
-        for (int i = 0; i < n; i++) {
-            CHECK(mem::vspace::reserve(r[i], size, page) == resa::success);
-        }
-        CHECK(mem::vspace::count() == regions_before + n);
-        CHECK(mem::vspace::reserved_bytes() == bytes_before + n * size);
-
-        counter c{0, 0, 0, true};
-        mem::vspace::for_each([](const mem::vspace::region &e, void *arg) {
-            auto *s = static_cast<counter *>(arg);
-            s->regions++;
-            s->bytes += e.span.size();
-            s->ordered = s->ordered && e.span.start >= s->last_end;
-            s->last_end = e.span.end;
-        }, &c);
-        CHECK(c.ordered);
-        CHECK(c.regions == mem::vspace::count());
-        CHECK(c.bytes == mem::vspace::reserved_bytes());
-
-        for (int i = 0; i < n; i++) {
-            mem::vspace::release(r[i]);
-        }
-        CHECK(mem::vspace::count() == regions_before);
-        CHECK(mem::vspace::reserved_bytes() == bytes_before);
-    }
-}
-
-void vspace_perf()
-{
-    group("vspace - performance");
-
-    section("reserve + release");
-    {
-        struct { const char *name; size_t size; int n; } cases[] = {
-            {"4 KiB",  4ul << 10, 20000},
-            {"2 MiB",  2ul << 20, 20000},
-            {"64 MiB", 64ul << 20, 2000},
-        };
-        for (auto &c : cases) {
-            mem::vspace::region r{};
-            auto t0 = clk::now();
-            for (int i = 0; i < c.n; i++) {
-                mem::vspace::reserve(r, c.size, page);
-                mem::vspace::release(r);
-            }
-            char label[64];
-            snprintf(label, sizeof(label), "reserve + release %s", c.name);
-            report_ns(label, since(t0), c.n);
-        }
-    }
-
-    section("reserve + release, scaling");
-    {
-        const int total = 40000;
-        for (unsigned t = 1; t <= n_cpus(); t *= 2) {
-            const int n = share(total, t, 64);
-            double s = parallel(t, [&](unsigned) {
-                mem::vspace::region r{};
-                for (int i = 0; i < n; i++) {
-                    mem::vspace::reserve(r, 2ul << 20, page);
-                    mem::vspace::release(r);
-                }
-            });
-            report_scale("reserve + release 2 MiB", t, static_cast<double>(n) * t, s);
-        }
-    }
-
-    section("lookup");
-    {
-        for (int live : {1, 100, 1000, 10000}) {
-            std::vector<mem::vspace::region> r(live);
-            for (int i = 0; i < live; i++) {
-                mem::vspace::reserve(r[i], page, page);
-            }
-            const int probes = 200000;
-            uintptr_t target = r[live / 2].span.start;
-            auto t0 = clk::now();
-            for (int i = 0; i < probes; i++) {
-                escape(mem::vspace::lookup(target));
-            }
-            char label[64];
-            snprintf(label, sizeof(label), "lookup with %d live regions", live);
-            report_ns(label, since(t0), probes);
-            for (int i = 0; i < live; i++) {
-                mem::vspace::release(r[i]);
-            }
-        }
-    }
-
-    section("lookup, scaling");
-    {
-        const int live = 1000;
-        std::vector<mem::vspace::region> r(live);
-        for (int i = 0; i < live; i++) {
-            mem::vspace::reserve(r[i], page, page);
-        }
-        const int probes = 200000;
-        for (unsigned t = 1; t <= n_cpus(); t *= 2) {
-            double s = parallel(t, [&](unsigned id) {
-                uintptr_t target = r[(id * 37) % live].span.start;
-                for (int i = 0; i < probes; i++) {
-                    escape(mem::vspace::lookup(target));
-                }
-            });
-            report_scale("lookup, 1000 live regions", t,
-                         static_cast<double>(probes) * t, s);
-        }
-        for (int i = 0; i < live; i++) {
-            mem::vspace::release(r[i]);
-        }
-    }
-
-}
-
 /* mapping ----------------------------------------------------------------- */
 
-namespace map = mem::mapping;
-
-// A reservation to write translations into. Nothing else hands these addresses
-// out, and the tests below never leave one attached, so no fault ever lands in
-// a region this file owns.
-struct scratch {
-    mem::vspace::region r;
-    explicit scratch(size_t bytes, size_t align = page)
-    {
-        CHECK(mem::vspace::reserve(r, bytes, align) == resa::success);
-    }
-    ~scratch() { mem::vspace::release(r); }
-    uintptr_t start() const { return r.span.start; }
-    char *ptr(size_t off = 0) const { return reinterpret_cast<char*>(r.span.start + off); }
-    mem::range range(size_t off, size_t len) const
-    {
-        return {r.span.start + off, r.span.start + off + len};
-    }
-};
-
-void mapping_functional()
+// A frame holding one byte everywhere, to tell frames apart through a mapping.
+fr::phys_addr marked(char c)
 {
-    group("mapping");
+    auto p = fr::alloc();
+    CHECK(p != fr::no_memory);
+    memset(view(p), c, page);
+    return p;
+}
 
-    section("an attached frame is reachable, and is gone once detached");
+void mapping_find()
+{
+    function("mapping::find");
+
+    test("nothing where nothing was attached");
+    {
+        scratch s(16 * page);
+        CHECK(!map::find(s.start()));
+        CHECK(!map::find(s.start() + 15 * page));
+        CHECK(map::populate(s.range(page, page), mem::perm_rw));
+        CHECK(!map::find(s.start()));
+        CHECK(bool(map::find(s.start() + page)));
+        CHECK(!map::find(s.start() + 2 * page));
+        map::depopulate(s.range(page, page));
+        CHECK(!map::find(s.start() + page));
+    }
+
+    test("a 4 KiB leaf: level 0, its frame and its permissions");
     {
         scratch s(page);
-        auto f = mem::frames::alloc();
-        CHECK(f != mem::frames::no_memory);
-
-        map::attach(s.range(0, page), f, mem::perm_rw);
-        auto e = map::find(s.start());
+        auto f = fr::alloc();
+        CHECK(map::attach(s.range(0, page), f, mem::perm_read));
+        auto e = map::find(s.start() + 123);
         CHECK(bool(e));
         CHECK(e.level() == 0);
+        CHECK(e.size() == page);
+        CHECK(e.addr() == f);
+        CHECK(e.perm() == mem::perm_read);
+        map::detach(s.range(0, page));
+        fr::free(f);
+    }
+
+    test("a 2 MiB leaf: level 1, from any address under it");
+    {
+        scratch s(huge, huge);
+        map::detach(s.range(0, huge));
+        CHECK(map::populate(s.range(0, huge), mem::perm_rw, huge));
+        auto e = map::find(s.start() + huge - 1);
+        CHECK(bool(e));
+        CHECK(e.level() == 1);
+        CHECK(e.size() == huge);
+        CHECK(e.addr() % huge == 0);
+        CHECK(map::find(s.start()).addr() == e.addr());
+        map::depopulate(s.range(0, huge));
+    }
+}
+
+void mapping_to_phys()
+{
+    function("mapping::to_phys");
+
+    test("a mapped address translates, offset included");
+    {
+        scratch s(4 * page);
+        auto pa = fr::alloc();
+        CHECK(map::attach(s.range(0, page), pa, mem::perm_rw));
+        CHECK(map::to_phys(s.start()) == pa);
+        CHECK(map::to_phys(s.start() + 100) == pa + 100);
+        CHECK(map::to_phys(s.ptr(200)) == pa + 200);
+        map::detach(s.range(0, page));
+        fr::free(pa);
+    }
+
+    test("an unmapped address is no_memory");
+    {
+        scratch s(4 * page);
+        CHECK(map::to_phys(s.start()) == fr::no_memory);
+        CHECK(map::to_phys(s.ptr(page)) == fr::no_memory);
+    }
+
+    test("a pointer into physical memory translates back to it");
+    {
+        auto pa = fr::alloc(huge, huge);
+        CHECK(map::to_phys(view(pa, huge)) == pa);
+        CHECK(map::to_phys(view(pa, huge) + huge - 1) == pa + huge - 1);
+        fr::free(pa, huge);
+    }
+}
+
+void mapping_is_contiguous()
+{
+    function("mapping::is_contiguous");
+
+    test("one leaf is one run, and a seam between two is not");
+    {
+        // The same frame at two neighbouring addresses: bytes flow across the
+        // boundary virtually, but physically the second page starts over.
+        scratch s(4 * page);
+        auto pa = fr::alloc();
+        CHECK(map::attach(s.range(0, page), pa, mem::perm_rw));
+        CHECK(map::attach(s.range(page, page), pa, mem::perm_rw));
+        CHECK(map::is_contiguous(s.ptr(), page));
+        CHECK(map::is_contiguous(s.ptr(100), page - 100));
+        CHECK(!map::is_contiguous(s.ptr(), 2 * page));
+        CHECK(!map::is_contiguous(s.ptr(page - 1), 2));
+        map::detach(s.range(0, 2 * page));
+        fr::free(pa);
+    }
+
+    test("two leaves over contiguous frames are one run");
+    {
+        scratch s(4 * page);
+        auto pa = fr::alloc(2 * page);
+        CHECK(map::attach(s.range(0, 2 * page), pa, mem::perm_rw));
+        CHECK(map::find(s.start()).level() == 0);
+        CHECK(map::is_contiguous(s.ptr(), 2 * page));
+        map::detach(s.range(0, 2 * page));
+        fr::free(pa, 2 * page);
+    }
+
+    test("a run ending in unmapped memory is not, and physical memory always is");
+    {
+        scratch s(4 * page);
+        auto pa = fr::alloc();
+        CHECK(map::attach(s.range(0, page), pa, mem::perm_rw));
+        CHECK(!map::is_contiguous(s.ptr(), page + 1));
+        CHECK(!map::is_contiguous(s.ptr(page), page));
+        CHECK(map::is_contiguous(view(pa), page));
+        map::detach(s.range(0, page));
+        fr::free(pa);
+    }
+}
+
+void mapping_prepare()
+{
+    function("mapping::prepare");
+
+    test("an empty level-0 slot, one store away from a usable mapping");
+    {
+        scratch s(page);
+        auto e = map::prepare(s.start());
+        CHECK(bool(e));
+        CHECK(e.level() == 0);
+        CHECK(e.empty());
+        CHECK(!map::find(s.start()));
+
+        auto f = fr::alloc();
+        e.write(e.leaf_for(f, mem::perm_rw));
+        map::barrier();
+        s.ptr()[0] = 0x33;
+        CHECK(view(f)[0] == 0x33);
+        CHECK(map::find(s.start()).addr() == f);
+
+        map::detach(s.range(0, page));
+        fr::free(f);
+    }
+
+    test("the same slot again, holding what was written into it");
+    {
+        scratch s(page);
+        auto f = fr::alloc();
+        auto e = map::prepare(s.start());
+        e.write(e.leaf_for(f, mem::perm_rw));
+        map::barrier();
+        auto again = map::prepare(s.start());
+        CHECK(!again.empty());
+        CHECK(again.addr() == f);
+        map::detach(s.range(0, page));
+        fr::free(f);
+    }
+
+    test("a 2 MiB leaf size stops one level up");
+    {
+        scratch s(huge, huge);
+        map::detach(s.range(0, huge));
+        auto e = map::prepare(s.start(), huge);
+        CHECK(bool(e));
+        CHECK(e.level() == 1);
+        CHECK(e.size() == huge);
+        CHECK(e.empty());
+
+        auto b = fr::alloc(huge, huge);
+        e.write(e.leaf_for(b, mem::perm_rw));
+        map::barrier();
+        s.ptr(huge - 1)[0] = 0x44;
+        CHECK(view(b, huge)[huge - 1] == 0x44);
+        CHECK(map::find(s.start() + page).level() == 1);
+
+        map::detach(s.range(0, huge));
+        fr::free(b, huge);
+    }
+
+    test("over a range, every level is built and costs nothing more per page");
+    {
+        scratch s(64 * page);
+        CHECK(map::prepare(s.range(0, 64 * page)));
+        size_t before = fr::free_bytes();
+        bool ready = true;
+        for (unsigned i = 0; i < 64; i++) {
+            auto e = map::prepare(s.start() + i * page);
+            ready = ready && e && e.level() == 0 && e.empty();
+        }
+        CHECK(ready);
+        CHECK(fr::free_bytes() == before);
+    }
+}
+
+void mapping_attach()
+{
+    function("mapping::attach");
+
+    test("an attached frame is reachable at the address, and gone once detached");
+    {
+        scratch s(page);
+        auto f = fr::alloc();
+        CHECK(map::attach(s.range(0, page), f, mem::perm_rw));
+        auto e = map::find(s.start());
+        CHECK(bool(e));
         CHECK(e.addr() == f);
         CHECK(e.perm() & mem::perm_write);
 
-        // The frame is reachable through both its linear address and the one
-        // just attached, which is what an attachment means.
         s.ptr()[0] = 0x5a;
-        CHECK(static_cast<char*>(mem::frames::to_linear(f))[0] == 0x5a);
+        CHECK(view(f)[0] == 0x5a);
 
         map::detach(s.range(0, page));
         CHECK(!map::find(s.start()));
-        mem::frames::free(f);
+        fr::free(f);
     }
 
-    section("attach refuses a range already mapped, attach_missing fills the gaps");
+    test("a range of frames, one leaf per page");
     {
         scratch s(4 * page);
-        auto f = mem::frames::alloc();
-        auto g = mem::frames::alloc();
+        auto f = fr::alloc(4 * page);
+        CHECK(map::attach(s.range(0, 4 * page), f, mem::perm_rw));
+        for (unsigned i = 0; i < 4; i++) {
+            auto e = map::find(s.start() + i * page);
+            CHECK(bool(e));
+            CHECK(e.addr() == f + i * page);
+            s.ptr(i * page)[0] = char(i);
+        }
+        for (unsigned i = 0; i < 4; i++) {
+            CHECK(view(f, 4 * page)[i * page] == char(i));
+        }
+        map::detach(s.range(0, 4 * page));
+        fr::free(f, 4 * page);
+    }
 
+    test("the permissions asked for are what the entry gets");
+    {
+        scratch s(page);
+        auto f = fr::alloc();
+        for (unsigned perm : {mem::perm_read, mem::perm_rw, mem::perm_rwx}) {
+            CHECK(map::attach(s.range(0, page), f, perm));
+            CHECK(map::find(s.start()).perm() == perm);
+            map::detach(s.range(0, page));
+        }
+        fr::free(f);
+    }
+
+    test("refuses a range already mapped, wholly or in part, and writes nothing");
+    {
+        scratch s(4 * page);
+        auto f = fr::alloc();
+        auto g = fr::alloc();
         CHECK(map::attach(s.range(0, page), f, mem::perm_rw));
-        // The whole point of the return value: the second caller is told, and
-        // the entry the first one wrote is still the one that is there.
         CHECK(!map::attach(s.range(0, page), g, mem::perm_rw));
         CHECK(map::find(s.start()).addr() == f);
-        // A range that only overlaps in part is refused just the same, and
-        // nothing in the untouched part of it is written.
         CHECK(!map::attach(s.range(0, 4 * page), g, mem::perm_rw));
         CHECK(!map::find(s.start() + page));
+        map::detach(s.range(0, 4 * page));
+        fr::free(f);
+        fr::free(g);
+    }
 
-        // attach_missing accepts the overlap as long as it agrees, and fills
-        // in what was not there. Only a different translation is an error.
-        CHECK(!map::attach_missing(s.range(0, 4 * page), g, mem::perm_rw));
+    test("2 MiB leaves where both sides allow, 4 KiB ones where they do not");
+    {
+        scratch s(huge, huge);
+        map::detach(s.range(0, huge));
+        auto b = fr::alloc(huge, huge);
+        CHECK(map::attach(s.range(0, huge), b, mem::perm_rw));
+        CHECK(map::find(s.start()).level() == 1);
+        map::detach(s.range(0, huge));
+
+        // The same range over the same block, a page along: the addresses no
+        // longer agree on a 2 MiB boundary.
+        CHECK(map::attach(s.range(0, huge - page), b + page, mem::perm_rw));
+        CHECK(map::find(s.start()).level() == 0);
+        CHECK(map::find(s.start()).addr() == b + page);
+        map::detach(s.range(0, huge));
+        fr::free(b, huge);
+    }
+
+    test("an empty range is accepted and maps nothing");
+    {
+        scratch s(page);
+        auto f = fr::alloc();
+        CHECK(map::attach(s.range(0, 0), f, mem::perm_rw));
+        CHECK(!map::find(s.start()));
+        fr::free(f);
+    }
+}
+
+void mapping_attach_missing()
+{
+    function("mapping::attach_missing");
+
+    test("fills the pages that are not there and leaves the one that is");
+    {
+        scratch s(4 * page);
+        auto f = fr::alloc(4 * page);
+        CHECK(map::attach(s.range(0, page), f, mem::perm_rw));
         CHECK(map::attach_missing(s.range(0, 4 * page), f, mem::perm_rw));
-        CHECK(map::find(s.start()).addr() == f);
-        for (unsigned i = 1; i < 4; i++) {
+        for (unsigned i = 0; i < 4; i++) {
             auto e = map::find(s.start() + i * page);
             CHECK(bool(e));
             CHECK(e.addr() == f + i * page);
         }
-
         map::detach(s.range(0, 4 * page));
-        mem::frames::free(f);
-        mem::frames::free(g);
+        fr::free(f, 4 * page);
     }
 
-    section("populate fills a range and depopulate gives the frames back");
+    test("refuses a translation that disagrees with what is there");
     {
-        scratch s(64 * page);
-        size_t before = mem::frames::free_bytes();
-        CHECK(map::populate(s.range(0, 64 * page), mem::perm_rw));
+        scratch s(4 * page);
+        auto f = fr::alloc(4 * page);
+        auto g = fr::alloc(4 * page);
+        CHECK(map::attach(s.range(0, page), f, mem::perm_rw));
+        CHECK(!map::attach_missing(s.range(0, 4 * page), g, mem::perm_rw));
+        CHECK(map::find(s.start()).addr() == f);
+        CHECK(!map::find(s.start() + page));
+        map::detach(s.range(0, 4 * page));
+        fr::free(f, 4 * page);
+        fr::free(g, 4 * page);
+    }
 
-        for (unsigned i = 0; i < 64; i++) {
+    test("slop maps the surroundings too, as far as the addresses run together");
+    {
+        scratch s(4 * page, 4 * page);
+        auto f = fr::alloc(4 * page, 4 * page);
+        CHECK(map::attach_missing(s.range(page, page), f + page, mem::perm_rw, 4 * page));
+        for (unsigned i = 0; i < 4; i++) {
             auto e = map::find(s.start() + i * page);
             CHECK(bool(e));
-            CHECK(s.ptr(i * page)[0] == 0);   // populate zeroes by default
+            CHECK(e.addr() == f + i * page);
+        }
+        map::detach(s.range(0, 4 * page));
+        fr::free(f, 4 * page);
+    }
+}
+
+void mapping_populate()
+{
+    function("mapping::populate");
+
+    test("a frame per page, zeroed, that keeps what is written");
+    {
+        scratch s(64 * page);
+        size_t before = fr::free_bytes();
+        CHECK(map::populate(s.range(0, 64 * page), mem::perm_rw));
+        CHECK(before - fr::free_bytes() >= 64 * page);
+        bool zero = true, mapped = true;
+        for (unsigned i = 0; i < 64; i++) {
+            mapped = mapped && map::find(s.start() + i * page);
+            zero = zero && s.ptr(i * page)[0] == 0 && s.ptr(i * page)[page - 1] == 0;
             s.ptr(i * page)[0] = char(i);
         }
+        CHECK(mapped);
+        CHECK(zero);
+        bool kept = true;
         for (unsigned i = 0; i < 64; i++) {
-            CHECK(s.ptr(i * page)[0] == char(i));
+            kept = kept && s.ptr(i * page)[0] == char(i);
         }
-        CHECK(before - mem::frames::free_bytes() >= 64 * page);
-
+        CHECK(kept);
         map::depopulate(s.range(0, 64 * page));
-        CHECK(!map::find(s.start()));
-        CHECK(mem::frames::free_bytes() >= before - page);
     }
 
-    section("a huge-page range is one entry, and splits into 512");
+    test("a 2 MiB leaf size takes one block per leaf");
+    {
+        scratch s(2 * huge, huge);
+        map::detach(s.range(0, 2 * huge));
+        size_t before = fr::free_bytes();
+        CHECK(map::populate(s.range(0, 2 * huge), mem::perm_rw, huge));
+        CHECK(before - fr::free_bytes() >= 2 * huge);
+        CHECK(map::find(s.start()).level() == 1);
+        CHECK(map::find(s.start() + huge).level() == 1);
+        CHECK(map::find(s.start()).addr() != map::find(s.start() + huge).addr());
+        s.ptr(2 * huge - 1)[0] = 0x7e;
+        CHECK(s.ptr(2 * huge - 1)[0] == 0x7e);
+        map::depopulate(s.range(0, 2 * huge));
+    }
+
+    test("zero = false still maps every page");
+    {
+        scratch s(8 * page);
+        CHECK(map::populate(s.range(0, 8 * page), mem::perm_rw, page, false));
+        bool mapped = true;
+        for (unsigned i = 0; i < 8; i++) {
+            mapped = mapped && map::find(s.start() + i * page);
+            s.ptr(i * page)[0] = 1;
+        }
+        CHECK(mapped);
+        map::depopulate(s.range(0, 8 * page));
+    }
+
+    test("refuses a range with anything mapped in it, and takes no frame");
+    {
+        scratch s(4 * page);
+        CHECK(map::populate(s.range(page, page), mem::perm_rw));
+        auto f = map::find(s.start() + page).addr();
+        size_t before = fr::free_bytes();
+        CHECK(!map::populate(s.range(0, 4 * page), mem::perm_rw));
+        CHECK(fr::free_bytes() == before);
+        CHECK(map::find(s.start() + page).addr() == f);
+        CHECK(!map::find(s.start()));
+        CHECK(!map::find(s.start() + 2 * page));
+        map::depopulate(s.range(0, 4 * page));
+    }
+
+    test("what was installed before a failure stays until depopulate takes it back");
+    {
+        // More than the allocator holds, in 2 MiB leaves and unzeroed so the
+        // run is short. Every block the allocator can find goes into it.
+        size_t want = align_up(fr::total_available_bytes() + 64 * huge, huge);
+        scratch s(want, huge);
+        size_t before = fr::free_bytes();
+        CHECK(!map::populate(s.range(0, want), mem::perm_rw, huge, false));
+        CHECK(bool(map::find(s.start())));
+        CHECK(fr::free_bytes() < before);
+        map::depopulate(s.range(0, want));
+        CHECK(!map::find(s.start()));
+        CHECK(fr::free_bytes() + (1ul << 20) >= before);
+    }
+}
+
+void mapping_detach()
+{
+    function("mapping::detach");
+
+    test("clears the entries and keeps the frames");
+    {
+        scratch s(4 * page);
+        auto f = fr::alloc(4 * page);
+        CHECK(map::attach(s.range(0, 4 * page), f, mem::perm_rw));
+        s.ptr(3 * page)[0] = 0x66;
+        size_t before = fr::free_bytes();
+        map::detach(s.range(0, 4 * page));
+        for (unsigned i = 0; i < 4; i++) {
+            CHECK(!map::find(s.start() + i * page));
+        }
+        CHECK(fr::free_bytes() <= before);
+        CHECK(view(f, 4 * page)[3 * page] == 0x66);
+        fr::free(f, 4 * page);
+    }
+
+    test("a range only partly mapped detaches what is there");
+    {
+        scratch s(4 * page);
+        auto f = fr::alloc();
+        CHECK(map::attach(s.range(2 * page, page), f, mem::perm_rw));
+        map::detach(s.range(0, 4 * page));
+        CHECK(!map::find(s.start() + 2 * page));
+        fr::free(f);
+    }
+
+    test("the TLB is flushed: a new frame at the same address is what is read");
+    {
+        scratch s(page);
+        auto f = marked('f');
+        auto g = marked('g');
+        CHECK(map::attach(s.range(0, page), f, mem::perm_rw));
+        CHECK(peek(s.start()) == 'f');
+        map::detach(s.range(0, page));
+        CHECK(map::attach(s.range(0, page), g, mem::perm_rw));
+        CHECK(peek(s.start()) == 'g');
+        map::detach(s.range(0, page));
+        fr::free(f);
+        fr::free(g);
+    }
+}
+
+void mapping_detach_deferred()
+{
+    function("mapping::detach_deferred");
+
+    test("clears the entries, records the addresses, and flushes nothing");
+    {
+        scratch s(4 * page);
+        auto f = fr::alloc(4 * page);
+        CHECK(map::attach(s.range(0, 4 * page), f, mem::perm_rw));
+        auto before = map::flush_epoch();
+
+        map::pending_invalidation stale;
+        map::detach_deferred(s.range(0, 2 * page), stale);
+        CHECK(stale.count == 2);
+        CHECK(stale.va[0] == s.start());
+        CHECK(stale.va[1] == s.start() + page);
+        CHECK(!stale.all);
+        CHECK(stale.epoch == before);
+        CHECK(!map::find(s.start()));
+        CHECK(bool(map::find(s.start() + 2 * page)));
+        CHECK(map::flush_epoch() == before);
+
+        // A second call adds to the same list.
+        map::detach_deferred(s.range(2 * page, 2 * page), stale);
+        CHECK(stale.count == 4);
+        CHECK(stale.va[3] == s.start() + 3 * page);
+        stale.invalidate();
+        fr::free(f, 4 * page);
+    }
+
+    test("past flush_batch addresses the list says all");
+    {
+        const size_t n = map::flush_batch + 1;
+        scratch s(n * page);
+        auto f = fr::alloc(n * page);
+        CHECK(map::attach(s.range(0, n * page), f, mem::perm_rw));
+        map::pending_invalidation stale;
+        map::detach_deferred(s.range(0, n * page), stale);
+        CHECK(stale.count == map::flush_batch);
+        CHECK(stale.all);
+        stale.invalidate();
+        fr::free(f, n * page);
+    }
+
+    test("invalidate makes a new frame at the address what is read");
+    {
+        scratch s(page);
+        auto f = marked('f');
+        auto g = marked('g');
+        CHECK(map::attach(s.range(0, page), f, mem::perm_rw));
+        CHECK(peek(s.start()) == 'f');
+        map::pending_invalidation stale;
+        map::detach_deferred(s.range(0, page), stale);
+        CHECK(map::attach(s.range(0, page), g, mem::perm_rw));
+        stale.invalidate();
+        CHECK(peek(s.start()) == 'g');
+        map::detach(s.range(0, page));
+        fr::free(f);
+        fr::free(g);
+    }
+
+    test("two global flushes since the detach settle the list without another");
+    {
+        scratch s(page);
+        auto f = fr::alloc();
+        CHECK(map::attach(s.range(0, page), f, mem::perm_rw));
+        map::pending_invalidation stale;
+        map::detach_deferred(s.range(0, page), stale);
+        map::flush_all();
+        map::flush_all();
+        auto quiet = map::flush_epoch();
+        stale.invalidate();
+        CHECK(map::flush_epoch() == quiet);
+        CHECK(stale.count == 0);
+        CHECK(!stale.all);
+        CHECK(stale.epoch == map::never_flushed);
+        fr::free(f);
+    }
+}
+
+void mapping_depopulate()
+{
+    function("mapping::depopulate");
+
+    test("clears the entries and gives the frames back");
+    {
+        scratch s(64 * page);
+        size_t before = fr::free_bytes();
+        CHECK(map::populate(s.range(0, 64 * page), mem::perm_rw));
+        map::depopulate(s.range(0, 64 * page));
+        bool gone = true;
+        for (unsigned i = 0; i < 64; i++) {
+            gone = gone && !map::find(s.start() + i * page);
+        }
+        CHECK(gone);
+        CHECK(fr::free_bytes() + page >= before);
+    }
+
+    test("a range with holes frees what is there");
+    {
+        scratch s(4 * page);
+        size_t before = fr::free_bytes();
+        CHECK(map::populate(s.range(0, page), mem::perm_rw));
+        CHECK(map::populate(s.range(2 * page, page), mem::perm_rw));
+        map::depopulate(s.range(0, 4 * page));
+        CHECK(!map::find(s.start()));
+        CHECK(!map::find(s.start() + 2 * page));
+        CHECK(fr::free_bytes() + page >= before);
+    }
+
+    test("a 2 MiB leaf gives its block back");
     {
         scratch s(huge, huge);
-        // An earlier owner of these addresses may have left a table behind: one
-        // is only given back when a detach covers the whole of what it spans,
-        // and a small mapping never does. Detaching the whole span is what
-        // clears it, and without that the populate below could only build
-        // 512 small leaves under the table that is already there.
         map::detach(s.range(0, huge));
-
-        size_t before = mem::frames::free_bytes();
+        size_t before = fr::free_bytes();
         CHECK(map::populate(s.range(0, huge), mem::perm_rw, huge));
-
-        auto e = map::find(s.start());
-        CHECK(bool(e));
-        CHECK(e.level() == 1);
-        CHECK(e.size() == huge);
-        auto phys = e.addr();
-        CHECK((phys & (huge - 1)) == 0);
-        s.ptr(huge - 1)[0] = 0x7e;
-
-        map::split(s.range(0, huge));
-        // Every one of the small entries that replaced it maps its own slice of
-        // the same frame, and the byte written through the large one is still
-        // there.
-        for (unsigned i = 0; i < 512; i += 64) {
-            auto small = map::find(s.start() + i * page);
-            CHECK(bool(small));
-            CHECK(small.level() == 0);
-            CHECK(small.addr() == phys + i * page);
-        }
-        CHECK(s.ptr(huge - 1)[0] == 0x7e);
-
-        // A huge frame given back one small piece at a time has to come back
-        // whole: the allocator handed out one block, and it is being returned
-        // as 512 frames.
+        CHECK(before - fr::free_bytes() >= huge);
         map::depopulate(s.range(0, huge));
         CHECK(!map::find(s.start()));
-        CHECK(mem::frames::free_bytes() >= before - page);
+        CHECK(fr::free_bytes() + page >= before);
     }
 
-    section("protect changes what an entry allows without moving the frame");
+    test("more than a batch goes back in batches");
+    {
+        const size_t n = 4 * map::flush_batch + 3;
+        scratch s(n * page);
+        size_t before = fr::free_bytes();
+        CHECK(map::populate(s.range(0, n * page), mem::perm_rw));
+        map::depopulate(s.range(0, n * page));
+        CHECK(!map::find(s.start() + (n - 1) * page));
+        CHECK(fr::free_bytes() + page >= before);
+    }
+}
+
+void mapping_protect()
+{
+    function("mapping::protect");
+
+    test("changes what an entry allows without moving the frame");
     {
         scratch s(page);
         CHECK(map::populate(s.range(0, page), mem::perm_rw));
@@ -787,8 +1955,6 @@ void mapping_functional()
         CHECK(map::find(s.start()).addr() == phys);
         CHECK(s.ptr()[0] == 0x11);
 
-        // Permissions of none keep the frame, which is what lets them be given
-        // back later.
         map::protect(s.range(0, page), mem::perm_none);
         CHECK(map::find(s.start()).perm() == mem::perm_none);
         CHECK(map::find(s.start()).addr() == phys);
@@ -796,78 +1962,246 @@ void mapping_functional()
         map::protect(s.range(0, page), mem::perm_rw);
         CHECK(map::find(s.start()).perm() & mem::perm_write);
         CHECK(s.ptr()[0] == 0x11);
-
         map::depopulate(s.range(0, page));
     }
 
-    section("prepare builds the levels, and the leaf is then one store away");
+    test("every mapped entry in the range, and none that is not");
+    {
+        scratch s(4 * page);
+        CHECK(map::populate(s.range(0, page), mem::perm_rw));
+        CHECK(map::populate(s.range(3 * page, page), mem::perm_rw));
+        map::protect(s.range(0, 4 * page), mem::perm_read);
+        CHECK(map::find(s.start()).perm() == mem::perm_read);
+        CHECK(map::find(s.start() + 3 * page).perm() == mem::perm_read);
+        CHECK(!map::find(s.start() + page));
+        map::depopulate(s.range(0, 4 * page));
+    }
+
+    test("a 2 MiB leaf is protected as one");
+    {
+        scratch s(huge, huge);
+        map::detach(s.range(0, huge));
+        CHECK(map::populate(s.range(0, huge), mem::perm_rw, huge));
+        map::protect(s.range(0, huge), mem::perm_read);
+        auto e = map::find(s.start() + huge / 2);
+        CHECK(e.level() == 1);
+        CHECK(e.perm() == mem::perm_read);
+        map::depopulate(s.range(0, huge));
+    }
+}
+
+void mapping_split()
+{
+    function("mapping::split");
+
+    test("a 2 MiB leaf becomes 512 leaves over the same block");
+    {
+        scratch s(huge, huge);
+        map::detach(s.range(0, huge));
+        CHECK(map::populate(s.range(0, huge), mem::perm_rw, huge));
+        auto phys = map::find(s.start()).addr();
+        s.ptr(huge - 1)[0] = 0x7e;
+
+        map::split(s.range(0, huge));
+        bool small = true;
+        for (unsigned i = 0; i < 512; i++) {
+            auto e = map::find(s.start() + i * page);
+            small = small && e && e.level() == 0 && e.addr() == phys + i * page;
+        }
+        CHECK(small);
+        CHECK(s.ptr(huge - 1)[0] == 0x7e);
+        map::depopulate(s.range(0, huge));
+    }
+
+    test("a range covering part of a leaf splits the whole leaf");
+    {
+        scratch s(huge, huge);
+        map::detach(s.range(0, huge));
+        CHECK(map::populate(s.range(0, huge), mem::perm_rw, huge));
+        map::split(s.range(huge / 2, page));
+        CHECK(map::find(s.start()).level() == 0);
+        CHECK(map::find(s.start() + huge - page).level() == 0);
+        map::depopulate(s.range(0, huge));
+    }
+
+    test("4 KiB leaves are left as they are");
+    {
+        scratch s(4 * page);
+        CHECK(map::populate(s.range(0, 4 * page), mem::perm_rw));
+        auto phys = map::find(s.start()).addr();
+        map::split(s.range(0, 4 * page));
+        CHECK(map::find(s.start()).level() == 0);
+        CHECK(map::find(s.start()).addr() == phys);
+        map::depopulate(s.range(0, 4 * page));
+    }
+
+    test("a block split into pages is given back as pages");
+    {
+        // What depopulate hands the allocator after a split: 512 frames of a
+        // block it handed out as one.
+        scratch s(huge, huge);
+        map::detach(s.range(0, huge));
+        size_t before = fr::free_bytes();
+        CHECK(map::populate(s.range(0, huge), mem::perm_rw, huge));
+        map::split(s.range(0, huge));
+        map::depopulate(s.range(0, huge));
+        CHECK(fr::free_bytes() + page >= before);
+        auto b = fr::alloc(huge, huge);
+        CHECK(b != fr::no_memory);
+        fr::free(b, huge);
+    }
+}
+
+// An entry rewritten by hand, which is what the flushes exist for: after the
+// swap the TLB of this cpu still names the old frame until it is told.
+void swap_by_hand(map::pte_ref e, fr::phys_addr to)
+{
+    e.write(e.leaf_for(to, mem::perm_rw));
+    map::barrier();
+}
+
+void mapping_flush()
+{
+    function("mapping::flush_local, mapping::flush_range, mapping::flush_all");
+
+    test("flush_local: this cpu sees an entry rewritten by hand");
     {
         scratch s(page);
+        auto f = marked('f');
+        auto g = marked('g');
         auto e = map::prepare(s.start());
-        CHECK(bool(e));
-        CHECK(e.level() == 0);
-        CHECK(e.empty());       // prepare writes no leaf of its own
+        swap_by_hand(e, f);
+        CHECK(peek(s.start()) == 'f');
+        swap_by_hand(e, g);
+        map::flush_local(s.range(0, page));
+        CHECK(peek(s.start()) == 'g');
+        map::detach(s.range(0, page));
+        fr::free(f);
+        fr::free(g);
+    }
 
-        auto f = mem::frames::alloc();
+    test("flush_range: every cpu does, and the epoch does not move");
+    {
+        scratch s(page);
+        auto f = marked('f');
+        auto g = marked('g');
+        auto e = map::prepare(s.start());
+        swap_by_hand(e, f);
+        unsigned threads = std::min(n_cpus(), 8u);
+        std::atomic<unsigned> saw_f{0};
+        parallel(threads, [&](unsigned) { saw_f += peek(s.start()) == 'f'; });
+        CHECK(saw_f.load() == threads);
+        swap_by_hand(e, g);
+        auto before = map::flush_epoch();
+        map::flush_range(s.range(0, page));
+        CHECK(map::flush_epoch() == before);
+        std::atomic<unsigned> saw_g{0};
+        parallel(threads, [&](unsigned) { saw_g += peek(s.start()) == 'g'; });
+        CHECK(saw_g.load() == threads);
+        map::detach(s.range(0, page));
+        fr::free(f);
+        fr::free(g);
+    }
+
+    test("flush_all: every cpu does, and the epoch advances");
+    {
+        scratch s(page);
+        auto f = marked('f');
+        auto g = marked('g');
+        auto e = map::prepare(s.start());
+        swap_by_hand(e, f);
+        unsigned threads = std::min(n_cpus(), 8u);
+        parallel(threads, [&](unsigned) { peek(s.start()); });
+        swap_by_hand(e, g);
+        auto before = map::flush_epoch();
+        map::flush_all();
+        CHECK(map::flush_epoch() > before);
+        std::atomic<unsigned> saw_g{0};
+        parallel(threads, [&](unsigned) { saw_g += peek(s.start()) == 'g'; });
+        CHECK(saw_g.load() == threads);
+        map::detach(s.range(0, page));
+        fr::free(f);
+        fr::free(g);
+    }
+
+    test("a range past flush_batch pages is flushed whole");
+    {
+        const size_t n = map::flush_batch + 1;
+        scratch s(n * page);
+        auto f = fr::alloc(n * page);
+        auto g = fr::alloc(n * page);
+        memset(view(f, n * page), 'f', n * page);
+        memset(view(g, n * page), 'g', n * page);
+        CHECK(map::prepare(s.range(0, n * page)));
+        std::vector<map::pte_ref> slot(n);
+        for (size_t i = 0; i < n; i++) {
+            slot[i] = map::prepare(s.start() + i * page);
+            swap_by_hand(slot[i], f + i * page);
+        }
+        CHECK(peek(s.start() + (n - 1) * page) == 'f');
+        for (size_t i = 0; i < n; i++) {
+            swap_by_hand(slot[i], g + i * page);
+        }
+        map::flush_range(s.range(0, n * page));
+        CHECK(peek(s.start() + (n - 1) * page) == 'g');
+        map::flush_local(s.range(0, n * page));
+        CHECK(peek(s.start()) == 'g');
+        map::detach(s.range(0, n * page));
+        fr::free(f, n * page);
+        fr::free(g, n * page);
+    }
+}
+
+void mapping_flush_epoch()
+{
+    function("mapping::flush_epoch, mapping::barrier");
+
+    test("the epoch counts global flushes and nothing else");
+    {
+        auto e0 = map::flush_epoch();
+        scratch s(4 * page);
+        CHECK(map::populate(s.range(0, 4 * page), mem::perm_rw));
+        map::protect(s.range(0, 4 * page), mem::perm_read);
+        map::flush_local(s.range(0, 4 * page));
+        map::flush_range(s.range(0, 4 * page));
+        map::depopulate(s.range(0, 4 * page));
+        CHECK(map::flush_epoch() == e0);
+        map::flush_all();
+        CHECK(map::flush_epoch() > e0);
+    }
+
+    test("barrier makes an entry written by hand usable");
+    {
+        scratch s(page);
+        auto f = marked('f');
+        auto e = map::prepare(s.start());
         e.write(e.leaf_for(f, mem::perm_rw));
         map::barrier();
-        s.ptr()[0] = 0x33;
-        CHECK(static_cast<char*>(mem::frames::to_linear(f))[0] == 0x33);
-
-        // The same slot, found the long way round.
-        auto again = map::prepare(s.start());
-        CHECK(again.addr() == f);
-        CHECK(map::find(s.start()).addr() == f);
-
+        CHECK(peek(s.start()) == 'f');
         map::detach(s.range(0, page));
-        mem::frames::free(f);
+        fr::free(f);
     }
+}
 
-    section("to_phys translates a mapped address and refuses an empty one");
-    {
-        scratch s(4 * page);
-        mem::frames::phys_addr pa = mem::frames::alloc();
-        CHECK(map::attach(s.range(0, page), pa, mem::perm_rw));
-        CHECK(map::to_phys(s.start()) == pa);
-        CHECK(map::to_phys(s.start() + 100) == pa + 100);
-        CHECK(map::to_phys(s.start() + page) == mem::frames::no_memory);
-        CHECK(map::to_phys(mem::frames::to_linear(pa)) == pa);
-        map::detach(s.range(0, page));
-        mem::frames::free(pa);
-    }
+void mapping_bits()
+{
+    function("mapping::accessed, mapping::dirty, mapping::clear_accessed, mapping::clear_dirty");
 
-    section("is_contiguous tells one run of memory from a seam");
+    test("a read sets accessed, a write sets dirty, and clearing starts over");
     {
-        // The same frame at two neighbouring addresses: bytes flow across the
-        // boundary virtually, but physically the second page starts over.
-        scratch s(4 * page);
-        mem::frames::phys_addr pa = mem::frames::alloc();
-        CHECK(map::attach(s.range(0, page), pa, mem::perm_rw));
-        CHECK(map::attach(s.range(page, page), pa, mem::perm_rw));
-        auto *p = reinterpret_cast<const void *>(s.start());
-        CHECK(map::is_contiguous(p, page));
-        CHECK(!map::is_contiguous(p, 2 * page));
-        CHECK(map::is_contiguous(mem::frames::to_linear(pa), page));
-        map::detach(s.range(0, 2 * page));
-        mem::frames::free(pa);
-    }
-
-    section("the entry records reads and writes, and clearing starts over");
-    {
-        scratch s(4 * page);
+        scratch s(page);
         CHECK(map::populate(s.range(0, page), mem::perm_rw));
         mem::range v = s.range(0, page);
 
         map::clear_accessed(v);
         map::clear_dirty(v);
-        // A cpu holding the old entry never sets the bits again.
         map::flush_all();
         CHECK(!map::accessed(v));
         if (map::tracks_writes) {
             CHECK(!map::dirty(v));
         }
 
-        (void)*reinterpret_cast<volatile char *>(s.start());
+        peek(s.start());
         CHECK(map::accessed(v));
         if (map::tracks_writes) {
             CHECK(!map::dirty(v));
@@ -875,17 +2209,166 @@ void mapping_functional()
 
         *reinterpret_cast<volatile char *>(s.start()) = 1;
         CHECK(map::dirty(v));
+        map::clear_dirty(v);
+        if (map::tracks_writes) {
+            CHECK(!map::dirty(v));
+        }
         map::depopulate(v);
     }
 
-    section("the software bits of an entry survive a round trip");
+    test("over a range, one touched page is enough, and clearing reaches every page");
+    {
+        scratch s(4 * page);
+        CHECK(map::populate(s.range(0, 4 * page), mem::perm_rw));
+        mem::range all = s.range(0, 4 * page);
+        map::clear_accessed(all);
+        map::clear_dirty(all);
+        map::flush_all();
+        *reinterpret_cast<volatile char *>(s.start() + 2 * page) = 1;
+        CHECK(map::accessed(all));
+        CHECK(map::accessed(s.range(2 * page, page)));
+        CHECK(!map::accessed(s.range(0, page)));
+        if (map::tracks_writes) {
+            CHECK(map::dirty(s.range(2 * page, page)));
+            CHECK(!map::dirty(s.range(0, 2 * page)));
+        }
+        for (unsigned i = 0; i < 4; i++) {
+            peek(s.start() + i * page);
+        }
+        map::clear_accessed(all);
+        map::clear_dirty(all);
+        map::flush_all();
+        CHECK(!map::accessed(all));
+        map::depopulate(all);
+    }
+
+    test("clear_dirty with a pending list defers the flush to the caller");
     {
         scratch s(page);
-        auto f = mem::frames::alloc();
-        map::attach(s.range(0, page), f, mem::perm_rw);
-        auto e = map::find(s.start());
+        CHECK(map::populate(s.range(0, page), mem::perm_rw));
+        mem::range v = s.range(0, page);
+        *reinterpret_cast<volatile char *>(s.start()) = 1;
+        map::pending_invalidation stale;
+        map::clear_dirty(v, stale);
+        if (map::tracks_writes) {
+            CHECK(stale.count == 1);
+            CHECK(stale.va[0] == s.start());
+            CHECK(stale.epoch != map::never_flushed);
+            CHECK(!map::dirty(v));
+        }
+        stale.invalidate();
+        CHECK(stale.count == 0);
+        map::depopulate(v);
+    }
+}
 
-        CHECK(map::sw_bits >= 3);   // the fewest any supported arch has
+void mapping_pending_invalidation()
+{
+    function("mapping::pending_invalidation");
+
+    test("add records up to flush_batch addresses, then says all");
+    {
+        map::pending_invalidation stale;
+        CHECK(stale.count == 0);
+        CHECK(!stale.all);
+        CHECK(stale.epoch == map::never_flushed);
+        for (size_t i = 0; i < map::flush_batch; i++) {
+            stale.add(0x1000 * (i + 1));
+        }
+        CHECK(stale.count == map::flush_batch);
+        CHECK(!stale.all);
+        CHECK(stale.va[map::flush_batch - 1] == 0x1000 * map::flush_batch);
+        stale.add(0x1000 * (map::flush_batch + 1));
+        CHECK(stale.count == map::flush_batch);
+        CHECK(stale.all);
+        stale.epoch = map::flush_epoch();
+        stale.invalidate();
+    }
+
+    test("invalidate empties the list");
+    {
+        map::pending_invalidation stale;
+        stale.add(0x1000);
+        stale.epoch = map::flush_epoch();
+        stale.invalidate();
+        CHECK(stale.count == 0);
+        CHECK(!stale.all);
+        CHECK(stale.epoch == map::never_flushed);
+        stale.invalidate();
+        CHECK(stale.count == 0);
+    }
+}
+
+void mapping_pte_ref()
+{
+    function("mapping::pte_ref");
+
+    test("empty is false; a leaf reports level, size, address and permissions");
+    {
+        map::pte_ref none;
+        CHECK(!none);
+        scratch s(page);
+        auto f = fr::alloc();
+        CHECK(map::attach(s.range(0, page), f, mem::perm_rw));
+        auto e = map::find(s.start());
+        CHECK(bool(e));
+        CHECK(e.level() == 0);
+        CHECK(e.size() == page);
+        CHECK(e.addr() == f);
+        CHECK(e.perm() == mem::perm_rw);
+        CHECK(e.present());
+        CHECK(!e.empty());
+        map::detach(s.range(0, page));
+        fr::free(f);
+    }
+
+    test("read, write, exchange and compare_exchange act on the slot");
+    {
+        scratch s(page);
+        auto f = fr::alloc();
+        auto g = fr::alloc();
+        auto e = map::prepare(s.start());
+        CHECK(e.read() == 0);
+        map::pte leaf_f = e.leaf_for(f, mem::perm_rw);
+        map::pte leaf_g = e.leaf_for(g, mem::perm_rw);
+        e.write(leaf_f);
+        CHECK(e.read() == leaf_f);
+        CHECK(e.exchange(leaf_g) == leaf_f);
+        CHECK(e.addr() == g);
+        map::pte expected = leaf_f;
+        CHECK(!e.compare_exchange(expected, leaf_f));
+        CHECK(expected == leaf_g);
+        CHECK(e.compare_exchange(expected, leaf_f));
+        CHECK(e.addr() == f);
+        map::barrier();
+        map::detach(s.range(0, page));
+        fr::free(f);
+        fr::free(g);
+    }
+
+    test("leaf_for builds the entry for this slot's level");
+    {
+        scratch s(huge, huge);
+        map::detach(s.range(0, huge));
+        auto b = fr::alloc(huge, huge);
+        auto e = map::prepare(s.start(), huge);
+        e.write(e.leaf_for(b, mem::perm_read));
+        map::barrier();
+        CHECK(e.present());
+        CHECK(e.addr() == b);
+        CHECK(e.perm() == mem::perm_read);
+        CHECK(map::find(s.start() + huge - 1).addr() == b);
+        map::detach(s.range(0, huge));
+        fr::free(b, huge);
+    }
+
+    test("the software bits survive a round trip without disturbing the entry");
+    {
+        scratch s(page);
+        auto f = fr::alloc();
+        CHECK(map::attach(s.range(0, page), f, mem::perm_rw));
+        auto e = map::find(s.start());
+        CHECK(map::sw_bits >= 3);
         for (unsigned n = 0; n < map::sw_bits; n++) {
             CHECK(!map::pte_sw_bit(e.read(), n));
             e.write(map::pte_set_sw_bit(e.read(), n, true));
@@ -895,59 +2378,9 @@ void mapping_functional()
             e.write(map::pte_set_sw_bit(e.read(), n, false));
             CHECK(!map::pte_sw_bit(e.read(), n));
         }
-        s.ptr()[0] = 0x44;      // still a usable mapping afterwards
-
+        s.ptr()[0] = 0x44;
         map::detach(s.range(0, page));
-        mem::frames::free(f);
-    }
-
-    section("nothing is mapped where nothing was attached");
-    {
-        scratch s(16 * page);
-        CHECK(!map::find(s.start()));
-        CHECK(!map::find(s.start() + 15 * page));
-
-        map::populate(s.range(page, page), mem::perm_rw);
-        CHECK(!map::find(s.start()));
-        CHECK(bool(map::find(s.start() + page)));
-        CHECK(!map::find(s.start() + 2 * page));
-        map::depopulate(s.range(page, page));
-    }
-
-    section("a global flush advances the epoch and a deferred detach does not");
-    {
-        scratch s(page);
-        CHECK(map::populate(s.range(0, page), mem::perm_rw));
-
-        auto before = map::flush_epoch();
-        map::flush_all();
-        CHECK(map::flush_epoch() > before);
-
-        auto phys = map::find(s.start()).addr();
-        before = map::flush_epoch();
-
-        // The addresses come back in the caller's own record, so it can settle
-        // exactly them, and nothing was invalidated on the way out.
-        map::pending_invalidation stale;
-        map::detach_deferred(s.range(0, page), stale);
-        CHECK(stale.count == 1);
-        CHECK(stale.va[0] == s.start());
-        CHECK(!stale.all);
-        CHECK(!map::find(s.start()));
-        CHECK(map::flush_epoch() == before);
-
-        // Two completed global invalidations settle the debt, not one: the
-        // first may have been under way while the entry was still mapped.
-        // Once they have happened, invalidate() has nothing left to do, and it
-        // says so by not moving the epoch itself.
-        map::flush_all();
-        map::flush_all();
-        auto quiet = map::flush_epoch();
-        stale.invalidate();
-        CHECK(map::flush_epoch() == quiet);
-        CHECK(stale.count == 0);
-        CHECK(!stale.all);
-        mem::frames::free(phys);
+        fr::free(f);
     }
 }
 
@@ -957,13 +2390,10 @@ void mapping_perf()
 
     section("attach and detach one page");
     {
-        // attach() refuses a range that is already mapped, so each one has to
-        // land on a page of its own; the detach that empties them again is
-        // outside the measurement.
         const size_t pages = 512;
         const int rounds = 40;
         scratch s(pages * page);
-        auto f = mem::frames::alloc();
+        auto f = fr::alloc();
         map::prepare(s.range(0, pages * page), page);
 
         double total = 0;
@@ -986,14 +2416,14 @@ void mapping_perf()
         }
         report_ns("attach + detach 4 KiB, one global flush each", since(t0), n);
 
-        mem::frames::free(f);
+        fr::free(f);
     }
 
     section("the prepared path: one store per page");
     {
         const size_t pages = 512;
         scratch s(pages * page);
-        auto f = mem::frames::alloc();
+        auto f = fr::alloc();
         std::vector<map::pte_ref> slot(pages);
 
         auto t0 = clk::now();
@@ -1013,7 +2443,7 @@ void mapping_perf()
         report_ns("write a prepared leaf", since(t0), double(rounds) * pages);
 
         map::detach(s.range(0, pages * page));
-        mem::frames::free(f);
+        fr::free(f);
     }
 
     section("populate and depopulate");
@@ -1056,1147 +2486,191 @@ void mapping_perf()
     }
 }
 
-/* early ------------------------------------------------------------------- */
+/* misc -------------------------------------------------------------------- */
 
-void early_functional()
+void misc_map_phys()
 {
-    group("early");
+    function("mem::map_phys");
 
-    section("an early object round-trips, before the heap and after");
+    test("a pointer to the frames given, that reaches them");
     {
-        CHECK(mem::early::takes(64, 8));
-        void *p = mem::early::alloc(64, 8);
-        CHECK(p != nullptr);
-        CHECK(mem::early::owns(p));
-        CHECK(!mem::heap::owns(p));
-        CHECK(mem::early::size_of(p) == 64);
-        memset(p, 0x77, 64);
-        CHECK(static_cast<unsigned char *>(p)[63] == 0x77);
-        mem::early::free(p);
-    }
-
-    section("alignment is honoured");
-    {
-        void *p = mem::early::alloc(100, 256);
-        CHECK((reinterpret_cast<uintptr_t>(p) & 255) == 0);
-        mem::early::free(p);
-    }
-
-    section("as many pages as boot asks for, all given back");
-    {
-        // One object per page, live at once: boot holds one of these for every
-        // cpu it brings up, and the count is not something to guess at.
-        const int n = 512;
-        const size_t big = page - 64;
-        std::vector<void *> p(n);
-        for (int i = 0; i < n; i++) {
-            p[i] = mem::early::alloc(big, 8);
-            CHECK(p[i] != nullptr);
-            memset(p[i], i & 0xff, big);
-        }
-        bool own = true, kept = true;
-        for (int i = 0; i < n; i++) {
-            own = own && mem::early::owns(p[i]);
-            kept = kept && static_cast<unsigned char *>(p[i])[big - 1] == (i & 0xff);
-        }
-        CHECK(own);
-        CHECK(kept);
-        for (int i = 0; i < n; i++) {
-            mem::early::free(p[i]);
-        }
-        void *q = mem::early::alloc(64, 8);
-        CHECK(q != nullptr);
-        CHECK(mem::early::owns(q));
-        mem::early::free(q);
-    }
-
-    section("what no page can hold gets frames of its own");
-    {
-        CHECK(!mem::early::takes(3 * page, 64));
-        auto *p = static_cast<char *>(mem::early::alloc(3 * page, 64));
-        CHECK(p != nullptr);
-        CHECK(mem::early::owns(p));
-        CHECK(mem::early::size_of(p) >= 3 * page);
-        memset(p, 0x2f, 3 * page);
-        CHECK(static_cast<unsigned char>(p[3 * page - 1]) == 0x2f);
-        mem::early::free(p);
-    }
-}
-
-/* phys -------------------------------------------------------------------- */
-
-void phys_functional()
-{
-    group("phys");
-
-    section("map_phys hands back a pointer to the frames it was given");
-    {
-        mem::frames::phys_addr pa = mem::frames::alloc();
+        auto pa = fr::alloc();
         auto *v = static_cast<char *>(mem::map_phys(pa, page));
         CHECK(v != nullptr);
         v[0] = 0x5c;
         v[page - 1] = 0x5d;
-        auto *l = static_cast<char *>(mem::frames::to_linear(pa));
-        CHECK(l[0] == 0x5c);
-        CHECK(static_cast<unsigned char>(l[page - 1]) == 0x5d);
-        mem::frames::free(pa);
+        CHECK(map::to_phys(v) == pa);
+        CHECK(map::to_phys(v + page - 1) == pa + page - 1);
+        fr::free(pa);
+    }
+
+    test("the same frames twice is the same pointer");
+    {
+        auto pa = fr::alloc(huge, huge);
+        void *a = mem::map_phys(pa, huge);
+        void *b = mem::map_phys(pa, huge);
+        void *c = mem::map_phys(pa + page, page);
+        CHECK(a == b);
+        CHECK(c == static_cast<char *>(a) + page);
+        fr::free(pa, huge);
+    }
+
+    test("the range is rounded out to whole pages and the pointer is to the byte");
+    {
+        auto pa = fr::alloc();
+        auto *v = static_cast<char *>(mem::map_phys(pa + 100, 100));
+        CHECK(map::to_phys(v) == pa + 100);
+        CHECK(map::to_phys(v - 100) == pa);
+        v[0] = 0x21;
+        CHECK(view(pa)[100] == 0x21);
+        fr::free(pa);
     }
 }
 
-/* heap -------------------------------------------------------------------- */
-
-/*
- * Only what needs to see inside. How the heap behaves as an allocator is in
- * os-memory.cc, through malloc, so that the same checks run on Linux and OSv;
- * what is here is the part of its design that is invisible from there -- that
- * a big allocation is one huge leaf rather than 512 small ones.
- */
-void heap_functional()
+void misc_map_phys_at()
 {
-    group("heap");
+    function("mem::map_phys_at");
 
-    section("the heap answers for what it owns");
+    test("maps at the address asked, and reserves it for good");
     {
-        CHECK(mem::heap::takes(16, 16));
-        CHECK(mem::heap::takes(1ul << 20, 4096));
-        CHECK(!mem::heap::takes(100, 4ul << 20));
-
-        void *p = mem::heap::alloc(100, 16);
-        CHECK(p != nullptr);
-        CHECK(mem::heap::owns(p));
-        CHECK(mem::heap::size_of(p) >= 100);
-        mem::heap::free(p);
-
-        // The sized form, which is what operator delete supplies.
-        void *q = mem::heap::alloc(64, 16);
-        CHECK(q != nullptr);
-        mem::heap::free(q, 64);
-
-        // A mapping has a reservation of its own too, and the heap must not
-        // mistake it for one of its large allocations.
-        void *m = mmap(nullptr, huge, PROT_READ | PROT_WRITE,
-                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        CHECK(m != MAP_FAILED);
-        CHECK(!mem::heap::owns(m));
-        CHECK(mem::heap::size_of(m) == 0);
-        CHECK(munmap(m, huge) == 0);
-    }
-
-    section("a large allocation is backed by huge pages");
-    {
-        const size_t bytes = 5 * huge / 2;    // not a whole number of huge pages
-        auto *p = static_cast<char *>(malloc(bytes));
-        CHECK(p != nullptr);
-        CHECK(malloc_usable_size(p) >= bytes);
-
-        // One entry per 2 MiB, over a frame aligned to it. This is the whole
-        // reason the heap asks for huge pages: 512 times fewer entries, and a
-        // TLB that can cover the allocation.
-        auto e = map::find(reinterpret_cast<uintptr_t>(p));
-        CHECK(bool(e));
-        CHECK(e.level() == 1);
-        CHECK((e.addr() & (huge - 1)) == 0);
-
-        // The last byte promised is as reachable as the first, which is what
-        // rounding the mapping up to whole huge pages is for.
-        memset(p, 0x3c, bytes);
-        CHECK(p[bytes - 1] == 0x3c);
-        free(p);
-    }
-
-    section("the heap gives its pages back when there is nothing else left");
-    {
-        // The heap keeps a page that empties, however many there are, because
-        // taking it again is not free and nothing has said the memory is
-        // wanted elsewhere. What makes that safe is frames::alloc() asking for
-        // it before it fails, and this is the only thing that asks.
-        const size_t size = 64ul << 10;
-        size_t before = mem::frames::free_bytes();
-        // Enough of the heap to measure, and not so much that the objects take
-        // longer to make than the giving back takes to show.
-        size_t asked = std::min<size_t>(before / 2, 4ul << 30);
-        size_t n = asked / size;
-        std::vector<void *> p(n);
-        for (size_t i = 0; i < n; i++) {
-            p[i] = malloc(size);
-        }
-        for (size_t i = 0; i < n; i++) {
-            free(p[i]);
-        }
-        size_t held = before - mem::frames::free_bytes();
-        CHECK(held > asked / 2);      // it really is holding it
-
-        // Ask for more than is free but not for all of what it holds, so
-        // that the rest of the kernel is never actually out of memory. Huge
-        // blocks while they last and pages after: what is tested here is that
-        // the memory comes back, and by then the rest of the system has left
-        // no 2 MiB run in what it is using.
-        size_t free_at_start = mem::frames::free_bytes();
-        size_t want = free_at_start + held / 2;
-        std::vector<mem::frames::phys_addr> big, small;
-        size_t taken = 0;
-        for (;;) {
-            if (taken >= want) {
-                break;
-            }
-            auto f = mem::frames::alloc(huge, huge);
-            if (f != mem::frames::no_memory) {
-                big.push_back(f);
-                taken += huge;
-                continue;
-            }
-            auto s = mem::frames::alloc(page, page);
-            if (s == mem::frames::no_memory) {
-                break;
-            }
-            small.push_back(s);
-            taken += page;
-        }
-        CHECK(taken >= want);
-        printf("      heap held %zu MiB, gave back %zu MiB under pressure\n",
-               held >> 20,
-               taken > free_at_start ? (taken - free_at_start) >> 20 : 0);
-        for (auto f : small) {
-            mem::frames::free(f, page);
-        }
-        for (auto f : big) {
-            mem::frames::free(f, huge);
-        }
-    }
-
-    section("the pages under an allocation are given back");
-    {
-        const size_t bytes = 8 * huge;
-        size_t before = mem::frames::free_bytes();
-        void *p = malloc(bytes);
-        CHECK(p != nullptr);
-        memset(p, 0x5a, bytes);
-        CHECK(before - mem::frames::free_bytes() >= bytes);
-        free(p);
-        // The mapping goes with the frames, so nothing can be reached there.
-        CHECK(!map::find(reinterpret_cast<uintptr_t>(p)));
-        CHECK(mem::frames::free_bytes() >= before - huge);
-    }
-}
-
-/* page cache -------------------------------------------------------------- */
-
-/*
- * A backend with nothing behind it: every byte is a function of where it is, so
- * an object of any size costs nothing to serve and every byte read can be
- * checked against what it should have been. Synchronous, since what is being
- * tested here is the cache and not a driver.
- */
-struct pattern_store : mem::store {
-    explicit pattern_store(uint64_t bytes) : _bytes(bytes) {}
-
-    uint64_t size() override { return _bytes; }
-
-    mem::io *read(void *buf, uint64_t off, size_t bytes) override
-    {
-        fill(static_cast<uint8_t *>(buf), off, bytes);
-        // Which frame each page was filled into, so that a write-back from a
-        // frame that was never filled for that page can be told apart.
-        if (read_from) {
-            for (size_t i = 0; i < bytes; i += page) {
-                read_from[(off + i) / page].store(
-                    (reinterpret_cast<uint64_t>(buf) + i) & ~uint64_t(page - 1),
-                    std::memory_order_relaxed);
-            }
-        }
-        reads += bytes;
-        return done_with(bytes);
-    }
-
-    mem::io *write(const void *buf, uint64_t off, size_t bytes) override
-    {
-        // What comes back has to be what that offset holds: a write-back
-        // reading the wrong frame says so here rather than at the next fault.
-        if (verify) {
-            auto *w = static_cast<const uint64_t *>(buf);
-            size_t n = bytes / sizeof(uint64_t), bad = 0, first = 0;
-            int64_t delta = 0;
-            bool uniform = true;
-            for (size_t i = 0; i < n; i++) {
-                uint64_t want = word(off + i * sizeof(uint64_t));
-                if (w[i] == want) {
-                    continue;
-                }
-                if (!bad++) {
-                    first = i;
-                    delta = int64_t(w[i] - want);
-                } else if (int64_t(w[i] - want) != delta) {
-                    uniform = false;
-                }
-            }
-            // One displacement over a whole page says the frame was another
-            // page's; a mixed one says the contents are not a page at all.
-            if (bad && !wrong.fetch_add(bad)) {
-                wrong_off = off + first * sizeof(uint64_t);
-                wrong_val = w[first];
-                wrong_bytes = bytes;
-                wrong_pos = first * sizeof(uint64_t);
-                wrong_run = bad * sizeof(uint64_t);
-                wrong_uniform = uniform;
-                if (read_from) {
-                    uint64_t bad_off = off + first * sizeof(uint64_t);
-                    wrong_frame = (reinterpret_cast<uint64_t>(buf) +
-                                   first * sizeof(uint64_t)) & ~uint64_t(page - 1);
-                    wrong_frame_of_off = read_from[bad_off / page].load(
-                        std::memory_order_relaxed);
-                    wrong_frame_of_val = read_from[w[first] / page].load(
-                        std::memory_order_relaxed);
-                }
-                // Stop on the spot: the backtrace names the eviction that did
-                // it, which is gone by the time the threads have joined.
-                if (stop_on_wrong) {
-                    printf("\n!! write-back caught in the act\n");
-                    printf("   %#lx holds %#lx (%+ld pages), %zu of %zu B wrong "
-                           "at +%zu, %s\n",
-                           wrong_off.load(), wrong_val.load(),
-                           (long)(wrong_val.load() - wrong_off.load()) / (long)page,
-                           wrong_run.load(), wrong_bytes.load(),
-                           wrong_pos.load(),
-                           uniform ? "one displacement" : "mixed");
-                    printf("   frame %#lx; that page was read into %#lx (%s), "
-                           "the page it holds into %#lx (%s)\n",
-                           wrong_frame.load(), wrong_frame_of_off.load(),
-                           wrong_frame.load() == wrong_frame_of_off.load()
-                               ? "same" : "OTHER",
-                           wrong_frame_of_val.load(),
-                           wrong_frame.load() == wrong_frame_of_val.load()
-                               ? "same" : "other");
-                    abort("pagecache: a write-back handed over another page\n");
-                }
-            }
-        }
-        // Only where a test is going to look. Where the hardware keeps no
-        // dirty bit every eviction writes back, and an object larger than
-        // memory would put every byte of itself in here.
-        if (record) {
-            auto *w = static_cast<const uint64_t *>(buf);
-            for (size_t i = 0; i < bytes / sizeof(uint64_t); i++) {
-                written[off + i * sizeof(uint64_t)] = w[i];
-            }
-        }
-        writes += bytes;
-        return done_with(bytes);
-    }
-
-    bool done(mem::io *) override { return true; }
-
-    int64_t wait(mem::io *req) override
-    {
-        auto *r = reinterpret_cast<int64_t *>(req);
-        int64_t n = *r;
-        delete r;
-        return n;
-    }
-
-    // Every aligned word is its own offset, so a byte anywhere says where it
-    // came from and a transfer of any length can be checked.
-    static uint64_t word(uint64_t off) { return off; }
-
-    static void fill(uint8_t *p, uint64_t off, size_t n)
-    {
-        size_t whole = n & ~size_t(7);
-        auto *w = reinterpret_cast<uint64_t *>(p);
-        for (size_t i = 0; i < whole / sizeof(uint64_t); i++) {
-            w[i] = off + i * sizeof(uint64_t);
-        }
-        for (size_t i = whole; i < n; i++) {
-            p[i] = uint8_t((off + (i & ~size_t(7))) >> (8 * (i & 7)));
-        }
-    }
-
-    uint64_t _bytes;
-    bool record = false;
-    bool verify = false;            // check what write-back hands over
-    bool stop_on_wrong = false;     // halt the guest where it is caught
-    std::atomic<size_t> reads{0};
-    std::atomic<size_t> writes{0};
-    std::atomic<size_t> wrong{0};
-    std::atomic<uint64_t> wrong_off{0}, wrong_val{0};
-    std::atomic<size_t> wrong_bytes{0}, wrong_pos{0}, wrong_run{0};
-    std::atomic<bool> wrong_uniform{false};
-    std::atomic<uint64_t> wrong_frame{0}, wrong_frame_of_off{0}, wrong_frame_of_val{0};
-    std::atomic<uint64_t> *read_from = nullptr;
-
-    void track_frames()
-    {
-        read_from = new std::atomic<uint64_t>[_bytes / page]();
-    }
-    std::map<uint64_t, uint64_t> written;   // only where a test wrote something
-
-private:
-    mem::io *done_with(size_t bytes)
-    {
-        return reinterpret_cast<mem::io *>(new int64_t(bytes));
-    }
-};
-
-// Reads that ask for more than a page at a time, to check that a buffer is
-// whatever the policy says it is rather than always one page.
-void fault_64k(void *, uint64_t off, uint64_t *start, uint64_t *len)
-{ *len = 64 * 1024; *start = (off / *len) * *len; }
-
-// Three pages and a bit: bigger than a couple of pages, and no whole number of
-// them, so consecutive buffers begin and end part-way through one.
-const uint64_t ragged_span = 3 * 4096 + 1000;
-void fault_ragged(void *, uint64_t off, uint64_t *start, uint64_t *len)
-{ *len = ragged_span; *start = (off / *len) * *len; }
-
-// Megabytes and misaligned: the analytics-page shape, with whole 2 MiB spans
-// inside every buffer.
-const uint64_t big_span = (5ull << 20) + 12345;
-void fault_big(void *, uint64_t off, uint64_t *start, uint64_t *len)
-{ *len = big_span; *start = (off / *len) * *len; }
-
-void fault_huge(void *, uint64_t off, uint64_t *start, uint64_t *len)
-{ *len = huge; *start = (off / *len) * *len; }
-
-// A sequential-readahead prefetch: whatever immediately follows the buffer
-// that faulted, out to "also"'s capacity.
-void readahead(void *, mem::pagecache::buffer &b, mem::pagecache::offset_list &also)
-{
-    namespace pc = mem::pagecache;
-    uint64_t step = pc::size(b);
-    uint64_t next = pc::offset(b) + step;
-    for (unsigned i = 0; i < also.max; i++, next += step) {
-        also.add(next);
-    }
-}
-
-/* store ------------------------------------------------------------------- */
-
-void store_functional()
-{
-    group("store");
-
-    section("a store moves bytes both ways and says when it is done");
-    {
-        pattern_store s(1ul << 20);
-        s.record = true;
-        std::vector<uint8_t> buf(3 * page);
-
-        CHECK(s.read_now(buf.data(), 8192, buf.size()) == (int64_t)buf.size());
-        bool ok = true;
-        for (size_t i = 0; i + 8 <= buf.size(); i += 8) {
-            uint64_t w;
-            memcpy(&w, buf.data() + i, 8);
-            ok = ok && w == pattern_store::word(8192 + i);
-        }
-        CHECK(ok);
-
-        uint64_t magic = 0x1122334455667788ull;
-        memcpy(buf.data(), &magic, 8);
-        CHECK(s.write_now(buf.data(), 4096, 8) == 8);
-        CHECK(s.written[4096] == magic);
-
-        // The split form: start, ask, wait.
-        mem::io *req = s.read(buf.data(), 0, page);
-        CHECK(req != nullptr);
-        CHECK(s.done(req));
-        CHECK(s.wait(req) == (int64_t)page);
-    }
-}
-
-/*
- * A policy that records everything the cache tells it, so every hook and every
- * buffer accessor is checked from the policy's side of the contract. Victims
- * are kept on a stack threaded through policy_data.
- */
-struct spy_state {
-    uint64_t created_size = 0;
-    std::atomic<int> faults{0}, evicted{0};
-    std::atomic<bool> accessors_ok{true};
-    mutex lock;
-    mem::pagecache::buffer *top = nullptr;
-};
-
-spy_state g_spy;
-std::atomic<bool> g_spy_destroyed{false};
-
-void *spy_create(uint64_t store_size)
-{
-    g_spy.created_size = store_size;
-    g_spy.faults = 0;
-    g_spy.evicted = 0;
-    g_spy.accessors_ok = true;
-    g_spy.top = nullptr;
-    g_spy_destroyed = false;
-    return &g_spy;
-}
-
-void spy_destroy(void *p)
-{
-    g_spy_destroyed = p == &g_spy;
-}
-
-void spy_on_fault(void *p, mem::pagecache::buffer &b)
-{
-    namespace pc = mem::pagecache;
-    auto *st = static_cast<spy_state *>(p);
-    st->faults.fetch_add(1);
-    bool ok = pc::size(b) > 0 && pc::size(b) <= ragged_span &&
-              pc::offset(b) + pc::size(b) <= st->created_size &&
-              pc::data(b) != nullptr;
-    // The contents are there before the policy hears of the buffer.
-    if (ok && pc::size(b) >= 8 && pc::offset(b) % 8 == 0) {
-        ok = *static_cast<uint64_t *>(pc::data(b)) == pattern_store::word(pc::offset(b));
-    }
-    if (!ok) {
-        st->accessors_ok = false;
-    }
-    WITH_LOCK(st->lock) {
-        *static_cast<pc::buffer **>(pc::policy_data(b)) = st->top;
-        st->top = &b;
-    }
-}
-
-void spy_evict(void *p, size_t bytes, mem::pagecache::buffer_list &victims)
-{
-    namespace pc = mem::pagecache;
-    auto *st = static_cast<spy_state *>(p);
-    size_t got = 0;
-    WITH_LOCK(st->lock) {
-        while (st->top && got < bytes && !victims.full()) {
-            pc::buffer *b = st->top;
-            st->top = *static_cast<pc::buffer **>(pc::policy_data(*b));
-            victims.add(b);
-            got += pc::size(*b);
-        }
-    }
-}
-
-void spy_on_evicted(void *p, mem::pagecache::buffer &)
-{
-    static_cast<spy_state *>(p)->evicted.fetch_add(1);
-}
-
-bool spy_is_dirty(void *, mem::pagecache::buffer &)
-{
-    return false;
-}
-
-const mem::pagecache::policy spy_policy = {
-    .bytes_per_buffer = sizeof(void *),
-    .create = spy_create,
-    .destroy = spy_destroy,
-    .fault_extent = fault_ragged,
-    .prefetch = nullptr,
-    .prefetch_depth = 0,
-    .evict = spy_evict,
-    .on_fault = spy_on_fault,
-    .on_evicted = spy_on_evicted,
-    .is_dirty = spy_is_dirty,
-};
-
-void pagecache_functional()
-{
-    group("pagecache");
-    namespace pc = mem::pagecache;
-
-    section("a page is read in when it is touched, and not before");
-    {
-        pattern_store s(16 * huge);
-        void *m = pc::map(s);
-        CHECK(m != nullptr);
-        CHECK(!pc::resident(m));
-        CHECK(s.reads.load() == 0);
-
-        auto *w = static_cast<volatile uint64_t *>(m);
-        CHECK(w[0] == pattern_store::word(0));
-        CHECK(pc::resident(m));
-        CHECK(s.reads.load() == page);
-
-        // Somewhere else entirely, which the first fault cannot have covered.
-        auto *far = reinterpret_cast<volatile uint64_t *>(
-            static_cast<char *>(m) + 8 * huge);
-        CHECK(!pc::resident(const_cast<uint64_t *>(far)));
-        CHECK(far[0] == pattern_store::word(8 * huge));
-        CHECK(s.reads.load() == 2 * page);
-        pc::unmap(m);
-    }
-
-    section("a buffer is as big as the policy asks for");
-    {
-        pattern_store s(16 * huge);
-        pc::policy p = pc::defaults();
-        p.fault_extent = fault_64k;
-
-        void *m = pc::map(s, p);
-        CHECK(m != nullptr);
-        auto *b = static_cast<char *>(m);
-        CHECK(*reinterpret_cast<volatile uint64_t *>(b + 8 * page) ==
-              pattern_store::word(8 * page));
-
-        // One transfer, and the fifteen pages around it are there without
-        // another fault between them.
-        CHECK(s.reads.load() == 64 * 1024);
-        for (int i = 0; i < 16; i++) {
-            CHECK(pc::resident(b + i * page));
-        }
-        CHECK(!pc::resident(b + 16 * page));
-        pc::unmap(m);
-    }
-
-    section("a buffer holds every page it touches, shared edges included");
-    {
-        /*
-         * Buffers of an awkward size, which is the case this is all for: an
-         * analytics page is whatever it is, and consecutive ones land wherever
-         * the one before them ended.
-         *
-         *   bytes 0     13288       26576       39864       53152
-         *         |  b0   |    b1     |    b2     |    b3     |
-         *   pages 0  1  2  3  4  5  6  7  8  9 10 11 12
-         *
-         * b2 is [26576, 39864). Pages 7 and 8 are inside it; pages 6 and 9 it
-         * shares with the buffer either side, and it holds those whole.
-         */
-        const uint64_t span = ragged_span;
-        pattern_store s(16 * huge);
-        pc::policy p = pc::defaults();
-        p.fault_extent = fault_ragged;
-
-        void *m = pc::map(s, p);
-        CHECK(m != nullptr);
-        auto *b = static_cast<char *>(m);
-
-        const uint64_t b2 = 2 * span;
-        const uint64_t lo = b2 / page;                       // 6, shared below
-        const uint64_t hi = (3 * span - 1) / page;           // 9, shared above
-        CHECK(lo * page < b2);                               // it really is shared
-        CHECK((hi + 1) * page > 3 * span);
-
-        // One touch in the middle of it. A fault names the page it happened
-        // in, not the byte, so this has to be somewhere the page it lands in
-        // begins inside b2 -- which is what "inner" means here.
-        const uint64_t mid = (b2 + span / 2) & ~uint64_t(7);
-        CHECK(*reinterpret_cast<volatile uint64_t *>(b + mid) ==
-              pattern_store::word(mid));
-
-        // Every page it touches came in, the two it only partly owns included,
-        // and nothing beyond them did.
-        for (uint64_t i = lo; i <= hi; i++) {
-            CHECK(pc::resident(b + i * page));
-        }
-        CHECK(!pc::resident(b + (lo - 1) * page));
-        CHECK(!pc::resident(b + (hi + 1) * page));
-        CHECK(s.reads.load() == (hi - lo + 1) * page);
-
-        // The bytes of b2 that fell in those shared pages are readable now,
-        // although the buffers they belong to have never been faulted.
-        CHECK(*reinterpret_cast<volatile uint64_t *>(b + lo * page) ==
-              pattern_store::word(lo * page));
-        CHECK(*reinterpret_cast<volatile uint64_t *>(b + hi * page) ==
-              pattern_store::word(hi * page));
-
-        // Its neighbour now finds one of its own pages taken. It stops at the
-        // edge rather than fighting for it, so it comes up short by the part
-        // of itself that fell in page "lo".
-        size_t before = s.reads.load();
-        CHECK(*reinterpret_cast<volatile uint64_t *>(b + span) ==
-              pattern_store::word(span));
-        CHECK(s.reads.load() - before == (lo - span / page) * page);
-        CHECK(pc::resident(b + span));
-        // b1 starts part-way through page 3, and that page came in with it and
-        // not with b0, which has still not been read at all.
-        CHECK(pc::resident(b + (span / page) * page));
-        CHECK(!pc::resident(b + (span / page - 1) * page));
-
-        // And every byte of the four of them reads as the object says, across
-        // the seams and through the pages two buffers had a claim on.
-        bool ok = true;
-        for (uint64_t off = 0; off < 4 * span; off += sizeof(uint64_t)) {
-            ok &= *reinterpret_cast<volatile uint64_t *>(b + off) ==
-                  pattern_store::word(off);
-        }
-        CHECK(ok);
-        pc::unmap(m);
-    }
-
-    section("a page two buffers fall in goes to the one that was reached for");
-    {
-        // Page 3 holds the end of b0 and the start of b1. Which of them it
-        // comes in with is decided by the byte that faulted, so the same page
-        // goes either way depending on what was touched.
-        const uint64_t span = ragged_span;
-        const uint64_t seam = span / page;               // 3
-        const uint64_t here = seam * page;               // 12288, still b0
-
+        // A free address outside the linear map: the mapping and the
+        // reservation it makes are permanent, which is the contract.
+        uintptr_t va;
         {
-            pattern_store s(16 * huge);
-            pc::policy p = pc::defaults();
-            p.fault_extent = fault_ragged;
-            void *m = pc::map(s, p);
-            auto *b = static_cast<char *>(m);
-
-            CHECK(*reinterpret_cast<volatile uint64_t *>(b + here) ==
-                  pattern_store::word(here));
-            // b0 is [0, span): pages 0 to 3.
-            CHECK(pc::resident(b));
-            CHECK(pc::resident(b + here));
-            CHECK(!pc::resident(b + here + page));
-            CHECK(s.reads.load() == (seam + 1) * page);
-            pc::unmap(m);
+            vs::region r{};
+            CHECK(vs::reserve(r, page, page) == resa::success);
+            va = r.span.start;
+            vs::release(r);
         }
-        {
-            pattern_store s(16 * huge);
-            pc::policy p = pc::defaults();
-            p.fault_extent = fault_ragged;
-            void *m = pc::map(s, p);
-            auto *b = static_cast<char *>(m);
+        auto pa = fr::alloc();
+        memset(view(pa), 0x77, page);
+        mem::map_phys_at(reinterpret_cast<void *>(va), pa, page);
+        CHECK(map::to_phys(va) == pa);
+        CHECK(peek(va) == 0x77);
+        *reinterpret_cast<volatile char *>(va + 1) = 0x78;
+        CHECK(view(pa)[1] == 0x78);
+        CHECK(map::find(va).perm() == mem::perm_rwx);
 
-            // The same page, a few hundred bytes further along, where b1
-            // begins. It comes in with b1 instead, and b0 is untouched.
-            CHECK(*reinterpret_cast<volatile uint64_t *>(b + span) ==
-                  pattern_store::word(span));
-            CHECK(!pc::resident(b));
-            CHECK(pc::resident(b + here));
-            CHECK(pc::resident(b + here + page));
-            // b1 is [span, 2 * span): pages 3 to 6.
-            const uint64_t last = (2 * span - 1) / page;
-            CHECK(s.reads.load() == (last + 1 - seam) * page);
-            pc::unmap(m);
+        vs::region *r = vs::lookup(va);
+        CHECK(r != nullptr);
+        if (r) {
+            CHECK(r->span.start == va);
+            CHECK(r->span.end == va + page);
+            CHECK(r->perm == mem::perm_rwx);
+            CHECK(r->ops == nullptr);
         }
+        CHECK(vs::reserved({va, va + page}));
+    }
+}
+
+// A region whose faults the test answers itself: one page per fault, recorded.
+struct probe_region {
+    vs::region r;
+    std::atomic<int> faults{0};
+    std::atomic<uintptr_t> last_addr{0};
+    std::atomic<unsigned> last_error{0};
+    std::atomic<bool> inside{true};
+};
+
+bool probe_fault(vs::region &r, uintptr_t addr, unsigned error)
+{
+    auto *pr = reinterpret_cast<probe_region *>(&r);
+    pr->faults.fetch_add(1);
+    pr->last_addr.store(addr);
+    pr->last_error.store(error);
+    if (!r.span.contains(addr)) {
+        pr->inside = false;
+    }
+    uintptr_t s = align_down(addr, uintptr_t(page));
+    return map::populate({s, s + page}, r.perm) || map::find(s);
+}
+
+const vs::region_ops probe_ops = {probe_fault};
+
+// The SIGSEGV side, for an address in no region, a region without ops, a
+// handler that answers false or an access the region's perm does not allow,
+// is not covered: for code inside the kernel image it aborts the kernel.
+void misc_vm_fault()
+{
+    function("mem::vm_fault");
+
+    test("a fault reaches the handler of the region that owns the address, with the byte");
+    {
+        probe_region pr;
+        pr.r.ops = &probe_ops;
+        pr.r.perm = mem::perm_rw;
+        CHECK(vs::reserve(pr.r, 16 * page, page) == resa::success);
+        uintptr_t at = pr.r.span.start + 3 * page + 17;
+        *reinterpret_cast<volatile char *>(at) = 3;
+        CHECK(pr.faults.load() == 1);
+        CHECK(pr.last_addr.load() == at);
+        CHECK(pr.inside.load());
+        CHECK(peek(at) == 3);
+        map::depopulate({pr.r.span.start, pr.r.span.end});
+        vs::release(pr.r);
     }
 
-    section("an object that ends part-way through a page");
+    test("the error code says whether the access was a write");
     {
-        const uint64_t odd = 4 * huge + 1234;
-        pattern_store s(odd);
-        void *m = pc::map(s);
-        CHECK(m != nullptr);
-        auto *b = static_cast<char *>(m);
-
-        const uint64_t last = (odd - 8) & ~uint64_t(7);
-        CHECK(*reinterpret_cast<volatile uint64_t *>(b + last) ==
-              pattern_store::word(last));
-        // The store has no more to give, and what is left of the page it ended
-        // in is reachable, so it has to be something. It is zero.
-        CHECK(b[odd] == 0);
-        CHECK(b[odd + 100] == 0);
-        pc::unmap(m);
+        probe_region pr;
+        pr.r.ops = &probe_ops;
+        pr.r.perm = mem::perm_rw;
+        CHECK(vs::reserve(pr.r, 4 * page, page) == resa::success);
+        *reinterpret_cast<volatile char *>(pr.r.span.start) = 1;
+        CHECK(map::is_page_fault_write(pr.last_error.load()));
+        peek(pr.r.span.start + page);
+        CHECK(!map::is_page_fault_write(pr.last_error.load()));
+        CHECK(pr.faults.load() == 2);
+        map::depopulate({pr.r.span.start, pr.r.span.end});
+        vs::release(pr.r);
     }
 
-    section("fetch brings in a range in one go");
+    test("a page the handler mapped does not fault again, and the others stay absent");
     {
-        pattern_store s(16 * huge);
-        void *m = pc::map(s);
-        CHECK(m != nullptr);
-        CHECK(pc::fetch(m, 32 * page) == 32 * page);
-        CHECK(s.reads.load() == 32 * page);
-
-        auto *w = static_cast<volatile uint64_t *>(m);
-        bool ok = true;
-        for (size_t i = 0; i < 32 * page / sizeof(uint64_t); i++) {
-            ok &= w[i] == pattern_store::word(i * sizeof(uint64_t));
-        }
-        CHECK(ok);
-        // Nothing more was read: fetch left the pages mapped, not just fetched.
-        CHECK(s.reads.load() == 32 * page);
-        pc::unmap(m);
+        probe_region pr;
+        pr.r.ops = &probe_ops;
+        pr.r.perm = mem::perm_rw;
+        CHECK(vs::reserve(pr.r, 16 * page, page) == resa::success);
+        auto *p = reinterpret_cast<volatile char *>(pr.r.span.start);
+        p[0] = 1;
+        p[3 * page] = 3;
+        p[1] = 2;
+        p[3 * page + 1] = 4;
+        CHECK(pr.faults.load() == 2);
+        CHECK(p[0] == 1 && p[1] == 2);
+        CHECK(p[3 * page] == 3 && p[3 * page + 1] == 4);
+        CHECK(!map::find(pr.r.span.start + page));
+        CHECK(!map::find(pr.r.span.start + 15 * page));
+        map::depopulate({pr.r.span.start, pr.r.span.end});
+        vs::release(pr.r);
     }
 
-    section("a fault reads ahead of itself when the policy asks for it");
+    test("faults from every cpu on one region each reach the handler");
     {
-        /*
-         * What prefetch does and does not do. The read is started with the
-         * fault, so the device has the whole batch at once; the buffer is not
-         * installed by it, because nothing has asked for that tile yet. So
-         * after one touch exactly one tile is present, and four more are paid
-         * for and in flight behind it.
-         */
-        pattern_store s(16 * huge);
-        pc::policy p = pc::defaults();
-        p.prefetch = readahead;
-        p.prefetch_depth = 4;
-
-        void *m = pc::map(s, p);
-        CHECK(m != nullptr);
-        auto *b = static_cast<char *>(m);
-
-        CHECK(*reinterpret_cast<volatile uint64_t *>(b) == pattern_store::word(0));
-        CHECK(pc::resident(b));
-        // Read, all five of them, in one batch.
-        CHECK(s.reads.load() == 5 * page);
-        // Installed: only the one that was asked for.
-        for (unsigned i = 1; i <= 4; i++) {
-            CHECK(!pc::resident(b + i * page));
-        }
-        // And nothing was started past what the policy named.
-        CHECK(!pc::resident(b + 5 * page));
-
-        // Reaching one of them installs it, and the contents are the store's
-        // -- the read that carried them was the prefetch's, not a new one.
-        CHECK(*reinterpret_cast<volatile uint64_t *>(b + page) ==
-              pattern_store::word(page));
-        CHECK(pc::resident(b + page));
-        CHECK(s.reads.load() == 5 * page);
-
-        // The rest likewise: every one of them is served without going back
-        // to the store, which is the whole point of having read them early.
-        for (unsigned i = 2; i <= 4; i++) {
-            CHECK(*reinterpret_cast<volatile uint64_t *>(b + i * page) ==
-                  pattern_store::word(i * page));
-            CHECK(pc::resident(b + i * page));
-        }
-        CHECK(s.reads.load() == 5 * page);
-        pc::unmap(m);
-    }
-
-    section("what is written goes back on sync, and again on unmap");
-    {
-        pattern_store s(16 * huge);
-        s.record = true;
-        void *m = pc::map(s);
-        CHECK(m != nullptr);
-
-        auto *w = static_cast<uint64_t *>(m);
-        w[0] = 0xfeed;
-        CHECK(pc::sync(m, page) == (int64_t)page);
-        CHECK(s.written[0] == 0xfeed);
-        CHECK(s.writes.load() == page);
-
-        // Nothing has changed since, so there is nothing to write -- where the
-        // hardware says so. Where it does not, everything reads as written to.
-        if (mem::mapping::tracks_writes) {
-            CHECK(pc::sync(m, page) == 0);
-            CHECK(s.writes.load() == page);
-        }
-
-        auto *later = reinterpret_cast<uint64_t *>(static_cast<char *>(m) + 4 * page);
-        *later = 0xbeef;
-        pc::unmap(m);
-        CHECK(s.written[4 * page] == 0xbeef);
-    }
-
-    section("a cache with a limit stays inside it");
-    {
-        const size_t cap = 64 << 20;
-        pattern_store s(8ull << 30);
-        void *m = pc::map(s, pc::defaults(), cap);
-        CHECK(m != nullptr);
-
-        // Measured from the mapped cache: the policy sizes its queues at
-        // create, from the store and the memory, and the limit is on buffers.
-        size_t before = mem::frames::free_bytes();
-        auto *b = static_cast<char *>(m);
-        bool ok = true;
-        size_t worst = 0;
-        for (uint64_t off = 0; off < 8 * size_t(cap); off += page) {
-            ok &= *reinterpret_cast<volatile uint64_t *>(b + off) ==
-                  pattern_store::word(off);
-            size_t held = before - mem::frames::free_bytes();
-            worst = std::max(worst, held);
-        }
-        CHECK(ok);
-        // Eight times its limit went through it, and it never held much more
-        // than the limit at once. The slack is the page tables for the range
-        // and what the frame allocator keeps in its per-cpu caches.
-        CHECK(worst < cap + (cap / 2));
-        printf("      a %zu MiB limit held at most %zu MiB\n", cap >> 20, worst >> 20);
-        pc::unmap(m);
-    }
-
-    section("a big misaligned buffer takes huge frames where it can");
-    {
-        pattern_store s(1ull << 30);
-        pc::policy p = pc::defaults();
-        p.fault_extent = fault_big;
-        void *m = pc::map(s, p);
-        CHECK(m != nullptr);
-        auto *b = static_cast<char *>(m);
-
-        // One touch in the second tile brings its whole ~5 MiB in.
-        const uint64_t off = (big_span + 3 * page) & ~uint64_t(7);
-        CHECK(*reinterpret_cast<volatile uint64_t *>(b + off) ==
-              pattern_store::word(off));
-        size_t foot = ((2 * big_span - 1) / page - big_span / page + 1) * page;
-        CHECK(s.reads.load() == foot);
-
-        // The aligned 2 MiB spans inside it are single level-1 leaves; the
-        // ragged lead is small entries.
-        uintptr_t base = reinterpret_cast<uintptr_t>(b);
-        auto h = map::find(base + align_up(big_span, uint64_t(huge)));
-        CHECK(bool(h));
-        CHECK(h.level() == 1);
-        auto l = map::find(base + align_down(big_span, uint64_t(page)));
-        CHECK(bool(l));
-        CHECK(l.level() == 0);
-
-        // Every byte of it, seams and huge interiors alike.
-        bool ok = true;
-        for (uint64_t o = big_span; o < 2 * big_span; o += 8) {
-            ok &= *reinterpret_cast<volatile uint64_t *>(b + (o & ~uint64_t(7))) ==
-                  pattern_store::word(o & ~uint64_t(7));
-        }
-        CHECK(ok);
-        pc::unmap(m);
-    }
-
-    section("big buffers cycle through a limit");
-    {
-        const size_t cap = 64 << 20;
-        pattern_store s(1ull << 30);
-        pc::policy p = pc::defaults();
-        p.fault_extent = fault_big;
-        size_t before = mem::frames::free_bytes();
-        void *m = pc::map(s, p, cap);
-        CHECK(m != nullptr);
-        auto *b = static_cast<char *>(m);
-
-        // Eight limits' worth of object, one probe per tile.
-        bool ok = true;
-        size_t worst = 0;
-        for (uint64_t off = 0; off + 8 <= 8 * uint64_t(cap); off += big_span) {
-            uint64_t o = (off + big_span / 2) & ~uint64_t(7);
-            ok &= *reinterpret_cast<volatile uint64_t *>(b + o) ==
-                  pattern_store::word(o);
-            worst = std::max(worst, before - mem::frames::free_bytes());
-        }
-        CHECK(ok);
-        CHECK(worst < cap + (cap / 2));
-        printf("      %zu MiB of %zu KiB buffers through a %zu MiB limit, held %zu MiB\n",
-               size_t(8) * (cap >> 20), size_t(big_span >> 10), cap >> 20, worst >> 20);
-        pc::unmap(m);
-    }
-
-    section("a policy of the application's own sees the life of every buffer");
-    {
-        const uint64_t bytes = 64ul << 20;
-        pattern_store s(bytes);
-        s.record = true;
-        void *m = pc::map(s, spy_policy, 8ul << 20);
-        CHECK(m != nullptr);
-        CHECK(g_spy.created_size == bytes);
-
-        auto *b = static_cast<char *>(m);
-        b[0] = 0x55;                    // written, so write-back would show
-        bool ok = true;
-        for (uint64_t off = page; off < bytes; off += ragged_span) {
-            uint64_t o = off & ~uint64_t(7);
-            ok &= *reinterpret_cast<volatile uint64_t *>(b + o) ==
-                  pattern_store::word(o);
-        }
-        CHECK(ok);
-        CHECK(g_spy.accessors_ok.load());
-        CHECK(g_spy.faults.load() >= int(bytes / ragged_span) / 2);
-        CHECK(g_spy.evicted.load() > 0);
-
-        pc::unmap(m);
-        // unmap drains through the policy, so everything it was ever handed
-        // has come back, and its is_dirty verdict held: nothing was written.
-        CHECK(g_spy.evicted.load() == g_spy.faults.load());
-        CHECK(g_spy_destroyed.load());
-        CHECK(s.writes.load() == 0);
-    }
-
-    section("two caches live side by side and die separately");
-    {
-        pattern_store s1(4 * huge), s2(4 * huge);
-        char *m1 = static_cast<char *>(pc::map(s1));
-        char *m2 = static_cast<char *>(pc::map(s2));
-        CHECK(m1 != nullptr);
-        CHECK(m2 != nullptr);
-        CHECK(m1 != m2);
-        CHECK(*reinterpret_cast<volatile uint64_t *>(m1) == pattern_store::word(0));
-        CHECK(*reinterpret_cast<volatile uint64_t *>(m2 + 8) == pattern_store::word(8));
-        pc::unmap(m1);
-        CHECK(*reinterpret_cast<volatile uint64_t *>(m2 + 16) == pattern_store::word(16));
-        CHECK(pc::resident(m2));
-        pc::unmap(m2);
-    }
-
-    section("ragged buffers survive eviction, from many threads");
-    {
-        // Buffers that share edge pages, a limit small enough that eviction
-        // runs the whole time, and every cpu faulting at once: the edge
-        // handover between a leaving buffer and an arriving neighbour has to
-        // hold under all of it.
-        pattern_store s(1ull << 30);
-        pc::policy p = pc::defaults();
-        p.fault_extent = fault_ragged;
-        void *m = pc::map(s, p, 32 << 20);
-        CHECK(m != nullptr);
-
-        auto *b = static_cast<char *>(m);
-        std::atomic<bool> ok{true};
-        std::atomic<uint64_t> bad_off{0}, bad_val{0}, bad_again{0};
-        std::atomic<uint64_t> bad_pa{0}, bad_pa_other{0};
-        parallel(n_cpus(), [&](unsigned t) {
-            uint64_t seed = 0x9e3779b9u * (t + 1);
-            for (int i = 0; i < 20000; i++) {
-                seed = seed * 6364136223846793005ull + 1;
-                uint64_t off = (seed >> 16) % ((1ull << 30) - 8) & ~uint64_t(7);
-                uint64_t v = *reinterpret_cast<volatile uint64_t *>(b + off);
-                if (v != pattern_store::word(off)) {
-                    if (ok.exchange(false)) {
-                        bad_off = off;
-                        bad_val = v;
-                        bad_again = *reinterpret_cast<volatile uint64_t *>(b + off);
-                        // While it is still mapped: after the threads join it
-                        // has usually been evicted and says nothing.
-                        bad_pa = map::to_phys(b + off);
-                        bad_pa_other = v < (1ull << 30) ? map::to_phys(b + v) : 0;
-                    }
-                }
+        probe_region pr;
+        pr.r.ops = &probe_ops;
+        pr.r.perm = mem::perm_rw;
+        unsigned threads = n_cpus();
+        const int per_thread = 32;
+        CHECK(vs::reserve(pr.r, threads * per_thread * page, page) == resa::success);
+        parallel(threads, [&](unsigned id) {
+            for (int i = 0; i < per_thread; i++) {
+                auto *p = reinterpret_cast<volatile char *>(
+                    pr.r.span.start + (id * per_thread + i) * page);
+                *p = char(id + 1);
             }
         });
-        if (!ok) {
-            uint64_t o = bad_off.load(), v = bad_val.load();
-            printf("      at %#lx read %#lx (delta %ld, page %+ld, spans %+ld) "
-                   "reread %#lx\n",
-                   o, v, (long)(v - o), (long)(v - o) / (long)page,
-                   (long)(v - o) / (long)ragged_span, bad_again.load());
-            // Same frame under both addresses means one was handed out twice;
-            // different frames mean this one was filled for somebody else.
-            unsigned long pa = bad_pa.load(), pb = bad_pa_other.load();
-            printf("      phys %#lx, phys of the data's own address %#lx, %s\n",
-                   pa, pb, pa && pa == pb ? "SAME FRAME" : "different");
-        }
-
-        // Whether any frame is under two addresses at once, which is the
-        // shape of every wrong value seen so far. Independent of whether a
-        // probe happened to land on one.
-        {
-            std::map<mem::frames::phys_addr, uint64_t> seen;
-            unsigned dup = 0, resident = 0;
-            for (uint64_t off = 0; off < (1ull << 30); off += page) {
-                auto pa = map::to_phys(b + off);
-                if (!pa) {
-                    continue;
-                }
-                resident++;
-                auto it = seen.find(pa);
-                if (it != seen.end()) {
-                    if (dup++ < 4) {
-                        printf("      ALIAS: frame %#lx at %#lx and %#lx\n",
-                               (unsigned long)pa, it->second, off);
-                    }
-                } else {
-                    seen[pa] = off;
-                }
+        CHECK(pr.faults.load() == int(threads * per_thread));
+        CHECK(pr.inside.load());
+        bool kept = true;
+        for (unsigned id = 0; id < threads; id++) {
+            for (int i = 0; i < per_thread; i++) {
+                kept = kept && peek(pr.r.span.start + (id * per_thread + i) * page) == char(id + 1);
             }
-            printf("      %u pages resident, %u aliased\n", resident, dup);
-            CHECK(dup == 0);
         }
-        CHECK(ok);
-        pc::unmap(m);
-    }
-
-    section("ragged buffers survive eviction under writes, from many threads");
-    {
-        // The same, writing. Every buffer touched is dirty, so eviction has to
-        // write it back before the frame goes -- the long way round, on every
-        // architecture, where the read-only pass leaves clean buffers that go
-        // straight back. Each word is written the value it already holds, so
-        // what the store receives is checkable and a refault still verifies.
-        pattern_store s(1ull << 30);
-        s.verify = true;
-        s.stop_on_wrong = true;
-        s.track_frames();
-        pc::policy p = pc::defaults();
-        p.fault_extent = fault_ragged;
-        void *m = pc::map(s, p, 32 << 20);
-        CHECK(m != nullptr);
-
-        auto *b = static_cast<char *>(m);
-        std::atomic<bool> ok{true};
-        std::atomic<uint64_t> bad_off{0}, bad_val{0};
-        parallel(n_cpus(), [&](unsigned t) {
-            uint64_t seed = 0x85ebca6bu * (t + 1);
-            for (int i = 0; i < 20000; i++) {
-                seed = seed * 6364136223846793005ull + 1;
-                uint64_t off = (seed >> 16) % ((1ull << 30) - 8) & ~uint64_t(7);
-                auto *at = reinterpret_cast<volatile uint64_t *>(b + off);
-                uint64_t v = *at;
-                if (v != pattern_store::word(off)) {
-                    if (ok.exchange(false)) {
-                        bad_off = off;
-                        bad_val = v;
-                    }
-                }
-                *at = pattern_store::word(off);
-            }
-        });
-        if (!ok) {
-            uint64_t o = bad_off.load(), v = bad_val.load();
-            printf("      at %#lx read %#lx (delta %ld, page %+ld)\n",
-                   o, v, (long)(v - o), (long)(v - o) / (long)page);
-        }
-        if (s.wrong.load()) {
-            printf("      write-back handed over %zu wrong words, first at "
-                   "%#lx: %#lx\n",
-                   s.wrong.load(), s.wrong_off.load(), s.wrong_val.load());
-            printf("      chunk %zu B, %zu B wrong at +%zu, delta %+ld pages, %s\n",
-                   s.wrong_bytes.load(), s.wrong_run.load(), s.wrong_pos.load(),
-                   (long)(s.wrong_val.load() - s.wrong_off.load()) / (long)page,
-                   s.wrong_uniform.load() ? "one displacement" : "mixed");
-            printf("      frame %#lx; that page was read into %#lx (%s), "
-                   "the page it holds into %#lx (%s)\n",
-                   s.wrong_frame.load(), s.wrong_frame_of_off.load(),
-                   s.wrong_frame.load() == s.wrong_frame_of_off.load() ? "same"
-                                                                       : "OTHER",
-                   s.wrong_frame_of_val.load(),
-                   s.wrong_frame.load() == s.wrong_frame_of_val.load() ? "same"
-                                                                       : "other");
-        }
-        printf("      %zu MiB written back\n", s.writes.load() >> 20);
-        CHECK(ok);
-        CHECK(s.wrong.load() == 0);
-        pc::unmap(m);
-    }
-
-    section("a working set bigger than the cache is served and served correctly");
-    {
-        // Twice what the cache may hold, so that it has to give pages back to
-        // reach the end of the object, and has to fault back what it gave up.
-        // What it may hold is all of free memory, until there is more of that
-        // than a pass over twice it is worth spending: past that, a limit puts
-        // the same pressure on the cache at a fixed cost.
-        const uint64_t roof = 16ull << 30;
-        const uint64_t room = mem::frames::free_bytes();
-        const size_t limit = room > roof ? roof : 0;
-        const uint64_t bytes = (2 * (limit ? limit : room)) & ~(huge - 1);
-        pattern_store s(bytes);
-        // 2 MiB at a time where the object is big, so that a pass costs what
-        // the store can move and not one fault per page of it.
-        pc::policy p = pc::defaults();
-        if (bytes > (8ull << 30)) {
-            p.fault_extent = fault_huge;
-        }
-        auto t0 = clk::now();
-        void *m = pc::map(s, p, limit);
-        CHECK(m != nullptr);
-
-        auto *b = static_cast<char *>(m);
-        bool ok = true;
-        for (uint64_t off = 0; off < bytes; off += page) {
-            ok &= *reinterpret_cast<volatile uint64_t *>(b + off) ==
-                  pattern_store::word(off);
-        }
-        CHECK(ok);
-        CHECK(s.reads.load() >= bytes);
-
-        // The start of the object is what was faulted longest ago, so going
-        // back to it reads it in again -- which is eviction, seen from outside.
-        size_t after_first_pass = s.reads.load();
-        for (uint64_t off = 0; off < bytes / 8; off += page) {
-            ok &= *reinterpret_cast<volatile uint64_t *>(b + off) ==
-                  pattern_store::word(off);
-        }
-        CHECK(ok);
-        // Most of that eighth had to come back from the store: it is the part
-        // that was faulted longest ago, and so the part a fifo gives up first.
-        CHECK(s.reads.load() - after_first_pass > bytes / 8 / 2);
-        printf("      %zu MiB of object through %zu MiB, %zu MiB read in %.1f s\n",
-               (size_t)(bytes >> 20),
-               (limit ? limit : mem::frames::total_available_bytes()) >> 20,
-               s.reads.load() >> 20, since(t0));
-        pc::unmap(m);
+        CHECK(kept);
+        map::depopulate({pr.r.span.start, pr.r.span.end});
+        vs::release(pr.r);
     }
 }
 
@@ -2206,19 +2680,54 @@ int os_memory_primitives_main()
 {
     reset();
     printf("######## memory primitives ########\n");
-    printf("cpus: %u, memory: %zu MiB\n", n_cpus(), mem::frames::total_available_bytes() >> 20);
+    printf("cpus: %u, memory: %zu MiB\n", n_cpus(), fr::total_available_bytes() >> 20);
 
-    frames_functional();
-    frames_perf();
-    vspace_functional();
+    group("vspace");
+    vspace_app_window();
+    vspace_reserve();
+    vspace_reserve_at();
+    vspace_release();
+    vspace_lookup();
+    vspace_reserved();
+    vspace_accounting();
+    vspace_for_each();
+    vspace_self_check();
     vspace_perf();
-    mapping_functional();
+
+    group("frames");
+    frames_alloc();
+    frames_free();
+    frames_accounting();
+    frames_watch_pressure();
+    frames_under_pressure();
+    frames_check_pressure();
+    frames_reclaim();
+    frames_perf();
+
+    group("mapping");
+    mapping_find();
+    mapping_to_phys();
+    mapping_is_contiguous();
+    mapping_prepare();
+    mapping_attach();
+    mapping_attach_missing();
+    mapping_populate();
+    mapping_detach();
+    mapping_detach_deferred();
+    mapping_depopulate();
+    mapping_protect();
+    mapping_split();
+    mapping_flush();
+    mapping_flush_epoch();
+    mapping_bits();
+    mapping_pending_invalidation();
+    mapping_pte_ref();
     mapping_perf();
-    early_functional();
-    phys_functional();
-    heap_functional();
-    store_functional();
-    pagecache_functional();
+
+    group("misc");
+    misc_map_phys();
+    misc_map_phys_at();
+    misc_vm_fault();
 
     return summary("MEMORY PRIMITIVE");
 }

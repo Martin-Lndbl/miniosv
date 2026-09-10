@@ -6,6 +6,8 @@
 #include <osv/kernel_config.h>
 #include <osv/mem/pagecache.hh>
 
+extern "C" void app_profile_dump() __attribute__((weak));
+
 namespace osv {
 
 void shutdown()
@@ -27,6 +29,9 @@ void shutdown()
         });
     }
     mem::pagecache::stats_dump();
+    if (app_profile_dump) {
+        app_profile_dump();
+    }
 
     debug("Powering off.\n");
     osv::poweroff();

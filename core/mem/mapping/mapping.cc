@@ -265,7 +265,7 @@ bool populate(range r, unsigned perm, size_t leaf_size, bool zero)
         return false;
     }
 
-    walk_opts o{true, true, false, level_of(leaf_size)};
+    walk_opts o{true, true, false, level_of(leaf_size), true};
     auto res = walk_range(page_align(r), o, [=](pte_ref e, uintptr_t) {
         if (!e.empty()) {
             return true;
@@ -290,6 +290,7 @@ bool populate(range r, unsigned perm, size_t leaf_size, bool zero)
     if (res.split) {
         flush_all();
     }
+    res.settle();
     return res.complete;
 }
 

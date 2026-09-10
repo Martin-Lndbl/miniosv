@@ -468,7 +468,6 @@ uint64_t tile_of(cache &c, uint64_t off, uint64_t &start)
     if (start > off) {
         start = off;
     }
-    start = align_down(start, uint64_t(page_size));
     len = std::min<uint64_t>(std::max<uint64_t>(len, page_size), tile_max);
 
     if (off - start >= len) {

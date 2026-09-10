@@ -22,6 +22,7 @@ struct walk_opts {
     bool split = false;       // break a large leaf the range covers only part of
     bool reclaim = false;     // give back a table the walk leaves empty
     unsigned max_level = 0;   // largest leaf the walk may hand to fn
+    bool replace = false;     // hand fn the slot of an empty table it covers whole
 };
 
 struct walk_result {
@@ -80,8 +81,20 @@ static bool walk_table(std::atomic<pte> *table, unsigned level, range r,
         auto *slot = &table[i];
         pte e = slot->load(std::memory_order_acquire);
 
-        if (level == 0 || (level <= o.max_level && va >= r.start && va + step <= r.end &&
-                           (pte_empty(e) || pte_is_leaf(e, level)))) {
+        bool whole = level <= o.max_level && va >= r.start && va + step <= r.end;
+        // An empty table left behind by a smaller mapping gives way to a leaf.
+        if (whole && o.replace && !pte_empty(e) && !pte_is_leaf(e, level) &&
+            table_is_empty(table_of(e))) {
+            pte was = e;
+            if (slot->compare_exchange_strong(was, 0, std::memory_order_acq_rel)) {
+                res.retire(pte_table_addr(e));
+                res.split = true;
+                e = 0;
+            } else {
+                e = was;
+            }
+        }
+        if (level == 0 || (whole && (pte_empty(e) || pte_is_leaf(e, level)))) {
             if (!fn(pte_ref(slot, level), va)) {
                 return false;
             }

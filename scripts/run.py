@@ -132,6 +132,9 @@ def start_osv_qemu(options):
             "-drive", "if=pflash,format=raw,readonly=on,file=%s" % code_copy,
             "-drive", "if=pflash,format=raw,file=%s" % vars_copy]
 
+        # Skip the firmware's boot-menu countdown.
+        args += ["-boot", "menu=on,splash-time=0"]
+
         # Boot disk: the GPT/ESP image as an NVMe drive. The firmware finds
         # \EFI\BOOT\BOOT{X64,AA64}.EFI on it, exactly as on AWS Nitro.
         args += [
@@ -192,9 +195,17 @@ def start_osv_qemu(options):
             print(format_args(cmdline))
             return
 
+        # --preload scopes the library to qemu itself. Putting LD_PRELOAD on
+        # this script instead would load it into every helper subprocess too
+        # (stty, setargs.py); the boot-time benchmark preloads a library whose
+        # exit-time stop must catch qemu, not whichever helper exits first.
+        env = os.environ.copy()
+        if options.preload:
+            env["LD_PRELOAD"] = options.preload
+
         try:
             stty_save()
-            ret = subprocess.call(cmdline, env=os.environ.copy())
+            ret = subprocess.call(cmdline, env=env)
             if ret != 0:
                 sys.exit("qemu failed.")
         except OSError as e:
@@ -271,6 +282,9 @@ if __name__ == "__main__":
                         help="passthrough PCI device(s) bound to vfio-pci, e.g. 0000:01:00.0")
     parser.add_argument("--gic-version", action="store", default="3",
                         help="aarch64 GIC version under TCG (default 3)")
+    parser.add_argument("--preload", action="store", metavar="LIB",
+                        help="LD_PRELOAD this library into qemu (only qemu, "
+                             "not this script's helper subprocesses)")
     parser.add_argument("--args", action="store", metavar="STRING",
                         help="application arguments; written into the boot "
                              "image before starting (see scripts/setargs.py). "

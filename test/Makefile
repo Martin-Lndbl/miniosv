@@ -12,8 +12,8 @@
 #   - os-libc      : C libc surface conformance checks (string/stdlib/math/...)
 #   - os-iostream  : C++ iostreams / localization checks (std::cout etc.)
 #   - os-memmove   : memmove() overlap-correctness regression test
-#   - os-memory    : memory as an application sees it (malloc, mmap, faults)
-#   - os-memory-primitives : the frame and address-space primitives directly
+#   - os-memory    : the memory clients: early, heap, page cache, plus malloc/mmap
+#   - os-memory-primitives : vspace, frames and mapping, one header per function
 #   - os-stress    : concurrency / allocator / TLS stress tests
 #   - os-miniext   : miniext filesystem checks, only when conf_fs_miniext=1
 #                    (needs --emulated-nvme at run time; skips without)
