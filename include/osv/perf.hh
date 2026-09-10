@@ -271,11 +271,7 @@ struct Event {
       valid = false;
       return;
     }
-<<<<<<< HEAD
     before = last = pmc->read();
-=======
-    before = last = pmc->probe();
->>>>>>> aea2fe82471513e652b47f03326a7d69aea73410
   }
 
   // Read the counter and fold in an overflow if it has gone backwards. 
@@ -284,11 +280,7 @@ struct Event {
   void pollCounter() {
     if (!pmc || width >= 64)
       return;
-<<<<<<< HEAD
     uint64_t now = pmc->read();
-=======
-    uint64_t now = pmc->probe();
->>>>>>> aea2fe82471513e652b47f03326a7d69aea73410
     if (now < last)
       polled += 1ull << width;
     last = now;
@@ -298,11 +290,7 @@ struct Event {
     if (!pmc)
       return;
     pollCounter();
-<<<<<<< HEAD
     after = pmc->read();
-=======
-    after = pmc->probe();
->>>>>>> aea2fe82471513e652b47f03326a7d69aea73410
     if (after < last)
       polled += 1ull << width;
     pmc->stop();
