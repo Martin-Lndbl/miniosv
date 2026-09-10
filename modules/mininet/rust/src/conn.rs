@@ -319,6 +319,24 @@ impl Conn {
             tcp::State::Closed | tcp::State::CloseWait | tcp::State::TimeWait
         );
         if self.handshake_done && self.request_queued && ended && self.outgoing.is_empty() && !s.can_recv() {
+            // A closed connection only means "the response ended" if a
+            // response actually started. A peer that closes before answering
+            // -- or a connection reset mid-request -- otherwise arrives at the
+            // caller as a *successful* empty response: rc OK, status 0, zero
+            // bytes, and httpfs keeps whatever was already in the buffer it
+            // handed us. Seen on c6in.large at sf=10 as a range read reporting
+            // want=47 got=0 status=0, and the caller reporting
+            // "HTTP Error: Request returned HTTP 0".
+            //
+            // discard_ciphertext is exempt: it bypasses the parser on purpose,
+            // so it has no head to have finished.
+            if !self.discard_ciphertext && !self.parser.headers_done() {
+                println!(
+                    "FAIL: q{} port {} closed before answering",
+                    self.queue_id, self.src_port
+                );
+                return self.finish(Step::Failed(Error::BadResponse));
+            }
             return self.finish(Step::Complete);
         }
         Step::Pending
