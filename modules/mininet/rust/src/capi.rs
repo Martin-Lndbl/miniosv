@@ -228,8 +228,28 @@ pub extern "C" fn mininet_get(
     }
     let g = unsafe { &*g };
 
+    // Everything below writes through (buf, cap) on the strength of the
+    // caller's word, and a cap that does not match the allocation behind it
+    // surfaces much later as a fault inside BufferSink::write. S3 answers a
+    // ranged GET and httpfs sizes its reads in MiB, so a gigabyte-plus figure
+    // is a misparsed Range header rather than a large read: refuse it here,
+    // where the argument is still attributable to its caller.
+    const MAX_SANE_CAP: u64 = 1 << 30;
+    if cap > MAX_SANE_CAP {
+        println!("FAIL: mininet_get: implausible buffer cap {} bytes", cap);
+        return E_BAD_ARGUMENT;
+    }
+
     let head = unsafe { core::slice::from_raw_parts(head as *const u8, head_len as usize) };
-    let body = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, cap as usize) };
+    // `from_raw_parts_mut` requires a non-null, dereferenceable pointer even
+    // for an empty slice, and the HEAD path passes null with cap 0. Building
+    // that slice was undefined behaviour: nothing read it, but the compiler is
+    // entitled to assume it was valid.
+    let body = if cap == 0 {
+        &mut [][..]
+    } else {
+        unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, cap as usize) }
+    };
 
     match g.svc.get(head, body) {
         Ok(r) => {
