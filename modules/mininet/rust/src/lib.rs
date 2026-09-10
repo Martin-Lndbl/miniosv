@@ -54,6 +54,7 @@ mod ffi;
 mod http;
 mod nic;
 mod rss;
+mod selftest;
 mod service;
 pub mod stats;
 pub mod thread;
