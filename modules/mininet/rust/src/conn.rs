@@ -139,8 +139,15 @@ impl Conn {
     /// request. Only valid when [`Conn::idle_reusable`] was just true; the TCP
     /// and TLS handshakes are not repeated.
     pub(crate) fn reset_for(&mut self, req: &Request<'_>, now_ms: i64) {
-        self.incoming.clear();
-        self.outgoing.clear();
+        // `incoming` is deliberately *not* cleared. A reused connection carries
+        // on the same TLS session, so anything still buffered is a partial
+        // record of that stream -- a server-sent ticket, or a record that
+        // straddled the moment the body completed. Dropping it would leave
+        // rustls decrypting from the middle of a record, which fails much
+        // later and nowhere near here. Completion already requires `outgoing`
+        // to be empty, so there is nothing pending to send either; clearing it
+        // would only be able to discard a partly-written record.
+        debug_assert!(self.outgoing.is_empty(), "reuse with unsent request bytes");
         self.head = req.head.to_vec();
         self.request_queued = false;
         self.discard_ciphertext = req.discard_ciphertext && self.tls.is_some();
