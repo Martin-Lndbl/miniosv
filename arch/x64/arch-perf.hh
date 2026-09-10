@@ -163,7 +163,7 @@ inline PMCIntHandle pmc_attach_overflow_handler(std::function<void()> handler) {
   return vector;
 }
 
-inline void pmc_detach_overflow_handler(PMCIntHandle vector) {
+inline void pmc_detach_overflow_handler(PMCIntHandle vector, uint64_t /*mask*/) {
   processor::apic->write(processor::apicreg::LVTPC, 1u << 16);
   idt.unregister_handler(vector);
 }

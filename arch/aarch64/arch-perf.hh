@@ -331,8 +331,11 @@ inline PMCIntHandle pmc_attach_overflow_handler(std::function<void()> handler) {
                            std::move(handler));
 }
 
-inline void pmc_detach_overflow_handler(PMCIntHandle irq) {
-  asm volatile("msr pmintenclr_el1, %0\n\tisb" ::"r"(~0ull) : "memory");
+// Disables only the counters named by `mask`. Clearing PMINTENSET wholesale
+// would silently switch off the wrap-counting handler, which shares this
+// interrupt and has no way to notice.
+inline void pmc_detach_overflow_handler(PMCIntHandle irq, uint64_t mask) {
+  pmc_disable_overflow_int(mask);
   delete irq;
 }
 
