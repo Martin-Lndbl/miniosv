@@ -341,12 +341,52 @@ fn test_completion_rule(r: &mut Report) {
     r.check(g.intact(), "completion path does not touch guard bands");
 }
 
+/// A connection that ends without a response is a failure, not an empty
+/// success. Checked on the parser, which is what `Conn` consults: if no head
+/// was ever parsed there is nothing to call complete.
+fn test_close_without_response(r: &mut Report) {
+    println!("-- close without a response");
+
+    // Nothing at all arrived.
+    {
+        let mut p = ResponseParser::new();
+        r.check(!p.headers_done(), "a parser fed nothing has no head");
+        r.eq_u64(p.status() as u64, 0, "no head means status 0");
+        r.eq_u64(p.body_bytes(), 0, "no head means no body");
+        let mut sink = crate::http::NullSink;
+        let _ = p.feed(b"", &mut sink);
+        r.check(!p.headers_done(), "an empty feed still has no head");
+    }
+
+    // A head that was cut off mid-way is not a head either: the peer closing
+    // here must not be read as a complete response.
+    {
+        let mut sink = crate::http::NullSink;
+        let mut p = ResponseParser::new();
+        let rc = p.feed(b"HTTP/1.1 206 Partial\r\nContent-Length: 5\r\n", &mut sink);
+        r.check(rc.is_ok(), "a partial head parses so far without error");
+        r.check(!p.headers_done(), "a partial head is not done");
+        r.eq_u64(p.status() as u64, 0, "a partial head has no status yet");
+    }
+
+    // The completing case, for contrast: a 204 has no body but does have a
+    // head, so a close after it is a real completion.
+    {
+        let mut sink = crate::http::NullSink;
+        let mut p = ResponseParser::new();
+        let _ = p.feed(b"HTTP/1.1 204 No Content\r\n\r\n", &mut sink);
+        r.check(p.headers_done(), "a bodyless response still finishes its head");
+        r.eq_u64(p.status() as u64, 204, "204 status is readable");
+    }
+}
+
 /// Runs every check. Returns the number that failed.
 pub fn run(verbose: bool) -> u32 {
     let mut r = Report::new(verbose);
     test_buffer_sink(&mut r);
     test_response_parser(&mut r);
     test_completion_rule(&mut r);
+    test_close_without_response(&mut r);
     println!(
         "mininet selftest: {} checks, {} failed",
         r.checks, r.failures
