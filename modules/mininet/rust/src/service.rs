@@ -277,7 +277,9 @@ fn serve(
         }
     };
 
-    let mut pending: Vec<Option<*mut Slot>> = Vec::new();
+    // The slot, whether its attempt went out on a reused socket, and whether
+    // it has already been retried once.
+    let mut pending: Vec<Option<(*mut Slot, bool, bool)>> = Vec::new();
     pending.resize(w.slots(), None);
 
     loop {
@@ -285,7 +287,7 @@ fn serve(
 
         for slot in 0..w.slots() {
             match pending[slot] {
-                Some(p) => {
+                Some((p, was_reused, retried)) => {
                     let done = w.conn(slot).and_then(|c| c.outcome());
                     if let Some(step) = done {
                         let res = match step {
@@ -307,6 +309,35 @@ fn serve(
                             crate::Step::Failed(e) => Err(e),
                             crate::Step::Pending => unreachable!("outcome() is terminal"),
                         };
+                        // A keep-alive connection the peer closed while it was
+                        // idle stays Established until its FIN arrives, so a
+                        // request can go out on a socket that is already gone
+                        // and come back as a failure. That is a race, not an
+                        // answer: dial again and re-send. Once only, and only
+                        // for a socket we reused -- a fresh connection failing
+                        // this way is a real fault -- and only because every
+                        // request here is a GET or a HEAD, which are safe to
+                        // repeat.
+                        if was_reused && !retried && matches!(step, crate::Step::Failed(_)) {
+                            let s = unsafe { &*p };
+                            let head =
+                                unsafe { core::slice::from_raw_parts(s.head, s.head_len) };
+                            let req = Request {
+                                head,
+                                discard_ciphertext: s.discard_ciphertext,
+                            };
+                            w.release(slot);
+                            if w.connect_next(slot, &req).is_ok() {
+                                let sink = unsafe { BufferSink::new(s.buf, s.buf_cap) };
+                                if let Some(c) = w.conn_mut(slot) {
+                                    c.set_sink(alloc::boxed::Box::new(sink));
+                                }
+                                pending[slot] = Some((p, false, true));
+                                continue;
+                            }
+                            // Could not re-dial: report the original failure
+                            // rather than inventing one about the retry.
+                        }
                         unsafe { Slot::complete(p, res) };
                         pending[slot] = None;
                         // A connection the peer hasn't closed stays open for
@@ -331,7 +362,8 @@ fn serve(
                         head,
                         discard_ciphertext: s.discard_ciphertext,
                     };
-                    let opened = if w.idle_reusable(slot) {
+                    let reusing = w.idle_reusable(slot);
+                    let opened = if reusing {
                         w.reuse(slot, &req)
                     } else {
                         // The socket can still be open here. It was reusable
@@ -349,7 +381,7 @@ fn serve(
                             if let Some(c) = w.conn_mut(slot) {
                                 c.set_sink(alloc::boxed::Box::new(sink));
                             }
-                            pending[slot] = Some(p);
+                            pending[slot] = Some((p, reusing, false));
                         }
                         Err(e) => unsafe { Slot::complete(p, Err(e)) },
                     }
