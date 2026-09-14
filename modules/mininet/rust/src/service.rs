@@ -22,8 +22,9 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use crate::endpoint::{Endpoint, Request};
 use crate::error::Error;
-use crate::ffi::{shim_thread_current, shim_thread_park, shim_thread_unpark};
+use crate::ffi::{shim_thread_current, shim_thread_park, shim_thread_unpark, shim_time_ns};
 use crate::http::{BufferSink, ContentRange};
+use crate::stats;
 use crate::thread;
 use crate::worker::{Worker, WorkerConfig, WorkerHandle};
 use crate::Stack;
@@ -71,6 +72,10 @@ struct Slot {
     buf: *mut u8,
     buf_cap: usize,
     discard_ciphertext: bool,
+    /// When the submitter pushed this, on the shim clock. The worker splits
+    /// the request's latency around the moment it picks the slot up: before is
+    /// queueing (too few slots, or a busy worker), after is the wire.
+    submitted_ns: u64,
     /// The submitter's thread, for the worker to wake.
     waiter: *mut c_void,
     state: AtomicU32,
@@ -224,6 +229,7 @@ impl Service {
             buf: buf.as_mut_ptr(),
             buf_cap: buf.len(),
             discard_ciphertext,
+            submitted_ns: unsafe { shim_time_ns() },
             waiter: unsafe { shim_thread_current() },
             state: AtomicU32::new(PENDING),
             outcome: UnsafeCell::new(None),
@@ -277,17 +283,38 @@ fn serve(
         }
     };
 
-    // The slot, whether its attempt went out on a reused socket, and whether
-    // it has already been retried once.
-    let mut pending: Vec<Option<(*mut Slot, bool, bool)>> = Vec::new();
+    // The slot, whether its attempt went out on a reused socket, whether it
+    // has already been retried once, and when this worker took it on.
+    let mut pending: Vec<Option<(*mut Slot, bool, bool, u64)>> = Vec::new();
     pending.resize(w.slots(), None);
 
+    let mut prev_poll_ns = 0u64;
+
+    // The loop spins rather than sleeping, even with an empty queue, and that
+    // is a measurement rather than an oversight. Parking the worker and having
+    // Queue::push unpark it was tried: TPC-H Q01 at sf=1 on c6in.2xlarge went
+    // from 818 to 1194 ms at one worker and 826 to 1082 at two, and only the
+    // oversubscribed four-worker case improved (1038 -> 947). The wake is the
+    // reason -- a worker is pinned, so it comes back only when its CPU next
+    // preempts whichever DuckDB thread took it, and a query's requests pay
+    // that latency one after another. Spinning costs a CPU; waking costs the
+    // critical path. Size the worker count to the workload instead.
     loop {
         w.poll();
 
+        // The gap between consecutive polls is how starvation shows up: a
+        // worker that was off the CPU for a millisecond left a response
+        // sitting in the ring for that long. Free, because poll() already
+        // read the clock.
+        let now_ns = w.last_poll_ns();
+        if prev_poll_ns != 0 {
+            stats::poll_tick(now_ns.saturating_sub(prev_poll_ns));
+        }
+        prev_poll_ns = now_ns;
+
         for slot in 0..w.slots() {
             match pending[slot] {
-                Some((p, was_reused, retried)) => {
+                Some((p, was_reused, retried, started_ns)) => {
                     let done = w.conn(slot).and_then(|c| c.outcome());
                     if let Some(step) = done {
                         let res = match step {
@@ -328,16 +355,26 @@ fn serve(
                             };
                             w.release(slot);
                             if w.connect_next(slot, &req).is_ok() {
+                                stats::request_retried();
                                 let sink = unsafe { BufferSink::new(s.buf, s.buf_cap) };
                                 if let Some(c) = w.conn_mut(slot) {
                                     c.set_sink(alloc::boxed::Box::new(sink));
                                 }
-                                pending[slot] = Some((p, false, true));
+                                pending[slot] = Some((p, false, true, started_ns));
                                 continue;
                             }
                             // Could not re-dial: report the original failure
                             // rather than inventing one about the retry.
                         }
+                        let submitted_ns = unsafe { (*p).submitted_ns };
+                        stats::request_finished(
+                            started_ns.saturating_sub(submitted_ns),
+                            w.last_poll_ns().saturating_sub(started_ns),
+                            match &res {
+                                Ok(g) => g.written,
+                                Err(_) => 0,
+                            },
+                        );
                         unsafe { Slot::complete(p, res) };
                         pending[slot] = None;
                         // A connection the peer hasn't closed stays open for
@@ -381,7 +418,7 @@ fn serve(
                             if let Some(c) = w.conn_mut(slot) {
                                 c.set_sink(alloc::boxed::Box::new(sink));
                             }
-                            pending[slot] = Some((p, reusing, false));
+                            pending[slot] = Some((p, reusing, false, w.last_poll_ns()));
                         }
                         Err(e) => unsafe { Slot::complete(p, Err(e)) },
                     }

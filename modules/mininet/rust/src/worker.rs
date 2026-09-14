@@ -94,6 +94,8 @@ pub struct Worker {
     peer: Endpoint,
     tls_config: Arc<ClientConfig>,
     clk: MonoClock,
+    /// When the last poll ran, on the worker's own clock.
+    last_poll_ns: u64,
 }
 
 impl Worker {
@@ -186,6 +188,7 @@ impl Worker {
             peer: cfg.peer.clone(),
             tls_config: tls::client_config(),
             clk,
+            last_poll_ns: 0,
         })
     }
 
@@ -304,7 +307,12 @@ impl Worker {
     /// A worker with no open connections is trivially done, so a caller that
     /// loops on this must open something first.
     pub fn poll(&mut self) -> bool {
-        let now_ms = self.clk.elapsed_ms();
+        // One clock read, kept: smoltcp wants milliseconds, the poll-gap stat
+        // wants nanoseconds, and reading twice would put a second
+        // clock_gettime in the tightest loop in the stack.
+        let now_ns = self.clk.elapsed_ns();
+        self.last_poll_ns = now_ns;
+        let now_ms = (now_ns / 1_000_000) as i64;
         self.iface
             .poll(Instant::from_millis(now_ms), &mut self.dev, &mut self.sockets);
 
@@ -315,6 +323,12 @@ impl Worker {
             }
         }
         all_done
+    }
+
+    /// The clock reading the last poll took, for a caller measuring the gap
+    /// between its own iterations without paying for a second read.
+    pub fn last_poll_ns(&self) -> u64 {
+        self.last_poll_ns
     }
 
     pub fn conn(&self, slot: usize) -> Option<&Conn> {

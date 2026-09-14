@@ -87,6 +87,9 @@ void shim_thread_join(void *handle);
 // submitters spinning beside it -- on a box where DuckDB's threads outnumber
 // the cores left over, spinning waiters would take the CPU the worker needs.
 //
+// One direction only, deliberately: parking the *worker* on an empty queue was
+// tried and is worse where it matters. See the note in service.rs.
+//
 // shim_thread_park() blocks until *flag is nonzero. The waker stores the flag
 // and then calls shim_thread_unpark() with the handle the waiter published;
 // the predicate is re-checked after the wake, so a wake that lands before the
