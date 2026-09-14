@@ -47,3 +47,32 @@ rdmsr $PMC0
 
 </td></tr>
 </table>
+
+
+#### Interface
+MiniOsv provides a low-level interface that allows driving the PMU directly from the application
+```c++
+// Create a virtual representation of the oncore PMU of the underlying architecture. This only works propperly for supported microarchitectures
+std::vector<PMC> make_default_core_pmcs();
+
+// Allocate a counter pair of a given class from your virtual PMU representation. The class tells which events can be measured by a specific counter (e.g. CYCLES, or CORE)
+pmcs.acquire(PMClass pmClass);
+
+// Start counting on an allocated counter with a specific event configuration and initial value for the counter
+pmc.start_with_conf(uint64_t perfEvtSel, uint64_t intial_value);
+
+// Read the current value of an allocated PMC
+pmc.read();
+
+// Write a value to an allocated PMC
+pmc.write(uint64_t value);
+
+// Stop (unset enable bit) on a specific counter. This makes sure no further overflow interrupts can fire
+pmc.stop();
+
+// Deallocate the counter pair
+pmcs.release(PMC *pmc)
+```
+
+### PerfEvent
+For convenience, miniOSv implements the PerfEvent abstraction on top of the low-level interface presented above. This allows linux `perf` like counting inside the unikernel. For an introduction to PerfEvent, consider the [original linux wrapper](https://github.com/viktorleis/perfevent).
