@@ -1,6 +1,6 @@
 ## Performance Monitoring
 
-MiniOSv leverages hardware performance counters directly. The corresponding architecture-specific implementation can be found in 'arch/<arch>/arch-perf.hh'.
+MiniOSv leverages hardware performance counters directly. The corresponding architecture-specific implementation can be found in `arch/<arch>/arch-perf.hh`.
 
 > [!NOTE]
 > When running virtualized, these counters are gated. A VM-exit is therefore required to query or change their contents.
@@ -14,13 +14,16 @@ CPU packages contain multiple units in charge or performance monitoring:
 
 #### Basic Functionality
 Most oncore PMUs allow counting 6 events concurrently (IDs 0-5). Counting one event requires a pair of 2 registers:
-- Performance Event Selector [0-5] (PerfEvtSel[0-5])
+
+<img width="710" height="438" alt="hardware-counters" src="https://github.com/user-attachments/assets/91c1779d-1449-499e-9913-61d56d7bf8fa" />
+
+- Performance Event Selector [0-5] (`PerfEvtSel[0-5]`)
     - Write to this register to configure which event you want to count
     - This register allows for further configuration (enable counting, interrupt on overflow, ...)
-- Performance Monitoring Counter [0-5] (PMC[0-5])
+- Performance Monitoring Counter [0-5] (`PMC[0-5]`)
     - Read from this register to get the number of events counted
 
-This conceptually maps the [PerfEvent header](https://github.com/viktorleis/perfevent) syntax to the following 4 x86 assembly instructions
+This conceptually maps the [PerfEvent header](https://github.com/viktorleis/perfevent) syntax to the following 4 x86 assembly instructions:
 
 <table>
 <tr><th>PerfEvent</th><th>x86 assembly</th></tr>
@@ -44,7 +47,3 @@ rdmsr $PMC0
 
 </td></tr>
 </table>
-
-
-> [!NOTE]
-> This is substantially simplified
