@@ -76,3 +76,19 @@ pmcs.release(PMC *pmc)
 
 ### PerfEvent
 For convenience, miniOSv implements the PerfEvent abstraction on top of the low-level interface presented above. This allows linux `perf` like counting inside the unikernel. For an introduction to PerfEvent, consider the [original linux wrapper](https://github.com/viktorleis/perfevent).
+
+
+### Supported Microarchitectures
+As of September 2026, miniOSv's perf infrastructure supports the following microarchitectures
+
+#### x86-64
+- AMD Zen 4
+- AMD Zen 5
+- Intel Skylake
+
+#### ARM
+- Neoverse V1
+- Neoverse V2
+- Ampere 1a
+
+To add support for more microarchitectures, [papi](https://github.com/icl-utk-edu/papi/tree/master/src/libpfm4/lib/events) and [likwid](https://github.com/RRZE-HPC/likwid/tree/master/src/includes) may be good entrypoints to get the register addresses and event codes
