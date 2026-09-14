@@ -1,10 +1,11 @@
 ## Sampling
 Based on the Performance Measurement Unit
 
-Periodically taking snapshots of a programs execution state is referred to as sampling. Sampling can give deep insights into a programs behavior and performance, but comes with a considerable performance overhead, especially when sampling with high frequency and/or in virtualised environments. For further information regarding sampling overhead in miniOSv, consult the corresponding section of this documentation.
+Periodically taking snapshots of a program's execution state is referred to as sampling. Sampling can provide deep insights into a program's behavior and performance, but it incurs considerable overhead, especially when sampling at high frequency and/or in virtualized environments. For further information regarding sampling overhead in miniOSv, consult the corresponding section of this documentation.
 
 ### Overview
-MiniOSv leverages [PMU](./10-performance-monitoring.md) counter overflows as they provide more configurability and precision compared to timer interrupts. Our unikernel furthermore only implements the structure around sampling, so by design we do **not** provide a default implementation what should be done during a default routine. Instead, the application is responsible to provide the interrupt handler that will be run on every sample. 
+MiniOSv leverages [PMU](./10-performance-monitoring.md) counter overflows to generate sampling interrupts, as they offer greater configurability and precision than timer interrupts. On each interrupt, a sampling routine runs, saving relevant parts of the programs execution state.
+Our unikernel only implement the structure around sampling, so by design we do **not** provide a default sampling routine. Instead, the application is responsible for providing the interrupt handler that runs on every sample. 
 
 ### Interface
 ```c++
