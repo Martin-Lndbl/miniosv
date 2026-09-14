@@ -1,8 +1,10 @@
 //! rustls configuration.
 //!
-//! `no_std`, so the crypto provider is the pure-Rust `rustls-rustcrypto` rather
-//! than ring or aws-lc-rs, and the trust anchors are the compiled-in Mozilla
-//! bundle rather than a file on disk.
+//! `no_std`, and the trust anchors are the compiled-in Mozilla bundle rather
+//! than a file on disk. The crypto provider is ring: it is `#![no_std]` as
+//! well, and its AES-GCM is around six times the pure-Rust provider's -- see
+//! the note in Cargo.toml for the measurement. `--features rustcrypto` goes
+//! back to the pure-Rust one.
 
 use alloc::sync::Arc;
 
@@ -27,13 +29,24 @@ impl TimeProvider for ShimTimeProvider {
     }
 }
 
+/// The provider the build selected.
+#[cfg(not(feature = "rustcrypto"))]
+fn provider() -> rustls::crypto::CryptoProvider {
+    rustls::crypto::ring::default_provider()
+}
+
+#[cfg(feature = "rustcrypto")]
+fn provider() -> rustls::crypto::CryptoProvider {
+    rustls_rustcrypto::provider()
+}
+
 /// Built once per worker and shared by its connections: assembling the root
 /// store parses the whole bundle, which is not something to do per connection.
 pub(crate) fn client_config() -> Arc<ClientConfig> {
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let cfg = ClientConfig::builder_with_details(
-        Arc::new(rustls_rustcrypto::provider()),
+        Arc::new(provider()),
         Arc::new(ShimTimeProvider),
     )
     .with_safe_default_protocol_versions()

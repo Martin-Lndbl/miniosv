@@ -25,6 +25,26 @@ $(out)/$(mininet-dir)/shim/shim.o: CXXFLAGS += -Iinclude/api/minidpdk
 
 mininet-objects = $(mininet-dir)/shim/shim.o
 
+# --- ring's C sources -------------------------------------------------------
+#
+# rustls' crypto provider is ring, and ring compiles a handful of C files
+# through cc-rs. Those include <assert.h>, <string.h> and friends, which the
+# devshell's clang cannot find on its own: this is a freestanding build and
+# carries no host headers by design. Hand it the same headers the kernel's own
+# C is compiled against, so the crate and the kernel agree on what a `size_t`
+# is. Headers only -- cc-rs already passes -DNDEBUG, so no assert lands in the
+# object and nothing here needs a host libc at link time.
+#
+# Exported because cargo passes the environment through to build scripts, and
+# cc-rs reads the per-target variable before the generic one.
+#
+# $(out)/gen/include is in the list for the same reason it is in the kernel's:
+# <bits/alltypes.h> is generated there, and include/api/stddef.h reaches for it.
+ring-cflags = -isystem $(CURDIR)/include/api -isystem $(CURDIR)/include/api/$(arch) \
+              -isystem $(CURDIR)/$(out)/gen/include
+export CFLAGS_x86_64_unknown_linux_gnu = $(ring-cflags)
+export CFLAGS_aarch64_unknown_linux_gnu = $(ring-cflags)
+
 # --- the crate, for callers that are not Rust -------------------------------
 
 mininet_cargo_dir = $(out)/mininet-objs/cargo
