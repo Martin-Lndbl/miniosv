@@ -572,15 +572,68 @@ void cpu::enqueue_first_equal(thread& t)
     runqueue.insert_before(runqueue.lower_bound(t), t);
 }
 
+// Cpus that have run init_on_cpu(), which each one does on itself as it comes
+// up -- the boot cpu from main(), the rest from smp_main(). `sched::cpus` is
+// populated by smp_init() long before any of that, so its size is not a count
+// of cpus that can run anything. placement_cpu() needs the difference.
+static std::atomic<unsigned> cpus_running;
+
 void cpu::init_on_cpu()
 {
     arch.init_on_cpu();
     clock_event->setup_on_cpu();
+    cpus_running.fetch_add(1, std::memory_order_release);
 }
 
 unsigned cpu::load()
 {
     return runqueue.size();
+}
+
+// Where an unpinned new thread goes.
+//
+// It used to go to its creator's cpu, and the load balancer was left to
+// spread it later. That is fine for a thread or two and wrong for a thread
+// pool: DuckDB builds one worker per cpu from a single thread, so all 32
+// landed on one cpu, and load_balance() moves at most one thread per 100 ms
+// -- three seconds to undo what one placement decision need not have done.
+// Measured on a 32-vCPU c6in.8xlarge, one expensive predicate over 6M rows
+// went from 1314 ms on one thread to 910 ms on all of them: a 1.4x speedup
+// where Linux gets 11.6x on the same instance, and the whole of the 2x gap
+// on TPC-H over S3.
+//
+// Least-loaded, searched from a rotating offset. The offset is the part that
+// matters: a thread pool is created in a burst, while every runqueue is
+// still empty, so without it every candidate ties at zero and min_element
+// hands back whichever cpu happens to compare first -- the same pile-up in a
+// new place.
+static cpu *placement_cpu()
+{
+    // Not yet, or not any more, a choice: until every cpu is scheduling, a
+    // thread placed on one that is not would simply wait for it, and the
+    // window between smp_init() populating `cpus` and the last ap reaching
+    // smp_main() is on the boot path.
+    if (cpus.size() <= 1 ||
+        cpus_running.load(std::memory_order_acquire) != cpus.size()) {
+        return thread::current()->tcpu();
+    }
+    static std::atomic<unsigned> rotor;
+    unsigned start = rotor.fetch_add(1, std::memory_order_relaxed);
+    cpu *best = nullptr;
+    unsigned best_load = ~0u;
+    for (unsigned i = 0; i < cpus.size(); i++) {
+        cpu *c = cpus[(start + i) % cpus.size()];
+        // Racy by nature -- another cpu's runqueue can change under the read
+        // -- and advisory either way: being wrong costs one thread one
+        // balancer period, which is what this is here to avoid paying 32
+        // times over. load_balance() reads other cpus' loads the same way.
+        unsigned l = c->load();
+        if (l < best_load) {
+            best_load = l;
+            best = c;
+        }
+    }
+    return best;
 }
 
 // function to pin the *current* thread:
@@ -1203,7 +1256,7 @@ void thread::start()
         return;
     }
 
-    _detached_state->_cpu = _attr._pinned_cpu ? _attr._pinned_cpu : current()->tcpu();
+    _detached_state->_cpu = _attr._pinned_cpu ? _attr._pinned_cpu : placement_cpu();
     remote_thread_local_var(percpu_base) = _detached_state->_cpu->percpu_base;
     remote_thread_local_var(current_cpu) = _detached_state->_cpu;
     _detached_state->st.store(status::waiting);
