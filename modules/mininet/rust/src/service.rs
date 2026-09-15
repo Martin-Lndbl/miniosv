@@ -18,7 +18,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::endpoint::{Endpoint, Request};
 use crate::error::Error;
@@ -78,6 +78,17 @@ struct Slot {
     submitted_ns: u64,
     /// The submitter's thread, for the worker to wake.
     waiter: *mut c_void,
+    /// When the worker published the result, on the shim clock. The submitter
+    /// reads it once awake, so the difference is what the wake itself cost:
+    /// an unpark, the target cpu noticing, and a context switch back. Written
+    /// before the `PUBLISHED` release store, which is what makes it visible.
+    ///
+    /// Worth its own counter because it is the one part of a request's life
+    /// that mininet's own timings cannot see. `wire` ends when the worker
+    /// harvests the slot; `ttfb + xfer` accounts for `wire` almost exactly;
+    /// and yet DuckDB's blocking call is 8-9 ms longer than `wire`. This is
+    /// where that goes, or it is not.
+    published_ns: AtomicU64,
     state: AtomicU32,
     /// Written by the worker before `state` leaves `PENDING`, read by the
     /// submitter after. The `state` ordering is what makes that safe.
@@ -97,6 +108,10 @@ impl Slot {
         // may already be running, and everything in the slot is racing.
         let waiter = s.waiter;
         unsafe { *s.outcome.get() = Some(res) };
+        s.published_ns.store(
+            unsafe { shim_time_ns() },
+            Ordering::Relaxed,
+        );
         s.state.store(PUBLISHED, Ordering::Release);
         if !waiter.is_null() {
             unsafe { shim_thread_unpark(waiter) };
@@ -231,6 +246,7 @@ impl Service {
             discard_ciphertext,
             submitted_ns: unsafe { shim_time_ns() },
             waiter: unsafe { shim_thread_current() },
+            published_ns: AtomicU64::new(0),
             state: AtomicU32::new(PENDING),
             outcome: UnsafeCell::new(None),
         };
@@ -244,6 +260,13 @@ impl Service {
         unsafe { shim_thread_park(slot.state.as_ptr() as *const u32) };
         while slot.state.load(Ordering::Acquire) != RELEASED {
             core::hint::spin_loop();
+        }
+
+        // The Acquire above orders the store of `published_ns` ahead of this
+        // load, so the value is the worker's and not a torn read.
+        let published = slot.published_ns.load(Ordering::Relaxed);
+        if published != 0 {
+            stats::wake(unsafe { shim_time_ns() }.saturating_sub(published));
         }
 
         // SAFETY: the worker wrote this before the release store above, and is
@@ -367,9 +390,10 @@ fn serve(
                             // rather than inventing one about the retry.
                         }
                         let submitted_ns = unsafe { (*p).submitted_ns };
+                        let now_ns = unsafe { shim_time_ns() };
                         stats::request_finished(
                             started_ns.saturating_sub(submitted_ns),
-                            w.last_poll_ns().saturating_sub(started_ns),
+                            now_ns.saturating_sub(started_ns),
                             match &res {
                                 Ok(g) => g.written,
                                 Err(_) => 0,
@@ -418,7 +442,17 @@ fn serve(
                             if let Some(c) = w.conn_mut(slot) {
                                 c.set_sink(alloc::boxed::Box::new(sink));
                             }
-                            pending[slot] = Some((p, reusing, false, w.last_poll_ns()));
+                            // A real clock read, not `w.last_poll_ns()`.
+                            // That timestamp is taken at the top of the loop,
+                            // before this pop, so it is *earlier* than the
+                            // pickup it is meant to mark -- and
+                            // `started - submitted` then underflowed through
+                            // saturating_sub to 0 for every request submitted
+                            // after that poll, which is most of them. Every
+                            // `queue_us_avg=0` printed before this line
+                            // existed says nothing at all.
+                            pending[slot] =
+                                Some((p, reusing, false, unsafe { shim_time_ns() }));
                         }
                         Err(e) => unsafe { Slot::complete(p, Err(e)) },
                     }

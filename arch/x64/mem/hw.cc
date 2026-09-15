@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <vector>
 
+#include <osv/clock.hh>
 #include <osv/interrupt.hh>
 #include <osv/mem/mapping.hh>
 #include <osv/migration-lock.hh>
@@ -67,6 +68,22 @@ static inter_processor_interrupt flush_ipi{IPI_TLB_FLUSH, [] {
         }
 }};
 
+// See shootdown_stats in arch/common/mem.hh. Relaxed throughout: these are
+// read once, after the run that produced them, and an exact order between
+// two cpus' increments would say nothing a sum does not.
+static std::atomic<uint64_t> sd_count, sd_pages, sd_all, sd_ns_total, sd_ns_max;
+
+shootdown_stats tlb_shootdown_stats()
+{
+    return shootdown_stats{
+        sd_count.load(std::memory_order_relaxed),
+        sd_pages.load(std::memory_order_relaxed),
+        sd_all.load(std::memory_order_relaxed),
+        sd_ns_total.load(std::memory_order_relaxed),
+        sd_ns_max.load(std::memory_order_relaxed),
+    };
+}
+
 /*
  * Shoot down TLB entries on all CPUs. If va is nullptr, flush the entire TLB.
  */
@@ -84,6 +101,17 @@ static void shootdown(const uintptr_t *va, size_t count)
         flush_here();
         return;
     }
+
+    // Timed from here, not from the top: the single-cpu case above is a local
+    // invalidate and none of what this measures applies to it.
+    sd_count.fetch_add(1, std::memory_order_relaxed);
+    sd_pages.fetch_add(count, std::memory_order_relaxed);
+    if (!va) {
+        sd_all.fetch_add(1, std::memory_order_relaxed);
+    }
+    auto t0 = osv::clock::uptime::now();
+    // Not a scope guard: the wait below is the thing being measured, so the
+    // clock has to be read after it, and there is no early return past it.
 
     SCOPE_LOCK(migration_lock);
     std::lock_guard<mutex> guard(flush_mutex);
@@ -104,6 +132,15 @@ static void shootdown(const uintptr_t *va, size_t count)
             return flush_pendingconfirms.load() == 0;
     });
     flush_waiter.clear();
+
+    uint64_t ns = (osv::clock::uptime::now() - t0).count();
+    sd_ns_total.fetch_add(ns, std::memory_order_relaxed);
+    // fetch_max, spelled out: the store must not undo a larger value another
+    // cpu put there between the load and the exchange.
+    uint64_t seen = sd_ns_max.load(std::memory_order_relaxed);
+    while (ns > seen &&
+           !sd_ns_max.compare_exchange_weak(seen, ns, std::memory_order_relaxed)) {
+    }
 }
 
 void tlb_flush_all()

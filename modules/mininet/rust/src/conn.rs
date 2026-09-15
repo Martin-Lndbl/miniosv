@@ -62,6 +62,16 @@ pub struct Conn {
     attempts: u16,
     settled: bool,
     start_ms: i64,
+    /// Same instant as `start_ms`, kept separately because a round trip to the
+    /// peer is a millisecond or two -- too short to measure in milliseconds.
+    start_ns: u64,
+    /// When the request went out, and when the first byte of its response came
+    /// back. The difference is S3's think time plus one round trip, which is a
+    /// per-request cost no amount of window matters to; what follows it is the
+    /// transfer, which is the only part a window governs. Splitting them is
+    /// the difference between "slow link" and "slow service".
+    req_sent_ns: u64,
+    first_byte_ns: u64,
     /// HEAD (and, defensively, 1xx/204/304) responses have no body regardless
     /// of what Content-Length says -- needed now that completion can't just
     /// wait for the peer to close.
@@ -123,6 +133,9 @@ impl Conn {
             attempts: 1,
             settled: false,
             start_ms: now_ms,
+            start_ns: unsafe { crate::ffi::shim_time_ns() },
+            req_sent_ns: 0,
+            first_byte_ns: 0,
             is_head: is_head_request(req.head),
         })
     }
@@ -155,6 +168,8 @@ impl Conn {
         self.sink = Box::new(NullSink);
         self.outcome = None;
         self.connect_start_ms = now_ms;
+        self.req_sent_ns = 0;
+        self.first_byte_ns = 0;
         self.is_head = is_head_request(&self.head);
     }
 
@@ -207,6 +222,11 @@ impl Conn {
     }
 
     fn finish(&mut self, step: Step) -> Step {
+        if step == Step::Complete && self.first_byte_ns != 0 {
+            stats::transfer(
+                unsafe { crate::ffi::shim_time_ns() }.saturating_sub(self.first_byte_ns),
+            );
+        }
         self.outcome = Some(step);
         step
     }
@@ -225,7 +245,9 @@ impl Conn {
         // right queue; record how many SYNs it took and how long it burned.
         if !self.settled && state == tcp::State::Established {
             self.settled = true;
-            stats::conn_established(self.attempts, now_ms - self.start_ms);
+            let setup_ns =
+                unsafe { crate::ffi::shim_time_ns() }.saturating_sub(self.start_ns);
+            stats::conn_established(self.attempts, now_ms - self.start_ms, setup_ns);
         }
 
         // A SYN that goes unanswered now is a real failure -- lost packet or
@@ -248,12 +270,26 @@ impl Conn {
             self.outgoing.extend_from_slice(&self.head);
             self.request_queued = true;
             self.handshake_done = true;
+            self.req_sent_ns = unsafe { crate::ffi::shim_time_ns() };
         }
         if !self.outgoing.is_empty() && s.can_send() {
             if let Ok(n) = s.send_slice(&self.outgoing) {
                 if n > 0 {
                     self.outgoing.drain(..n);
                 }
+            }
+        }
+        // How much the peer had actually delivered by the time we looked. This
+        // is the number that says whether a large advertised window is being
+        // used: if the peer were filling it, this would be far above one MSS.
+        if s.can_recv() {
+            let queued = s.recv_queue();
+            stats::recv_drain(queued, queued);
+            // Only after the request is on the wire: before that, anything
+            // arriving is handshake traffic, not the response.
+            if self.first_byte_ns == 0 && self.req_sent_ns != 0 {
+                self.first_byte_ns = unsafe { crate::ffi::shim_time_ns() };
+                stats::ttfb(self.first_byte_ns.saturating_sub(self.req_sent_ns));
             }
         }
         // Drain until the socket is empty, not once: smoltcp hands back the
@@ -324,9 +360,9 @@ impl Conn {
             // -- or a connection reset mid-request -- otherwise arrives at the
             // caller as a *successful* empty response: rc OK, status 0, zero
             // bytes, and httpfs keeps whatever was already in the buffer it
-            // handed us. Seen on c6in.large at sf=10 as a range read reporting
-            // want=47 got=0 status=0, and the caller reporting
-            // "HTTP Error: Request returned HTTP 0".
+            // handed us. Seen on c6in.large at sf=10 as
+            //   ODD READ: ... want=47 got=0 status=0 cl=0
+            // and the caller reporting "HTTP Error: Request returned HTTP 0".
             //
             // discard_ciphertext is exempt: it bypasses the parser on purpose,
             // so it has no head to have finished.
@@ -404,6 +440,7 @@ impl Conn {
                             Ok(n) => {
                                 self.outgoing.truncate(head + n);
                                 self.request_queued = true;
+                                self.req_sent_ns = unsafe { crate::ffi::shim_time_ns() };
                                 progress = true;
                             }
                             Err(e) => {

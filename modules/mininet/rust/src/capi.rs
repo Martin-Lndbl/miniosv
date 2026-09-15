@@ -228,23 +228,23 @@ pub extern "C" fn mininet_get(
     }
     let g = unsafe { &*g };
 
-    // Everything below writes through (buf, cap) on the strength of the
-    // caller's word, and a cap that does not match the allocation behind it
-    // surfaces much later as a fault inside BufferSink::write. S3 answers a
-    // ranged GET and httpfs sizes its reads in MiB, so a gigabyte-plus figure
-    // is a misparsed Range header rather than a large read: refuse it here,
-    // where the argument is still attributable to its caller.
+    // The caller's buffer is described entirely by (buf, cap) and everything
+    // below writes through it on the strength of that claim. A cap that does
+    // not match the allocation behind it is unfalsifiable here and shows up
+    // much later as a fault inside BufferSink::write, so record the extremes
+    // and refuse a figure that cannot be a real range read. S3 answers a
+    // ranged GET, and httpfs sizes its reads in MiB, so a gigabyte-plus cap
+    // means the Range header was misparsed rather than that the read is big.
     const MAX_SANE_CAP: u64 = 1 << 30;
     if cap > MAX_SANE_CAP {
         println!("FAIL: mininet_get: implausible buffer cap {} bytes", cap);
         return E_BAD_ARGUMENT;
     }
+    crate::stats::body_buffer(cap);
 
     let head = unsafe { core::slice::from_raw_parts(head as *const u8, head_len as usize) };
-    // `from_raw_parts_mut` requires a non-null, dereferenceable pointer even
-    // for an empty slice, and the HEAD path passes null with cap 0. Building
-    // that slice was undefined behaviour: nothing read it, but the compiler is
-    // entitled to assume it was valid.
+    // `from_raw_parts_mut` requires a non-null pointer even for an empty
+    // slice; the HEAD path passes null with cap 0, which would be UB.
     let body = if cap == 0 {
         &mut [][..]
     } else {
@@ -300,14 +300,87 @@ pub extern "C" fn mininet_get(
 pub struct mininet_conn_stats {
     pub requests_served: u64,
     pub requests_reused: u64,
+    pub queue_wait_us_total: u64,
+    pub wire_us_total: u64,
+    pub body_bytes_total: u64,
+    pub poll_iters: u64,
+    pub poll_gap_us_total: u64,
+    pub poll_gap_us_max: u64,
+    pub poll_gaps_over_1ms: u64,
+    pub misrouted_drops: u64,
+    pub tx_alloc_fail: u64,
+    pub tx_burst_fail: u64,
+    pub nic_ipackets: u64,
+    pub nic_ibytes: u64,
+    pub nic_imissed: u64,
+    pub nic_ierrors: u64,
+    pub nic_rx_nombuf: u64,
+    pub conns_established: u64,
+    pub conns_failed: u64,
+    pub syn_retries: u64,
+    pub setup_us_total: u64,
+    pub recv_drains: u64,
+    pub recv_drain_bytes: u64,
+    pub recv_queue_max: u64,
+    pub tx_calls: u64,
+    pub tx_ns_total: u64,
+    pub tx_ns_max: u64,
+    pub ttfb_us_total: u64,
+    pub ttfb_count: u64,
+    pub xfer_us_total: u64,
+    pub xfer_count: u64,
+    pub body_cap_max: u64,
+    pub body_cap_calls: u64,
+    pub requests_retried: u64,
+    pub wake_ns_total: u64,
+    pub wake_count: u64,
+    pub wake_ns_max: u64,
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn mininet_conn_stats() -> mininet_conn_stats {
     let s = crate::stats::snapshot();
+    let nic = crate::nic::eth_stats().unwrap_or_default();
     mininet_conn_stats {
         requests_served: s.requests_served,
         requests_reused: s.requests_reused,
+        queue_wait_us_total: s.queue_wait_us_total,
+        wire_us_total: s.wire_us_total,
+        body_bytes_total: s.body_bytes_total,
+        poll_iters: s.poll_iters,
+        poll_gap_us_total: s.poll_gap_us_total,
+        poll_gap_us_max: s.poll_gap_us_max,
+        poll_gaps_over_1ms: s.poll_gaps_over_1ms,
+        misrouted_drops: s.misrouted_drops,
+        tx_alloc_fail: s.tx_alloc_fail,
+        tx_burst_fail: s.tx_burst_fail,
+        // Read straight off the device: a frame it dropped for want of a
+        // descriptor never reached smoltcp, so nothing above can count it.
+        nic_ipackets: nic.ipackets,
+        nic_ibytes: nic.ibytes,
+        nic_imissed: nic.imissed,
+        nic_ierrors: nic.ierrors,
+        nic_rx_nombuf: nic.rx_nombuf,
+        conns_established: s.conns_established,
+        conns_failed: s.conns_failed,
+        syn_retries: s.syn_retries,
+        setup_us_total: s.setup_us_total,
+        recv_drains: s.recv_drains,
+        recv_drain_bytes: s.recv_drain_bytes,
+        recv_queue_max: s.recv_queue_max,
+        tx_calls: s.tx_calls,
+        tx_ns_total: s.tx_ns_total,
+        tx_ns_max: s.tx_ns_max,
+        ttfb_us_total: s.ttfb_us_total,
+        ttfb_count: s.ttfb_count,
+        xfer_us_total: s.xfer_us_total,
+        xfer_count: s.xfer_count,
+        body_cap_max: s.body_cap_max,
+        body_cap_calls: s.body_cap_calls,
+        requests_retried: s.requests_retried,
+        wake_ns_total: s.wake_ns_total,
+        wake_count: s.wake_count,
+        wake_ns_max: s.wake_ns_max,
     }
 }
 

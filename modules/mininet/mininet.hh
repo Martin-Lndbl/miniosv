@@ -128,6 +128,68 @@ struct conn_stats {
     //! hadn't closed instead of paying for a fresh handshake.
     uint64_t requests_served;
     uint64_t requests_reused;
+    //! Summed over requests: time queued waiting for a free connection slot,
+    //! and time from a worker picking the request up to the response being
+    //! complete. Queue wait near zero means slots were never the constraint.
+    uint64_t queue_wait_us_total;
+    uint64_t wire_us_total;
+    uint64_t body_bytes_total;
+    //! The worker poll loop. A worker polls without yielding, so the gap
+    //! between iterations should be microseconds; milliseconds mean it lost
+    //! the CPU, and a worker that is off-CPU is not draining the RX ring.
+    uint64_t poll_iters;
+    uint64_t poll_gap_us_total;
+    uint64_t poll_gap_us_max;
+    uint64_t poll_gaps_over_1ms;
+    //! Frames lost before smoltcp could see them. `nic_imissed` is the device
+    //! dropping for want of a descriptor, which the stack above cannot
+    //! observe -- and which the peer sees as congestion.
+    uint64_t misrouted_drops;
+    uint64_t tx_alloc_fail;
+    uint64_t tx_burst_fail;
+    uint64_t nic_ipackets;
+    uint64_t nic_ibytes;
+    uint64_t nic_imissed;
+    uint64_t nic_ierrors;
+    uint64_t nic_rx_nombuf;
+    //! SYN to Established is one round trip, so setup_us_total divided by
+    //! conns_established is the measured RTT to the peer.
+    uint64_t conns_established;
+    uint64_t conns_failed;
+    uint64_t syn_retries;
+    uint64_t setup_us_total;
+    //! Bytes waiting in the socket when a connection drained it. A mean near
+    //! one MSS means the peer sends a segment and waits, whatever window we
+    //! advertised -- which makes throughput one MSS per round trip.
+    uint64_t recv_drains;
+    uint64_t recv_drain_bytes;
+    uint64_t recv_queue_max;
+    //! Cost of one transmit call, which every ACK pays.
+    uint64_t tx_calls;
+    uint64_t tx_ns_total;
+    uint64_t tx_ns_max;
+    //! Request on the wire to first response byte, then first byte to done.
+    //! A large ttfb against a small transfer is latency, not bandwidth.
+    uint64_t ttfb_us_total;
+    uint64_t ttfb_count;
+    uint64_t xfer_us_total;
+    uint64_t xfer_count;
+    //! Largest body buffer a caller ever claimed, and how many it handed
+    //! over. A cap unlike the sizes httpfs asks for means a misread Range.
+    uint64_t body_cap_max;
+    uint64_t body_cap_calls;
+    //! Requests re-sent on a fresh connection because a reused one turned
+    //! out to be already closed. S3's keep-alive timeout, not a fault.
+    uint64_t requests_retried;
+    //! From the worker publishing a result to the submitting thread running
+    //! again: an unpark, the target cpu noticing, and a context switch.
+    //! Nanoseconds, because the good case is under a microsecond. This is the
+    //! only part of a request neither `wire_us_total` nor `ttfb + xfer`
+    //! covers, and the caller's own blocking time exceeds `wire` by 8-9 ms
+    //! per request -- so either this accounts for that or nothing does.
+    uint64_t wake_ns_total;
+    uint64_t wake_count;
+    uint64_t wake_ns_max;
 };
 
 conn_stats stats();

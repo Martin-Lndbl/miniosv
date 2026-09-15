@@ -38,6 +38,24 @@ void tlb_flush_local();
 void tlb_flush_all();
 void tlb_flush_pages_all(const uintptr_t *va, size_t count);
 
+// What broadcast invalidation has cost. A shootdown holds one global mutex and
+// then blocks until every other cpu has answered an IPI, so its cost is not
+// the invalidate -- it is the slowest cpu's interrupt latency, paid by one
+// thread at a time machine-wide. Whether that matters is a question about a
+// workload's free pattern, not about the code, so it has to be measured
+// against the workload: `ns_total` is wall time inside the call, summed over
+// callers, and so is directly comparable to the thread-time a query spends
+// outside its I/O.
+struct shootdown_stats {
+    uint64_t count;     // broadcast invalidations begun
+    uint64_t pages;     // addresses named by them; 0 for a whole-TLB flush
+    uint64_t all;       // how many were whole-TLB rather than by address
+    uint64_t ns_total;  // wall time inside the call, summed
+    uint64_t ns_max;    // the worst single one
+};
+
+shootdown_stats tlb_shootdown_stats();
+
 // Index into the table at "level" for "va".
 inline unsigned pt_index(void *va, unsigned level)
 {

@@ -67,6 +67,15 @@ void tlb_flush_pages_all(const uintptr_t *va, size_t count)
     tlb_flush_pages(va, count);
 }
 
+// Nothing to count: `tlbi ...is` is broadcast by the hardware, so there is no
+// IPI, no global lock and no waiting for other cpus -- the whole cost this
+// measures on x86 does not exist here. Zeros, rather than no symbol, so the
+// generic code and the app can print the line unconditionally.
+shootdown_stats tlb_shootdown_stats()
+{
+    return shootdown_stats{};
+}
+
 }
 }
 

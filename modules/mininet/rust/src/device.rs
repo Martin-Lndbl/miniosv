@@ -146,7 +146,13 @@ impl TxToken for DpdkTxToken<'_> {
         let n = core::cmp::min(len, cap as usize);
         let slice = unsafe { core::slice::from_raw_parts_mut(data, n) };
         let r = f(slice);
-        if unsafe { shim_mbuf_tx(PORT, self.dev.queue_id, handle, n as u16) } != 0 {
+        // Timed because every ACK pays it: if this is anywhere near the RTT,
+        // the peer is being paced by how fast we can put an ACK on the wire
+        // rather than by the network.
+        let t0 = unsafe { crate::ffi::shim_time_ns() };
+        let rc = unsafe { shim_mbuf_tx(PORT, self.dev.queue_id, handle, n as u16) };
+        stats::tx_call(unsafe { crate::ffi::shim_time_ns() }.saturating_sub(t0));
+        if rc != 0 {
             stats::tx_burst_fail();
         }
         r
