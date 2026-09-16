@@ -592,21 +592,15 @@ unsigned cpu::load()
 
 // Where an unpinned new thread goes.
 //
-// It used to go to its creator's cpu, and the load balancer was left to
-// spread it later. That is fine for a thread or two and wrong for a thread
-// pool: DuckDB builds one worker per cpu from a single thread, so all 32
-// landed on one cpu, and load_balance() moves at most one thread per 100 ms
-// -- three seconds to undo what one placement decision need not have done.
-// Measured on a 32-vCPU c6in.8xlarge, one expensive predicate over 6M rows
-// went from 1314 ms on one thread to 910 ms on all of them: a 1.4x speedup
-// where Linux gets 11.6x on the same instance, and the whole of the 2x gap
-// on TPC-H over S3.
+// It used to go to its creator's cpu and wait for the load balancer, which
+// moves one thread per 100 ms. A thread pool is created in a burst from one
+// thread, so the whole pool landed on one cpu: 3 of 32 cpus did any work, and
+// one expensive predicate over 6M rows got a 1.4x parallel speedup where
+// Linux got 11.7x.
 //
-// Least-loaded, searched from a rotating offset. The offset is the part that
-// matters: a thread pool is created in a burst, while every runqueue is
-// still empty, so without it every candidate ties at zero and min_element
-// hands back whichever cpu happens to compare first -- the same pile-up in a
-// new place.
+// Least-loaded, searched from a rotating offset. The offset matters: `load()`
+// is `runqueue.size()`, which is 0 on every cpu while a pool is being created,
+// so without it every candidate ties and the pile-up just moves.
 static cpu *placement_cpu()
 {
     // Not yet, or not any more, a choice: until every cpu is scheduling, a
