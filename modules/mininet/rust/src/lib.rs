@@ -111,15 +111,37 @@ pub struct Stack {
     queues: u16,
 }
 
+/// Workers to run when the caller does not say.
+///
+/// A worker spins without yielding and is pinned, so it owns its cpu for the
+/// life of the program: the count belongs to the machine, not to the program.
+/// One per sixteen cpus, at least one -- 2 -> 4 workers on a 32-vCPU box cost
+/// ~10% and bought no depth, so the knee is below four.
+///
+/// Right for a latency- or compute-bound workload. A bandwidth benchmark
+/// wants the opposite and should keep asking explicitly.
+fn auto_workers() -> u16 {
+    let cpus = unsafe { crate::ffi::shim_cpu_count() };
+    let n = (cpus / 16).max(1);
+    let n = n.min(u16::MAX as u64) as u16;
+    println!("mininet: {} cpus -> {} worker(s) (auto)", cpus, n);
+    n
+}
+
 impl Stack {
     /// Configure and start port 0, read the RSS steering model off the device,
     /// then acquire a lease and resolve the gateway's MAC.
     ///
     /// Everything here happens on queue 0 before any worker exists.
     pub fn up(cfg: &Config) -> Result<Stack, Error> {
-        let queues = nic::clamp_queues(cfg.queues);
-        if queues != cfg.queues {
-            println!("clamping workers {} -> {} (device max)", cfg.queues, queues);
+        let want = if cfg.queues == 0 {
+            auto_workers()
+        } else {
+            cfg.queues
+        };
+        let queues = nic::clamp_queues(want);
+        if queues != want {
+            println!("clamping workers {} -> {} (device max)", want, queues);
         }
 
         let (pools, mac) = nic::probe_and_open(queues)?;

@@ -100,6 +100,9 @@ void shim_thread_unpark(void *handle);
 uint64_t shim_time_seconds(void);
 uint64_t shim_time_ns(void);
 
+// How many cpus the guest has, for sizing the worker count.
+uint64_t shim_cpu_count(void);
+
 // Rust global allocator FFI.
 void *shim_malloc(uint64_t size);
 void  shim_free(void *ptr);

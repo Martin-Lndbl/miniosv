@@ -160,7 +160,8 @@ pub extern "C" fn mininet_up(cfg: *const mininet_config) -> c_int {
     let peer = Endpoint::new(ip, host, cfg.tls != 0);
 
     let stack = match Stack::up(&Config {
-        queues: cfg.workers.max(1) as u16,
+        // 0 means "pick for me"; see auto_workers().
+        queues: cfg.workers.min(u16::MAX as u32) as u16,
     }) {
         Ok(s) => s,
         Err(e) => return code(e),
