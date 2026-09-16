@@ -357,6 +357,10 @@ uint64_t shim_time_ns(void) {
          static_cast<uint64_t>(ts.tv_nsec);
 }
 
+uint64_t shim_cpu_count(void) {
+  return static_cast<uint64_t>(sched::cpus.size());
+}
+
 void *shim_thread_spawn(void (*fn)(void *), void *arg, int cpu_id) {
   sched::thread::attr attrs;
   if (cpu_id >= 0 && static_cast<size_t>(cpu_id) < sched::cpus.size()) {

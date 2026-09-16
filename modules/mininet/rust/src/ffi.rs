@@ -22,6 +22,7 @@ extern "C" {
     pub fn shim_time_seconds() -> u64;
     /// Monotonic, for smoltcp's timers.
     pub fn shim_time_ns() -> u64;
+    pub fn shim_cpu_count() -> u64;
     pub fn write(fd: c_int, buf: *const u8, count: usize) -> isize;
 
     pub fn shim_get_dev_info(port_id: u16, max_rx_queues: *mut u16, max_tx_queues: *mut u16) -> c_int;

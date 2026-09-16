@@ -53,6 +53,10 @@ struct config {
     int tls;
     //! RSS queues, and so worker threads, to ask for. Clamped to what the
     //! device advertises -- ENA caps queue count per instance size.
+    //!
+    //! 0 means "size it to the machine": one worker per sixteen cpus, at
+    //! least one. A worker owns its cpu, so a fixed 2 cost a 2-vCPU instance
+    //! its whole machine.
     uint32_t workers;
     //! Connection slots per worker. The concurrency ceiling is
     //! `workers * conns_per_worker` requests in flight; past that, callers
