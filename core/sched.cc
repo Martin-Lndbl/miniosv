@@ -636,6 +636,13 @@ static bool available(cpu *c)
     return !c->reserved.load(std::memory_order_acquire);
 }
 
+unsigned cpus_available()
+{
+    unsigned n = cpus.size();
+    unsigned r = cpus_reserved.load(std::memory_order_acquire);
+    return r < n ? n - r : 1;
+}
+
 // Where an unpinned new thread goes.
 //
 // It used to go to its creator's cpu and wait for the load balancer, which
