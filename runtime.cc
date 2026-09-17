@@ -300,7 +300,11 @@ long sysconf(int name)
     case _SC_THREAD_STACK_MIN: return 16384;
     case _SC_LINE_MAX: return 2048;
     case _SC_THREAD_PROCESS_SHARED: return true;
-    case _SC_NPROCESSORS_ONLN: return sched::cpus.size();
+    // ONLN is what a thread pool sizes itself from, and a cpu owned by a
+    // never-yielding poller is not one the application can run on -- offering
+    // it produces threads that share half a core with a spinner. CONF stays
+    // the whole machine, which is what it means.
+    case _SC_NPROCESSORS_ONLN: return sched::cpus_available();
     case _SC_NPROCESSORS_CONF: return sched::cpus.size();
     case _SC_PHYS_PAGES: return mem::frames::phys_mem_size / mem::frames::page_size;
     case _SC_AVPHYS_PAGES: return mem::frames::free_bytes() / mem::frames::page_size;

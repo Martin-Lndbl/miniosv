@@ -1528,6 +1528,11 @@ extern std::vector<cpu*> cpus;
 // last unreserved cpu; returns whether the cpu is reserved on return.
 bool reserve_cpu(unsigned id);
 
+// How many cpus an unpinned thread can actually be placed on. This is what
+// _SC_NPROCESSORS_ONLN reports, so a thread pool sized to "the machine" is
+// sized to the part of it the application may have. Never zero.
+unsigned cpus_available();
+
 inline void migrate_disable()
 {
     thread::current()->_migration_lock_counter++;
