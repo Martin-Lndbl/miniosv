@@ -1,11 +1,8 @@
 [submodule "app/miniduckdb"]
 	path = app/miniduckdb
 	url = git@github.com:TUM-DSE/miniduckdb.git
-	branch = perf/minimal
+	branch = srg_mainline
 [submodule "app/llama.cpp"]
 	path = app/llama.cpp
 	url = git@gitlab.lrz.de:tum-dse/llama.cpp-rknn.git
 	branch = lros
-[submodule "app/miniduckdb-httpfs"]
-	path = app/miniduckdb-httpfs
-	url = https://github.com/duckdb/duckdb-httpfs.git
