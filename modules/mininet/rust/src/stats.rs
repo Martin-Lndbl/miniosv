@@ -16,24 +16,19 @@ static CONNS_FAILED: AtomicU64 = AtomicU64::new(0);
 static REQUESTS_SERVED: AtomicU64 = AtomicU64::new(0);
 static REQUESTS_REUSED: AtomicU64 = AtomicU64::new(0);
 
-/// SYN on the wire to Established.
 static SETUP_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SETUP_NS_MAX: AtomicU64 = AtomicU64::new(0);
 static SETUP_HIST: [AtomicU64; BUCKETS] = [const { AtomicU64::new(0) }; BUCKETS];
-
-/// Building a connection, before its SYN can go out. The count lives in the
-/// histogram, so there is no separate counter to keep in step with it.
 static DIAL_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static DIAL_NS_MAX: AtomicU64 = AtomicU64::new(0);
 static DIAL_HIST: [AtomicU64; BUCKETS] = [const { AtomicU64::new(0) }; BUCKETS];
 
-/// Log2 histogram over microseconds: bucket `k > 0` holds `[2^(k-1), 2^k)`,
-/// bucket 0 holds everything under a microsecond. Coarse on purpose -- it
-/// costs a shift and one relaxed increment, and a percentile good to a factor
-/// of two is all that is needed to tell 80 us from 20 ms.
-pub(crate) const BUCKETS: usize = 32;
+/// Log2 histogram over microseconds: bucket `k > 0` holds `[2^(k-1), 2^k)`.
+/// Coarse on purpose -- a shift and one relaxed increment, and a percentile
+/// good to a factor of two is enough to tell 80 us from 20 ms.
+const BUCKETS: usize = 32;
 
-pub(crate) fn bucket(us: u64) -> usize {
+fn bucket(us: u64) -> usize {
     if us == 0 {
         return 0;
     }
@@ -46,17 +41,10 @@ fn record(hist: &[AtomicU64; BUCKETS], total: &AtomicU64, max: &AtomicU64, ns: u
     hist[bucket(ns / 1_000)].fetch_add(1, Ordering::Relaxed);
 }
 
-fn load_hist(hist: &[AtomicU64; BUCKETS]) -> [u64; BUCKETS] {
-    let mut out = [0u64; BUCKETS];
-    for (o, h) in out.iter_mut().zip(hist.iter()) {
-        *o = h.load(Ordering::Relaxed);
-    }
-    out
-}
-
-/// Interpolated linearly inside the bucket the answer lands in, so a p50 in a
-/// well-populated bucket is not reported as that bucket's floor.
-pub(crate) fn percentile(hist: &[u64; BUCKETS], p: u64) -> u64 {
+/// Interpolated inside the bucket it lands in, so a p50 is not reported as
+/// that bucket's floor. Can overshoot everything sampled, which is why
+/// [`dist`] clamps to the exact max.
+fn percentile(hist: &[u64; BUCKETS], p: u64) -> u64 {
     let count: u64 = hist.iter().sum();
     if count == 0 {
         return 0;
@@ -79,9 +67,8 @@ pub(crate) fn percentile(hist: &[u64; BUCKETS], p: u64) -> u64 {
     0
 }
 
-/// One measured duration, summarised. Microseconds throughout: the old
-/// millisecond clock quantised a ~1 ms handshake to 0 or 1, which at eight
-/// workers threw away most of the signal.
+/// One measured duration, in microseconds: a millisecond clock quantised a
+/// ~1 ms handshake to 0 or 1 and threw away most of the signal.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Dist {
     pub n: u64,
@@ -92,18 +79,18 @@ pub struct Dist {
 }
 
 fn dist(hist: &[AtomicU64; BUCKETS], total: &AtomicU64, max: &AtomicU64) -> Dist {
-    let h = load_hist(hist);
+    let mut h = [0u64; BUCKETS];
+    for (o, a) in h.iter_mut().zip(hist.iter()) {
+        *o = a.load(Ordering::Relaxed);
+    }
     let n: u64 = h.iter().sum();
+    let us_max = max.load(Ordering::Relaxed) / 1_000;
     Dist {
         n,
-        us_avg: if n == 0 {
-            0
-        } else {
-            total.load(Ordering::Relaxed) / n / 1_000
-        },
-        us_p50: percentile(&h, 50),
-        us_p90: percentile(&h, 90),
-        us_max: max.load(Ordering::Relaxed) / 1_000,
+        us_avg: if n == 0 { 0 } else { total.load(Ordering::Relaxed) / n / 1_000 },
+        us_p50: percentile(&h, 50).min(us_max),
+        us_p90: percentile(&h, 90).min(us_max),
+        us_max,
     }
 }
 
@@ -120,15 +107,12 @@ pub struct Stats {
     pub tx_burst_fail: u64,
     pub conns_established: u64,
     pub conns_failed: u64,
-    /// SYN on the wire to Established -- one round trip, so this is the
-    /// measured RTT to the peer. smoltcp does not expose its retransmit count,
-    /// so a lost SYN shows up here instead: its first retransmit is a second
-    /// out, which no healthy handshake can reach.
+    /// SYN on the wire to Established -- one round trip, so the measured RTT.
+    /// smoltcp does not expose a retransmit count, so a lost SYN shows up here
+    /// instead: its first retransmit is a second out.
     pub setup: Dist,
-    /// CPU burned building a connection -- the rustls session and its key
-    /// share -- before its SYN could be put on the wire. Separate from
-    /// `setup` because they answer different questions and only one of them is
-    /// about the network.
+    /// CPU spent building a connection before its SYN could go out. Separate
+    /// from `setup`: only one of the two is about the network.
     pub dial: Dist,
     /// Requests served on a connection that was already open, versus one that
     /// had to be dialled fresh. The gap between the two is the M3 win.

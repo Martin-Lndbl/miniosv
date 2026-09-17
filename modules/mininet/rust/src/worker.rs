@@ -88,8 +88,7 @@ pub struct Worker {
     sockets: SocketSet<'static>,
     handles: Vec<SocketHandle>,
     conns: Vec<Option<Conn>>,
-    /// One pair of record buffers per slot, parked here while the slot is
-    /// idle. `None` means the slot's connection is holding them.
+    /// Parked here while the slot is idle; `None` while its connection holds them.
     bufs: Vec<Option<ConnBufs>>,
     ports: Vec<u16>,
     rotation: Vec<u16>,
@@ -176,9 +175,7 @@ impl Worker {
         let mut conns = Vec::with_capacity(slots);
         conns.resize_with(slots, || None);
 
-        // Allocated here, with the socket buffers, rather than per dial: this
-        // is half a megabyte a slot, and paying for it inside `connect` put it
-        // on the path every SYN waits behind. See `ConnBufs`.
+        // With the socket buffers, not per dial. See `ConnBufs`.
         let mut bufs = Vec::with_capacity(slots);
         bufs.resize_with(slots, || Some(ConnBufs::new()));
 
@@ -241,7 +238,6 @@ impl Worker {
             self.sockets.get_mut::<tcp::Socket>(handle).abort();
         }
         if let Some(c) = self.conns.get_mut(slot).and_then(Option::take) {
-            // Keep the buffers; only the connection on top of them is done.
             if let Some(b) = self.bufs.get_mut(slot) {
                 *b = Some(c.into_bufs());
             }
@@ -290,9 +286,8 @@ impl Worker {
         let dst = (Ipv4Address::from_octets(self.peer.ip), self.peer.port);
         let dial_start_ns = self.clk.elapsed_ns();
 
-        // Before the socket is armed, and before the slot gives up its
-        // buffers: this is the one step that can fail, and the only expensive
-        // one left in a dial.
+        // Before the socket is armed and before the slot gives up its buffers:
+        // the one step that can fail, and the only expensive one left.
         let tls = Conn::session(&self.peer, &self.tls_config)?;
 
         {
@@ -304,9 +299,7 @@ impl Worker {
         }
         crate::stats::request_started(false);
 
-        // A slot re-dialled without an intervening `release` still owns its
-        // buffers; take them back rather than dropping them with the old
-        // connection and allocating a fresh pair.
+        // A slot re-dialled without a `release` still owns its buffers.
         let bufs = match self.conns[slot].take() {
             Some(old) => old.into_bufs(),
             None => self.bufs[slot].take().unwrap_or_else(ConnBufs::new),

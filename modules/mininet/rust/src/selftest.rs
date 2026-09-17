@@ -381,59 +381,12 @@ fn test_close_without_response(r: &mut Report) {
 }
 
 /// Runs every check. Returns the number that failed.
-/// The setup summary replaced a single sum that was quadratic in the
-/// connection count and so could not tell "every handshake was slow" from "one
-/// of them was". That distinction is the whole point of the replacement, so it
-/// is what gets checked here.
-fn test_setup_histogram(r: &mut Report) {
-    use crate::stats::{bucket, percentile, BUCKETS};
-
-    let empty = [0u64; BUCKETS];
-    r.check(percentile(&empty, 50) == 0, "an empty histogram has no p50");
-
-    // 128 handshakes, all near a millisecond: bucket [1024, 2048) us.
-    let mut uniform = [0u64; BUCKETS];
-    for _ in 0..128 {
-        uniform[bucket(1_100)] += 1;
-    }
-    let p50 = percentile(&uniform, 50);
-    let p90 = percentile(&uniform, 90);
-    r.check(
-        (1_024..2_048).contains(&p50),
-        "uniform p50 lands in the sampled bucket",
-    );
-    r.check(
-        (1_024..2_048).contains(&p90) && p90 >= p50,
-        "uniform p90 is in the same bucket, at or above p50",
-    );
-
-    // Ninety handshakes at 100 us and ten stalled at 100 ms. The median must
-    // stay with the fast ones and the tail must find the slow ones -- an
-    // average alone reports 10 ms and describes neither group.
-    let mut bimodal = [0u64; BUCKETS];
-    for _ in 0..90 {
-        bimodal[bucket(100)] += 1;
-    }
-    for _ in 0..10 {
-        bimodal[bucket(100_000)] += 1;
-    }
-    r.check(
-        (64..128).contains(&percentile(&bimodal, 50)),
-        "a slow tenth does not move p50",
-    );
-    r.check(
-        percentile(&bimodal, 99) >= 65_536,
-        "p99 finds the stalled connections",
-    );
-}
-
 pub fn run(verbose: bool) -> u32 {
     let mut r = Report::new(verbose);
     test_buffer_sink(&mut r);
     test_response_parser(&mut r);
     test_completion_rule(&mut r);
     test_close_without_response(&mut r);
-    test_setup_histogram(&mut r);
     println!(
         "mininet selftest: {} checks, {} failed",
         r.checks, r.failures

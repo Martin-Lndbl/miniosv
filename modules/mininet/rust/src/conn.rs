@@ -27,15 +27,9 @@ use crate::tls::TLS_BUF_CAP;
 /// backstop rather than a polling interval.
 const SYN_TIMEOUT_NS: u64 = 5_000_000_000;
 
-/// The two record buffers, which belong to the *slot* rather than to whatever
-/// connection is on it.
-///
-/// They used to be allocated inside `Conn::new`, which put half a megabyte of
-/// page-heap traffic inside every dial. Since a worker opens its connections
-/// in one serial loop and smoltcp only emits the SYNs on the `poll` that
-/// follows it, every connection waited out the construction of all the ones
-/// behind it: the cost showed up multiplied by `conns^2 / 2`. Allocated once
-/// per slot in `Worker::new` instead, alongside the socket buffers.
+/// The two record buffers. They belong to the slot, not to the connection on
+/// it: allocating half a megabyte inside every dial cost `conns^2 / 2`, since
+/// smoltcp holds every SYN until the `poll` after the dial loop.
 pub(crate) struct ConnBufs {
     incoming: Vec<u8>,
     outgoing: Vec<u8>,
@@ -83,10 +77,8 @@ pub struct Conn {
     /// Whether this connection has left SynSent yet -- either established or
     /// given up.
     settled: bool,
-    /// When this connection's SYN reached the wire, which is the first `step`
-    /// after the `iface.poll` that flushed it -- not when `connect` was
-    /// called. The gap between the two is dial cost, and belongs to
-    /// [`crate::stats::conn_dialled`] rather than in the handshake.
+    /// When the SYN reached the wire: the first `step` after the `iface.poll`
+    /// that flushed it, not when `connect` was called.
     syn_ns: Option<u64>,
     /// HEAD (and, defensively, 1xx/204/304) responses have no body regardless
     /// of what Content-Length says -- needed now that completion can't just
@@ -106,12 +98,9 @@ fn has_body(status: u16, is_head: bool) -> bool {
 }
 
 impl Conn {
-    /// The costly half of a dial: a fresh rustls session, including the key
-    /// share it puts in its ClientHello. `None` on a plain-HTTP peer.
-    ///
-    /// Split out of [`Conn::new`] so that the one fallible step happens before
-    /// the slot gives up its buffers -- a failed handshake must not strand
-    /// them -- and so that what a dial actually costs has a name.
+    /// The costly half of a dial: a fresh rustls session and its key share.
+    /// Split out so the one fallible step runs before the slot gives up its
+    /// buffers. `None` on a plain-HTTP peer.
     pub(crate) fn session(
         peer: &Endpoint,
         tls_config: &Arc<ClientConfig>,
@@ -163,8 +152,7 @@ impl Conn {
         }
     }
 
-    /// Hand the slot's buffers back, emptied but with their capacity intact,
-    /// so the next connection on this slot allocates nothing.
+    /// Hand the buffers back, emptied but with their capacity intact.
     pub(crate) fn into_bufs(mut self) -> ConnBufs {
         self.incoming.clear();
         self.outgoing.clear();
@@ -268,10 +256,8 @@ impl Conn {
         let s = sockets.get_mut::<tcp::Socket>(self.handle);
         let state = s.state();
 
-        // `Worker::poll` runs `iface.poll` before stepping anything, so by the
-        // time a socket is seen in SynSent its SYN is on the wire. That is
-        // when the handshake starts -- not when `connect` was called, which
-        // may have been many dials ago.
+        // `Worker::poll` runs `iface.poll` first, so a socket seen in SynSent
+        // has its SYN on the wire: that is when the handshake starts.
         if self.syn_ns.is_none()
             && matches!(state, tcp::State::SynSent | tcp::State::Established)
         {
