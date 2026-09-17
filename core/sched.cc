@@ -590,6 +590,52 @@ unsigned cpu::load()
     return runqueue.size();
 }
 
+static std::atomic<unsigned> cpus_reserved;
+static cpu *placement_cpu();
+
+// `load()` counts the runqueue, so a cpu whose spinning owner is *running*
+// reports 0 and looks like the emptiest cpu on the machine. Both placement and
+// the balancer then send threads there to share half a core with a thread that
+// never yields. Naming the cpu is cheaper than teaching them to see it.
+bool reserve_cpu(unsigned id)
+{
+    if (id >= cpus.size()) {
+        return false;
+    }
+    if (cpus[id]->reserved.load(std::memory_order_relaxed)) {
+        return true;
+    }
+    // Somebody has to be left to run the application.
+    if (cpus_reserved.load(std::memory_order_relaxed) + 1 >= cpus.size()) {
+        return false;
+    }
+    cpus_reserved.fetch_add(1, std::memory_order_relaxed);
+    cpus[id]->reserved.store(true, std::memory_order_release);
+
+    // Reserving says where new threads may go; it does not move the ones
+    // already here. The caller is one of them -- a worker is spawned from the
+    // application's own thread, which has been running since before this cpu
+    // had an owner -- and it is the one that matters, because every
+    // single-threaded phase of the program runs on it. Left behind it shares
+    // half a core with a poller that never yields: measured at exactly 2.00x
+    // on every single-threaded step of the cpu ladder. pin() migrates, unpin()
+    // gives the thread back to placement.
+    thread *t = thread::current();
+    if (t->tcpu() == cpus[id] && !t->pinned()) {
+        cpu *dst = placement_cpu();
+        if (dst != cpus[id]) {
+            t->pin(dst);
+            t->unpin();
+        }
+    }
+    return true;
+}
+
+static bool available(cpu *c)
+{
+    return !c->reserved.load(std::memory_order_acquire);
+}
+
 // Where an unpinned new thread goes.
 //
 // It used to go to its creator's cpu and wait for the load balancer, which
@@ -617,6 +663,9 @@ static cpu *placement_cpu()
     unsigned best_load = ~0u;
     for (unsigned i = 0; i < cpus.size(); i++) {
         cpu *c = cpus[(start + i) % cpus.size()];
+        if (!available(c)) {
+            continue;
+        }
         // Racy by nature -- another cpu's runqueue can change under the read
         // -- and advisory either way: being wrong costs one thread one
         // balancer period, which is what this is here to avoid paying 32
@@ -627,7 +676,7 @@ static cpu *placement_cpu()
             best = c;
         }
     }
-    return best;
+    return best ?: thread::current()->tcpu();
 }
 
 // function to pin the *current* thread:

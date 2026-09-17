@@ -174,8 +174,18 @@ pub struct Service {
     next: AtomicUsize,
 }
 
+/// Which cpu queue `q`'s worker takes. Counting down from the top, not up
+/// from zero: a worker never yields, so whatever shared its cpu runs at half
+/// speed, and cpu 0 is where the application's own thread starts. Queue index
+/// and cpu index are related only by this function -- the workers poll, so
+/// nothing steers a queue's interrupts anywhere.
+fn worker_cpu(q: u16) -> usize {
+    let cpus = unsafe { crate::ffi::shim_cpu_count() } as usize;
+    cpus.saturating_sub(1 + q as usize)
+}
+
 impl Service {
-    /// Spawn a worker per queue, each pinned to the matching CPU.
+    /// Spawn a worker per queue, each pinned to a CPU of its own.
     ///
     /// The threads are never joined: they poll for the life of the program,
     /// the way `modules/miniext` never unmounts in practice.
@@ -189,7 +199,7 @@ impl Service {
             let (conns, rx, tx) = (cfg.conns_per_worker, cfg.rx_buffer, cfg.tx_buffer);
             thread::spawn(
                 move || serve(handle, peer, conns, rx, tx, mine),
-                Some(q as usize),
+                Some(worker_cpu(q)),
             );
             queues.push(queue);
         }
