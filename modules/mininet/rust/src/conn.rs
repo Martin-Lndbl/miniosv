@@ -25,7 +25,30 @@ use crate::tls::TLS_BUF_CAP;
 /// A SYN now only goes unanswered on genuine loss -- the source port is chosen
 /// so the SYN-ACK provably returns on this queue -- so the timeout is a
 /// backstop rather than a polling interval.
-const SYN_TIMEOUT_MS: i64 = 5_000;
+const SYN_TIMEOUT_NS: u64 = 5_000_000_000;
+
+/// The two record buffers, which belong to the *slot* rather than to whatever
+/// connection is on it.
+///
+/// They used to be allocated inside `Conn::new`, which put half a megabyte of
+/// page-heap traffic inside every dial. Since a worker opens its connections
+/// in one serial loop and smoltcp only emits the SYNs on the `poll` that
+/// follows it, every connection waited out the construction of all the ones
+/// behind it: the cost showed up multiplied by `conns^2 / 2`. Allocated once
+/// per slot in `Worker::new` instead, alongside the socket buffers.
+pub(crate) struct ConnBufs {
+    incoming: Vec<u8>,
+    outgoing: Vec<u8>,
+}
+
+impl ConnBufs {
+    pub(crate) fn new() -> Self {
+        Self {
+            incoming: Vec::with_capacity(TLS_BUF_CAP),
+            outgoing: Vec::with_capacity(TLS_BUF_CAP),
+        }
+    }
+}
 
 /// What one [`Conn::step`] concluded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,14 +77,17 @@ pub struct Conn {
     sink: Box<dyn BodySink>,
 
     outcome: Option<Step>,
-    connect_start_ms: i64,
+    connect_start_ns: u64,
     queue_id: u16,
     src_port: u16,
-    /// Total SYNs sent, and whether this connection has left SynSent yet --
-    /// either established or given up.
-    attempts: u16,
+    /// Whether this connection has left SynSent yet -- either established or
+    /// given up.
     settled: bool,
-    start_ms: i64,
+    /// When this connection's SYN reached the wire, which is the first `step`
+    /// after the `iface.poll` that flushed it -- not when `connect` was
+    /// called. The gap between the two is dial cost, and belongs to
+    /// [`crate::stats::conn_dialled`] rather than in the handshake.
+    syn_ns: Option<u64>,
     /// HEAD (and, defensively, 1xx/204/304) responses have no body regardless
     /// of what Content-Length says -- needed now that completion can't just
     /// wait for the peer to close.
@@ -80,51 +106,72 @@ fn has_body(status: u16, is_head: bool) -> bool {
 }
 
 impl Conn {
+    /// The costly half of a dial: a fresh rustls session, including the key
+    /// share it puts in its ClientHello. `None` on a plain-HTTP peer.
+    ///
+    /// Split out of [`Conn::new`] so that the one fallible step happens before
+    /// the slot gives up its buffers -- a failed handshake must not strand
+    /// them -- and so that what a dial actually costs has a name.
+    pub(crate) fn session(
+        peer: &Endpoint,
+        tls_config: &Arc<ClientConfig>,
+    ) -> Result<Option<UnbufferedClientConnection>, Error> {
+        if !peer.tls {
+            return Ok(None);
+        }
+        let name = ServerName::try_from(peer.host.as_str())
+            .map_err(|_| Error::Tls)?
+            .to_owned();
+        match UnbufferedClientConnection::new(tls_config.clone(), name) {
+            Ok(c) => Ok(Some(c)),
+            Err(e) => {
+                println!("FAIL: rustls new: {:?}", e);
+                Err(Error::Tls)
+            }
+        }
+    }
+
     pub(crate) fn new(
         handle: SocketHandle,
         queue_id: u16,
         src_port: u16,
-        peer: &Endpoint,
+        tls: Option<UnbufferedClientConnection>,
         req: &Request<'_>,
-        tls_config: &Arc<ClientConfig>,
-        now_ms: i64,
-    ) -> Result<Conn, Error> {
-        let tls = if peer.tls {
-            let name = ServerName::try_from(peer.host.as_str())
-                .map_err(|_| Error::Tls)?
-                .to_owned();
-            match UnbufferedClientConnection::new(tls_config.clone(), name) {
-                Ok(c) => Some(c),
-                Err(e) => {
-                    println!("FAIL: rustls new: {:?}", e);
-                    return Err(Error::Tls);
-                }
-            }
-        } else {
-            None
-        };
-
-        Ok(Conn {
+        bufs: ConnBufs,
+        now_ns: u64,
+    ) -> Conn {
+        // Meaningless without a record layer to skip.
+        let discard_ciphertext = req.discard_ciphertext && tls.is_some();
+        Conn {
             handle,
             tls,
-            incoming: Vec::with_capacity(TLS_BUF_CAP),
-            outgoing: Vec::with_capacity(TLS_BUF_CAP),
+            incoming: bufs.incoming,
+            outgoing: bufs.outgoing,
             head: req.head.to_vec(),
             request_queued: false,
             handshake_done: false,
-            // Meaningless without a record layer to skip.
-            discard_ciphertext: req.discard_ciphertext && peer.tls,
+            discard_ciphertext,
             parser: ResponseParser::new(),
             sink: Box::new(NullSink),
             outcome: None,
-            connect_start_ms: now_ms,
+            connect_start_ns: now_ns,
             queue_id,
             src_port,
-            attempts: 1,
             settled: false,
-            start_ms: now_ms,
+            syn_ns: None,
             is_head: is_head_request(req.head),
-        })
+        }
+    }
+
+    /// Hand the slot's buffers back, emptied but with their capacity intact,
+    /// so the next connection on this slot allocates nothing.
+    pub(crate) fn into_bufs(mut self) -> ConnBufs {
+        self.incoming.clear();
+        self.outgoing.clear();
+        ConnBufs {
+            incoming: self.incoming,
+            outgoing: self.outgoing,
+        }
     }
 
     /// Whether this connection finished successfully and the peer hasn't
@@ -138,7 +185,7 @@ impl Conn {
     /// Reuse this connection's socket (and, over TLS, its session) for a new
     /// request. Only valid when [`Conn::idle_reusable`] was just true; the TCP
     /// and TLS handshakes are not repeated.
-    pub(crate) fn reset_for(&mut self, req: &Request<'_>, now_ms: i64) {
+    pub(crate) fn reset_for(&mut self, req: &Request<'_>, now_ns: u64) {
         // `incoming` is deliberately *not* cleared. A reused connection carries
         // on the same TLS session, so anything still buffered is a partial
         // record of that stream -- a server-sent ticket, or a record that
@@ -154,7 +201,7 @@ impl Conn {
         self.parser = ResponseParser::new();
         self.sink = Box::new(NullSink);
         self.outcome = None;
-        self.connect_start_ms = now_ms;
+        self.connect_start_ns = now_ns;
         self.is_head = is_head_request(&self.head);
     }
 
@@ -217,29 +264,44 @@ impl Conn {
         if let Some(done) = self.outcome {
             return done;
         }
-        let now_ms = clk.elapsed_ms();
+        let now_ns = clk.elapsed_ns();
         let s = sockets.get_mut::<tcp::Socket>(self.handle);
         let state = s.state();
 
+        // `Worker::poll` runs `iface.poll` before stepping anything, so by the
+        // time a socket is seen in SynSent its SYN is on the wire. That is
+        // when the handshake starts -- not when `connect` was called, which
+        // may have been many dials ago.
+        if self.syn_ns.is_none()
+            && matches!(state, tcp::State::SynSent | tcp::State::Established)
+        {
+            self.syn_ns = Some(now_ns);
+        }
+        let since_syn = now_ns.saturating_sub(self.syn_ns.unwrap_or(now_ns));
+
         // Leaving SynSent for Established means the SYN-ACK came back on the
-        // right queue; record how many SYNs it took and how long it burned.
+        // right queue, one round trip after the SYN left.
         if !self.settled && state == tcp::State::Established {
             self.settled = true;
-            stats::conn_established(self.attempts, now_ms - self.start_ms);
+            stats::conn_established(since_syn);
         }
 
         // A SYN that goes unanswered now is a real failure -- lost packet or
         // unreachable peer, not a wrong port hash -- so fail loudly rather
         // than abandon it silently.
-        if state == tcp::State::SynSent && now_ms - self.connect_start_ms > SYN_TIMEOUT_MS {
+        if state == tcp::State::SynSent
+            && now_ns.saturating_sub(self.connect_start_ns) > SYN_TIMEOUT_NS
+        {
             s.abort();
             println!(
                 "FAIL: q{} SYN timeout on port {} after {} ms — no SYN-ACK",
-                self.queue_id, self.src_port, SYN_TIMEOUT_MS
+                self.queue_id,
+                self.src_port,
+                SYN_TIMEOUT_NS / 1_000_000
             );
             if !self.settled {
                 self.settled = true;
-                stats::conn_failed(now_ms - self.start_ms);
+                stats::conn_failed(since_syn);
             }
             return self.finish(Step::Failed(Error::SynTimeout));
         }
