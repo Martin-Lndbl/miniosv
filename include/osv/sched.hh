@@ -88,17 +88,11 @@ extern "C" {
 
 namespace bi = boost::intrusive;
 
-// Maximum number of CPUs the kernel supports. Must be a multiple of the width
-// of an unsigned long (64) so that cpu_set below tiles cleanly into words.
+// Maximum number of CPUs the kernel supports. Must be a multiple of 64
 const unsigned max_cpus = 256;
+static_assert(max_cpus % 64 == 0);
 
-// A lock-free set of CPU ids (0 .. max_cpus-1), stored as a tiled array of
-// atomic words. Historically this was a single unsigned long, which is what
-// capped OSv at 64 CPUs; splitting it into nr_words lets it scale to any
-// multiple of 64 while keeping every operation lock-free (no wide/128-bit
-// atomics and no libatomic dependency). Each CPU id maps to exactly one word
-// (id / bits_per_word), so the per-CPU produce/consume reasoning for
-// incoming_wakeups_mask is preserved word by word.
+// A lock-free set of CPU ids (0 .. max_cpus-1), stored as an array of atomic words.
 class cpu_set {
 private:
     static constexpr unsigned bits_per_word = sizeof(unsigned long) * 8;
@@ -125,11 +119,7 @@ public:
         return _words[c / bits_per_word].fetch_or(bit, std::memory_order_release)
                & bit;
     }
-    // Set bit c and report whether the word containing c was non-empty before.
-    // This is relaxed from a whole-set emptiness test: a false "empty" result is
-    // impossible, so callers that coalesce wakeup IPIs on the empty->non-empty
-    // transition may send at most one extra IPI per non-empty word (harmless),
-    // but can never suppress a needed one.
+
     bool test_all_and_set(unsigned c) {
         return _words[c / bits_per_word].fetch_or(1UL << (c % bits_per_word),
                                                   std::memory_order_release);
@@ -206,10 +196,10 @@ public:
             while (idx < max_cpus) {
                 unsigned w = idx / bits_per_word;
                 unsigned b = idx % bits_per_word;
-                unsigned long tmp = _set._words[w].load(std::memory_order_relaxed)
+                unsigned long overflow = _set._words[w].load(std::memory_order_relaxed)
                                     & ~((1UL << b) - 1);
-                if (tmp) {
-                    _idx = w * bits_per_word + __builtin_ctzl(tmp);
+                if (overflow) {
+                    _idx = w * bits_per_word + __builtin_ctzl(overflow);
                     return;
                 }
                 idx = (w + 1) * bits_per_word;
