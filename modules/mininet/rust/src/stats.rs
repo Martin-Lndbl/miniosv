@@ -1,10 +1,4 @@
-//! Stack-wide counters.
-//!
-//! These are cheap and stay in the build. Each one is an invariant that should
-//! hold on every run, so a regression surfaces in the output rather than as a
-//! mysteriously slower number. Anything that is a *policy* question -- whether
-//! a 206 was expected, how many blocks a run planned -- belongs to the caller,
-//! not here.
+//! Stack-wide counters. Cheap, and always in the build.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -15,6 +9,27 @@ static CONNS_ESTABLISHED: AtomicU64 = AtomicU64::new(0);
 static CONNS_FAILED: AtomicU64 = AtomicU64::new(0);
 static REQUESTS_SERVED: AtomicU64 = AtomicU64::new(0);
 static REQUESTS_REUSED: AtomicU64 = AtomicU64::new(0);
+static REQUESTS_RETRIED: AtomicU64 = AtomicU64::new(0);
+static REQUESTS_DONE: AtomicU64 = AtomicU64::new(0);
+static QUEUE_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static WIRE_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BODY_BYTES: AtomicU64 = AtomicU64::new(0);
+static TTFB_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static TTFB_N: AtomicU64 = AtomicU64::new(0);
+static XFER_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static XFER_N: AtomicU64 = AtomicU64::new(0);
+static POLL_ITERS: AtomicU64 = AtomicU64::new(0);
+static POLL_GAP_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static POLL_GAP_NS_MAX: AtomicU64 = AtomicU64::new(0);
+static POLL_GAPS_OVER_1MS: AtomicU64 = AtomicU64::new(0);
+static POLL_BUSY_NS: AtomicU64 = AtomicU64::new(0);
+static POLL_ACTIVE_ITERS: AtomicU64 = AtomicU64::new(0);
+static POLL_WORK_NS: AtomicU64 = AtomicU64::new(0);
+static WAKE_N: AtomicU64 = AtomicU64::new(0);
+static WAKE_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static WAKE_NS_MAX: AtomicU64 = AtomicU64::new(0);
+static GET_CALLS: AtomicU64 = AtomicU64::new(0);
+static GET_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 static SETUP_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SETUP_NS_MAX: AtomicU64 = AtomicU64::new(0);
@@ -24,8 +39,6 @@ static DIAL_NS_MAX: AtomicU64 = AtomicU64::new(0);
 static DIAL_HIST: [AtomicU64; BUCKETS] = [const { AtomicU64::new(0) }; BUCKETS];
 
 /// Log2 histogram over microseconds: bucket `k > 0` holds `[2^(k-1), 2^k)`.
-/// Coarse on purpose -- a shift and one relaxed increment, and a percentile
-/// good to a factor of two is enough to tell 80 us from 20 ms.
 const BUCKETS: usize = 32;
 
 fn bucket(us: u64) -> usize {
@@ -41,9 +54,7 @@ fn record(hist: &[AtomicU64; BUCKETS], total: &AtomicU64, max: &AtomicU64, ns: u
     hist[bucket(ns / 1_000)].fetch_add(1, Ordering::Relaxed);
 }
 
-/// Interpolated inside the bucket it lands in, so a p50 is not reported as
-/// that bucket's floor. Can overshoot everything sampled, which is why
-/// [`dist`] clamps to the exact max.
+/// Interpolated inside its bucket; [`dist`] clamps it to the exact max.
 fn percentile(hist: &[u64; BUCKETS], p: u64) -> u64 {
     let count: u64 = hist.iter().sum();
     if count == 0 {
@@ -67,8 +78,7 @@ fn percentile(hist: &[u64; BUCKETS], p: u64) -> u64 {
     0
 }
 
-/// One measured duration, in microseconds: a millisecond clock quantised a
-/// ~1 ms handshake to 0 or 1 and threw away most of the signal.
+/// One measured duration, in microseconds.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Dist {
     pub n: u64,
@@ -96,28 +106,43 @@ fn dist(hist: &[AtomicU64; BUCKETS], total: &AtomicU64, max: &AtomicU64) -> Dist
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Stats {
-    /// Packets discarded because they arrived on a queue that does not own the
-    /// destination port. Source ports are chosen so this cannot happen; a
-    /// nonzero value means the RSS model no longer matches the hardware.
+    /// Nonzero means the RSS model no longer matches the hardware.
     pub misrouted_drops: u64,
-    /// Frames dropped before reaching the NIC: no mbuf available, or the TX
-    /// ring refused them. Both are invisible to smoltcp, which believes it
-    /// sent them.
+    /// Frames smoltcp believes it sent and the NIC never got.
     pub tx_alloc_fail: u64,
     pub tx_burst_fail: u64,
     pub conns_established: u64,
     pub conns_failed: u64,
-    /// SYN on the wire to Established -- one round trip, so the measured RTT.
-    /// smoltcp does not expose a retransmit count, so a lost SYN shows up here
-    /// instead: its first retransmit is a second out.
+    /// SYN on the wire to Established: the measured RTT.
     pub setup: Dist,
-    /// CPU spent building a connection before its SYN could go out. Separate
-    /// from `setup`: only one of the two is about the network.
+    /// CPU spent building a connection before its SYN could go out.
     pub dial: Dist,
-    /// Requests served on a connection that was already open, versus one that
-    /// had to be dialled fresh. The gap between the two is the M3 win.
     pub requests_served: u64,
     pub requests_reused: u64,
+    pub requests_retried: u64,
+    /// Per request: submit -> pick-up (queue), pick-up -> complete (wire),
+    /// and the wire split at the first head byte (ttfb / xfer).
+    pub requests_done: u64,
+    pub queue_ns_total: u64,
+    pub wire_ns_total: u64,
+    pub body_bytes: u64,
+    pub ttfb_ns_total: u64,
+    pub ttfb_n: u64,
+    pub xfer_ns_total: u64,
+    pub xfer_n: u64,
+    pub poll_iters: u64,
+    pub poll_gap_ns_total: u64,
+    pub poll_gap_ns_max: u64,
+    pub poll_gaps_over_1ms: u64,
+    pub poll_busy_ns: u64,
+    pub poll_active_iters: u64,
+    pub poll_work_ns: u64,
+    /// Publish -> submitter running again.
+    pub wake_n: u64,
+    pub wake_ns_total: u64,
+    pub wake_ns_max: u64,
+    pub get_calls: u64,
+    pub get_ns_total: u64,
 }
 
 pub fn snapshot() -> Stats {
@@ -131,7 +156,100 @@ pub fn snapshot() -> Stats {
         dial: dist(&DIAL_HIST, &DIAL_NS_TOTAL, &DIAL_NS_MAX),
         requests_served: REQUESTS_SERVED.load(Ordering::Relaxed),
         requests_reused: REQUESTS_REUSED.load(Ordering::Relaxed),
+        requests_retried: REQUESTS_RETRIED.load(Ordering::Relaxed),
+        requests_done: REQUESTS_DONE.load(Ordering::Relaxed),
+        queue_ns_total: QUEUE_NS_TOTAL.load(Ordering::Relaxed),
+        wire_ns_total: WIRE_NS_TOTAL.load(Ordering::Relaxed),
+        body_bytes: BODY_BYTES.load(Ordering::Relaxed),
+        ttfb_ns_total: TTFB_NS_TOTAL.load(Ordering::Relaxed),
+        ttfb_n: TTFB_N.load(Ordering::Relaxed),
+        xfer_ns_total: XFER_NS_TOTAL.load(Ordering::Relaxed),
+        xfer_n: XFER_N.load(Ordering::Relaxed),
+        poll_iters: POLL_ITERS.load(Ordering::Relaxed),
+        poll_gap_ns_total: POLL_GAP_NS_TOTAL.load(Ordering::Relaxed),
+        poll_gap_ns_max: POLL_GAP_NS_MAX.load(Ordering::Relaxed),
+        poll_gaps_over_1ms: POLL_GAPS_OVER_1MS.load(Ordering::Relaxed),
+        poll_busy_ns: POLL_BUSY_NS.load(Ordering::Relaxed),
+        poll_active_iters: POLL_ACTIVE_ITERS.load(Ordering::Relaxed),
+        poll_work_ns: POLL_WORK_NS.load(Ordering::Relaxed),
+        wake_n: WAKE_N.load(Ordering::Relaxed),
+        wake_ns_total: WAKE_NS_TOTAL.load(Ordering::Relaxed),
+        wake_ns_max: WAKE_NS_MAX.load(Ordering::Relaxed),
+        get_calls: GET_CALLS.load(Ordering::Relaxed),
+        get_ns_total: GET_NS_TOTAL.load(Ordering::Relaxed),
     }
+}
+
+pub(crate) fn request_retried() {
+    REQUESTS_RETRIED.fetch_add(1, Ordering::Relaxed);
+}
+pub(crate) fn request_finished(
+    queue_ns: u64,
+    wire_ns: u64,
+    bytes: u64,
+    ttfb_ns: Option<u64>,
+    xfer_ns: Option<u64>,
+) {
+    REQUESTS_DONE.fetch_add(1, Ordering::Relaxed);
+    QUEUE_NS_TOTAL.fetch_add(queue_ns, Ordering::Relaxed);
+    WIRE_NS_TOTAL.fetch_add(wire_ns, Ordering::Relaxed);
+    BODY_BYTES.fetch_add(bytes, Ordering::Relaxed);
+    if let Some(t) = ttfb_ns {
+        TTFB_NS_TOTAL.fetch_add(t, Ordering::Relaxed);
+        TTFB_N.fetch_add(1, Ordering::Relaxed);
+    }
+    if let Some(x) = xfer_ns {
+        XFER_NS_TOTAL.fetch_add(x, Ordering::Relaxed);
+        XFER_N.fetch_add(1, Ordering::Relaxed);
+    }
+}
+/// Per-worker, flushed in batches so workers do not share cache lines per iteration.
+#[derive(Default)]
+pub(crate) struct PollAcc {
+    pub iters: u64,
+    pub gap_ns_total: u64,
+    pub gap_ns_max: u64,
+    pub gaps_over_1ms: u64,
+    pub busy_ns: u64,
+    pub active_iters: u64,
+    pub work_ns: u64,
+}
+
+impl PollAcc {
+    pub(crate) fn tick(&mut self, gap_ns: u64, busy_ns: u64, active: bool) {
+        self.iters += 1;
+        self.gap_ns_total += gap_ns;
+        self.gap_ns_max = self.gap_ns_max.max(gap_ns);
+        if gap_ns > 1_000_000 {
+            self.gaps_over_1ms += 1;
+        }
+        self.busy_ns += busy_ns;
+        if active {
+            self.active_iters += 1;
+            self.work_ns += busy_ns;
+        }
+        if self.iters >= 1024 {
+            self.flush();
+        }
+    }
+
+    pub(crate) fn flush(&mut self) {
+        POLL_ITERS.fetch_add(self.iters, Ordering::Relaxed);
+        POLL_GAP_NS_TOTAL.fetch_add(self.gap_ns_total, Ordering::Relaxed);
+        POLL_GAP_NS_MAX.fetch_max(self.gap_ns_max, Ordering::Relaxed);
+        POLL_GAPS_OVER_1MS.fetch_add(self.gaps_over_1ms, Ordering::Relaxed);
+        POLL_BUSY_NS.fetch_add(self.busy_ns, Ordering::Relaxed);
+        POLL_ACTIVE_ITERS.fetch_add(self.active_iters, Ordering::Relaxed);
+        POLL_WORK_NS.fetch_add(self.work_ns, Ordering::Relaxed);
+        *self = Self::default();
+    }
+}
+pub(crate) fn get_finished(total_ns: u64, wake_ns: u64) {
+    GET_CALLS.fetch_add(1, Ordering::Relaxed);
+    GET_NS_TOTAL.fetch_add(total_ns, Ordering::Relaxed);
+    WAKE_N.fetch_add(1, Ordering::Relaxed);
+    WAKE_NS_TOTAL.fetch_add(wake_ns, Ordering::Relaxed);
+    WAKE_NS_MAX.fetch_max(wake_ns, Ordering::Relaxed);
 }
 
 pub(crate) fn misrouted_drop() {

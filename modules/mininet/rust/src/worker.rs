@@ -1,19 +1,12 @@
-//! One worker: one RSS queue, one interface, one set of connections.
-//!
-//! A worker is shared-nothing. It owns its queue's mempool, its own
-//! `Interface`, its own sockets, and a set of source ports whose return
-//! traffic the NIC provably steers to it. Nothing on its data path is shared
-//! with another worker, so nothing on it locks.
-//!
-//! Because the port partition is a function of the *peer's* address as well as
-//! ours, a worker is built for one [`Endpoint`] and stays with it.
+//! One worker: one RSS queue, one interface, one set of connections, and the
+//! source ports whose return traffic steers to that queue. Shared-nothing.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use rustls::client::ClientConfig;
-use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
+use smoltcp::iface::{Config, Interface, PollResult, SocketHandle, SocketSet, SocketStorage};
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address};
@@ -29,18 +22,11 @@ use crate::rss::{Rss, EPH_LEN};
 use crate::tls;
 use crate::Netif;
 
-/// How many source ports a slot rotates through before repeating one.
 const PORT_ROTATION: usize = 8;
 
-/// How a worker is sized, and who it talks to.
 pub struct WorkerConfig {
-    /// The server this worker's connections dial. Fixed for the worker's life:
-    /// the source ports it may use are derived from this address.
     pub peer: Endpoint,
-    /// Connection slots. Capped by how many usable source ports steer here.
     pub conns: usize,
-    /// Per-socket receive buffer. The dominant memory cost of the stack:
-    /// `conns * workers * rx_buffer`.
     pub rx_buffer: usize,
     pub tx_buffer: usize,
 }
@@ -56,12 +42,7 @@ impl WorkerConfig {
     }
 }
 
-/// A `Send` ticket for one queue.
-///
-/// Workers are built on the thread that polls them -- an `Interface` and its
-/// sockets must not migrate between CPUs -- so this is what crosses the thread
-/// boundary. The pool pointer is owned by the [`crate::Stack`], which outlives
-/// every worker.
+/// A `Send` ticket for one queue; the worker itself is built on its own thread.
 #[derive(Clone, Copy)]
 pub struct WorkerHandle {
     pub(crate) queue_id: u16,
@@ -70,12 +51,9 @@ pub struct WorkerHandle {
     pub(crate) rss: Rss,
 }
 
-// SAFETY: the mempool is per-queue and only ever touched by the one worker
-// that owns this handle; the shim's pool is internally locked in any case.
 unsafe impl Send for WorkerHandle {}
 
 impl WorkerHandle {
-    /// Also the CPU a caller should pin the worker's thread to.
     pub fn queue_id(&self) -> u16 {
         self.queue_id
     }
@@ -88,7 +66,6 @@ pub struct Worker {
     sockets: SocketSet<'static>,
     handles: Vec<SocketHandle>,
     conns: Vec<Option<Conn>>,
-    /// Parked here while the slot is idle; `None` while its connection holds them.
     bufs: Vec<Option<ConnBufs>>,
     ports: Vec<u16>,
     rotation: Vec<u16>,
@@ -96,6 +73,9 @@ pub struct Worker {
     peer: Endpoint,
     tls_config: Arc<ClientConfig>,
     clk: MonoClock,
+    last_poll_ns: u64,
+    last_busy_ns: u64,
+    last_active: bool,
 }
 
 impl Worker {
@@ -107,10 +87,6 @@ impl Worker {
             .rss
             .owned_ports(cfg.peer.ip, cfg.peer.port, netif.ip, h.queue_id);
         let ports = owned.spread(cfg.conns);
-        // A slot that serves request after request cannot keep reusing one
-        // port: even aborted, dialling the same 4-tuple again immediately
-        // risks the peer still holding the old connection. Rotating through a
-        // wider set costs 2 bytes each and removes the question.
         let rotation = owned.spread(cfg.conns * PORT_ROTATION);
         if ports.is_empty() {
             println!("FAIL: q{}: no ephemeral port steers here", h.queue_id);
@@ -135,8 +111,7 @@ impl Worker {
         let ip = Ipv4Address::from_octets(netif.ip);
         let gw = Ipv4Address::from_octets(netif.gateway_ip);
 
-        // Seed the neighbour cache from the reply queue 0 already got: an ARP
-        // exchange from here would not be steered back to this queue.
+        // ARP replies would not steer to this queue; seed the cache instead.
         let synth = arp::synthetic_reply(netif.gateway_mac, netif.gateway_ip, netif.mac, netif.ip);
         let mut dev = DpdkDevice::new(h.queue_id, h.pool, Some(owned), Some(synth));
 
@@ -147,10 +122,6 @@ impl Worker {
         });
         let _ = iface.routes_mut().add_default_ipv4_route(gw);
 
-        // Socket storage and buffers are leaked so their 'static lifetime
-        // satisfies SocketSet's borrow. A worker lives for the life of the
-        // program, so there is nothing to reclaim -- but this is why dropping
-        // one does not give the memory back.
         let slots = ports.len();
         let storage: &'static mut [SocketStorage<'static>] = Box::leak(
             (0..slots)
@@ -167,7 +138,6 @@ impl Worker {
             let tx: &'static mut [u8] =
                 Box::leak(alloc::vec![0u8; cfg.tx_buffer].into_boxed_slice());
             let mut sock = tcp::Socket::new(tcp::SocketBuffer::new(rx), tcp::SocketBuffer::new(tx));
-            // Delayed ACKs cost a round trip per window at these rates.
             sock.set_ack_delay(None);
             handles.push(sockets.add(sock));
         }
@@ -175,7 +145,6 @@ impl Worker {
         let mut conns = Vec::with_capacity(slots);
         conns.resize_with(slots, || None);
 
-        // With the socket buffers, not per dial. See `ConnBufs`.
         let mut bufs = Vec::with_capacity(slots);
         bufs.resize_with(slots, || Some(ConnBufs::new()));
 
@@ -193,6 +162,9 @@ impl Worker {
             peer: cfg.peer.clone(),
             tls_config: tls::client_config(),
             clk,
+            last_poll_ns: 0,
+            last_busy_ns: 0,
+            last_active: false,
         })
     }
 
@@ -200,8 +172,6 @@ impl Worker {
         self.queue_id
     }
 
-    /// Connection slots this worker actually has -- `WorkerConfig::conns`
-    /// unless too few source ports steer here.
     pub fn slots(&self) -> usize {
         self.handles.len()
     }
@@ -214,25 +184,17 @@ impl Worker {
         &self.clk
     }
 
-    /// Open `slot` and queue `req` on it. The request goes out as soon as the
-    /// socket can carry it -- immediately without TLS, after the handshake
-    /// with it.
+    /// Open `slot` and queue `req` on it.
     pub fn connect(&mut self, slot: usize, req: &Request<'_>) -> Result<(), Error> {
         let src_port = *self.ports.get(slot).ok_or(Error::ConnectRejected)?;
         self.connect_on(slot, src_port, req)
     }
 
-    /// Whether this slot is idle and can take a request.
     pub fn is_free(&self, slot: usize) -> bool {
         self.conns.get(slot).map_or(false, |c| c.is_none())
     }
 
-    /// Tear down whatever is on `slot` and make it available again.
-    ///
-    /// Aborts rather than closes: the response is already in hand, so there is
-    /// nothing left to receive, and a RST leaves no TIME_WAIT holding the
-    /// 4-tuple. A slot that had to wait out TIME_WAIT before its next request
-    /// would cap request rate at a few per minute per port.
+    /// Tear down `slot`. Aborts rather than closes, so no TIME_WAIT holds the port.
     pub fn release(&mut self, slot: usize) {
         if let Some(&handle) = self.handles.get(slot) {
             self.sockets.get_mut::<tcp::Socket>(handle).abort();
@@ -244,11 +206,6 @@ impl Worker {
         }
     }
 
-    /// Whether `slot` holds a finished connection the peer hasn't closed --
-    /// reusable for a new request instead of a fresh connect. Only [`Service`]
-    /// calls this; the raw benchmark API (`connect`/`release`) is unaffected.
-    ///
-    /// [`Service`]: crate::service::Service
     pub(crate) fn idle_reusable(&self, slot: usize) -> bool {
         self.conns
             .get(slot)
@@ -256,8 +213,7 @@ impl Worker {
             .map_or(false, |c| c.idle_reusable(&self.sockets))
     }
 
-    /// Reuse the connection already open on `slot` for `req`. Only call when
-    /// [`Worker::idle_reusable`] was just true for this slot.
+    /// Only after [`Worker::idle_reusable`] was just true.
     pub(crate) fn reuse(&mut self, slot: usize, req: &Request<'_>) -> Result<(), Error> {
         let now_ns = self.clk.elapsed_ns();
         match self.conns.get_mut(slot).and_then(|c| c.as_mut()) {
@@ -270,8 +226,7 @@ impl Worker {
         }
     }
 
-    /// Open `slot` on the next port in the rotation. Used when a slot is
-    /// serving a stream of requests rather than one fixed range.
+    /// Open `slot` on the next port in the rotation.
     pub fn connect_next(&mut self, slot: usize, req: &Request<'_>) -> Result<(), Error> {
         if self.rotation.is_empty() {
             return Err(Error::NoPorts);
@@ -286,8 +241,6 @@ impl Worker {
         let dst = (Ipv4Address::from_octets(self.peer.ip), self.peer.port);
         let dial_start_ns = self.clk.elapsed_ns();
 
-        // Before the socket is armed and before the slot gives up its buffers:
-        // the one step that can fail, and the only expensive one left.
         let tls = Conn::session(&self.peer, &self.tls_config)?;
 
         {
@@ -299,7 +252,6 @@ impl Worker {
         }
         crate::stats::request_started(false);
 
-        // A slot re-dialled without a `release` still owns its buffers.
         let bufs = match self.conns[slot].take() {
             Some(old) => old.into_bufs(),
             None => self.bufs[slot].take().unwrap_or_else(ConnBufs::new),
@@ -319,15 +271,15 @@ impl Worker {
         Ok(())
     }
 
-    /// One iteration of the poll loop: advance the interface, then every open
-    /// connection. Returns true when none of them are still in flight.
-    ///
-    /// A worker with no open connections is trivially done, so a caller that
-    /// loops on this must open something first.
+    /// Advance the interface, then every open connection. True when none is in flight.
     pub fn poll(&mut self) -> bool {
-        let now_ms = self.clk.elapsed_ms();
-        self.iface
+        let start_ns = self.clk.elapsed_ns();
+        self.last_poll_ns = start_ns + self.clk.epoch_ns();
+        let now_ms = (start_ns / 1_000_000) as i64;
+        let res = self
+            .iface
             .poll(Instant::from_millis(now_ms), &mut self.dev, &mut self.sockets);
+        self.last_active = matches!(res, PollResult::SocketStateChanged);
 
         let mut all_done = true;
         for slot in self.conns.iter_mut().flatten() {
@@ -335,7 +287,20 @@ impl Worker {
                 all_done = false;
             }
         }
+        self.last_busy_ns = self.clk.elapsed_ns().saturating_sub(start_ns);
         all_done
+    }
+
+    pub fn last_poll_ns(&self) -> u64 {
+        self.last_poll_ns
+    }
+
+    pub fn last_busy_ns(&self) -> u64 {
+        self.last_busy_ns
+    }
+
+    pub fn last_active(&self) -> bool {
+        self.last_active
     }
 
     pub fn conn(&self, slot: usize) -> Option<&Conn> {
@@ -346,7 +311,6 @@ impl Worker {
         self.conns.get_mut(slot).and_then(|c| c.as_mut())
     }
 
-    /// Every connection that was opened, in slot order.
     pub fn conns(&self) -> impl Iterator<Item = &Conn> {
         self.conns.iter().flatten()
     }

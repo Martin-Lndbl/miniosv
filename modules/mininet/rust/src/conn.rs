@@ -1,9 +1,5 @@
 //! One connection: a TCP socket, optionally a TLS session, one request, and
-//! wherever its response body goes.
-//!
-//! Driven by [`Conn::step`], which the owning [`crate::Worker`] calls once per
-//! poll for each of its connections. Nothing here blocks or waits -- a step
-//! moves what it can and returns.
+//! wherever its response body goes. Driven by [`Conn::step`], which never blocks.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -22,14 +18,9 @@ use crate::http::{BodySink, NullSink, ResponseHead, ResponseParser};
 use crate::stats;
 use crate::tls::TLS_BUF_CAP;
 
-/// A SYN now only goes unanswered on genuine loss -- the source port is chosen
-/// so the SYN-ACK provably returns on this queue -- so the timeout is a
-/// backstop rather than a polling interval.
 const SYN_TIMEOUT_NS: u64 = 5_000_000_000;
 
-/// The two record buffers. They belong to the slot, not to the connection on
-/// it: allocating half a megabyte inside every dial cost `conns^2 / 2`, since
-/// smoltcp holds every SYN until the `poll` after the dial loop.
+/// The two record buffers, owned by the slot rather than allocated per dial.
 pub(crate) struct ConnBufs {
     incoming: Vec<u8>,
     outgoing: Vec<u8>,
@@ -48,8 +39,6 @@ impl ConnBufs {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
     Pending,
-    /// The peer closed after the whole response had been requested and the
-    /// receive buffer had been drained.
     Complete,
     Failed(Error),
 }
@@ -62,9 +51,6 @@ pub struct Conn {
     outgoing: Vec<u8>,
     head: Vec<u8>,
     request_queued: bool,
-    /// With TLS, set when the session first reaches `WriteTraffic`. Without
-    /// it there is no handshake to wait on, so it means "the request may go
-    /// out" -- which is what the clean-close check below reads it as.
     handshake_done: bool,
     discard_ciphertext: bool,
     parser: ResponseParser,
@@ -74,15 +60,9 @@ pub struct Conn {
     connect_start_ns: u64,
     queue_id: u16,
     src_port: u16,
-    /// Whether this connection has left SynSent yet -- either established or
-    /// given up.
     settled: bool,
-    /// When the SYN reached the wire: the first `step` after the `iface.poll`
-    /// that flushed it, not when `connect` was called.
     syn_ns: Option<u64>,
-    /// HEAD (and, defensively, 1xx/204/304) responses have no body regardless
-    /// of what Content-Length says -- needed now that completion can't just
-    /// wait for the peer to close.
+    head_ns: Option<u64>,
     is_head: bool,
 }
 
@@ -90,17 +70,13 @@ fn is_head_request(head: &[u8]) -> bool {
     head.starts_with(b"HEAD ")
 }
 
-/// Whether a response with this status ever carries a body, per RFC 7230
-/// 3.3.3. Under keep-alive there is no FIN to fall back on, so this has to be
-/// right rather than assumed.
+/// RFC 7230 3.3.3.
 fn has_body(status: u16, is_head: bool) -> bool {
     !is_head && !matches!(status, 100..=199 | 204 | 304)
 }
 
 impl Conn {
-    /// The costly half of a dial: a fresh rustls session and its key share.
-    /// Split out so the one fallible step runs before the slot gives up its
-    /// buffers. `None` on a plain-HTTP peer.
+    /// A fresh rustls session; `None` on a plain-HTTP peer.
     pub(crate) fn session(
         peer: &Endpoint,
         tls_config: &Arc<ClientConfig>,
@@ -129,7 +105,6 @@ impl Conn {
         bufs: ConnBufs,
         now_ns: u64,
     ) -> Conn {
-        // Meaningless without a record layer to skip.
         let discard_ciphertext = req.discard_ciphertext && tls.is_some();
         Conn {
             handle,
@@ -148,11 +123,15 @@ impl Conn {
             src_port,
             settled: false,
             syn_ns: None,
+            head_ns: None,
             is_head: is_head_request(req.head),
         }
     }
 
-    /// Hand the buffers back, emptied but with their capacity intact.
+    pub(crate) fn head_ns(&self) -> Option<u64> {
+        self.head_ns
+    }
+
     pub(crate) fn into_bufs(mut self) -> ConnBufs {
         self.incoming.clear();
         self.outgoing.clear();
@@ -162,26 +141,14 @@ impl Conn {
         }
     }
 
-    /// Whether this connection finished successfully and the peer hasn't
-    /// closed it -- the socket is still Established, so the next request can
-    /// reuse it instead of paying for a fresh handshake (and, over TLS, a
-    /// fresh key exchange).
+    /// Finished successfully and still Established, so reusable.
     pub(crate) fn idle_reusable(&self, sockets: &SocketSet<'_>) -> bool {
         self.outcome == Some(Step::Complete) && sockets.get::<tcp::Socket>(self.handle).state() == tcp::State::Established
     }
 
-    /// Reuse this connection's socket (and, over TLS, its session) for a new
-    /// request. Only valid when [`Conn::idle_reusable`] was just true; the TCP
-    /// and TLS handshakes are not repeated.
+    /// Reuse the socket and TLS session for a new request. `incoming` is kept:
+    /// it may hold a partial record of the same TLS stream.
     pub(crate) fn reset_for(&mut self, req: &Request<'_>, now_ns: u64) {
-        // `incoming` is deliberately *not* cleared. A reused connection carries
-        // on the same TLS session, so anything still buffered is a partial
-        // record of that stream -- a server-sent ticket, or a record that
-        // straddled the moment the body completed. Dropping it would leave
-        // rustls decrypting from the middle of a record, which fails much
-        // later and nowhere near here. Completion already requires `outgoing`
-        // to be empty, so there is nothing pending to send either; clearing it
-        // would only be able to discard a partly-written record.
         debug_assert!(self.outgoing.is_empty(), "reuse with unsent request bytes");
         self.head = req.head.to_vec();
         self.request_queued = false;
@@ -190,6 +157,7 @@ impl Conn {
         self.sink = Box::new(NullSink);
         self.outcome = None;
         self.connect_start_ns = now_ns;
+        self.head_ns = None;
         self.is_head = is_head_request(&self.head);
     }
 
@@ -197,8 +165,6 @@ impl Conn {
         self.sink = sink;
     }
 
-    /// Bytes the sink stored, which is not the same as [`Conn::body_bytes`]:
-    /// the body may be larger than the sink had room for.
     pub fn sink_written(&self) -> u64 {
         self.sink.written()
     }
@@ -212,9 +178,6 @@ impl Conn {
         self.parser.status()
     }
 
-    /// False before the first bytes arrive, and for the whole transfer when
-    /// the record layer was stubbed out -- there is no plaintext head to
-    /// parse in that case.
     pub fn headers_parsed(&self) -> bool {
         self.parser.headers_done()
     }
@@ -223,8 +186,6 @@ impl Conn {
         self.parser.head()
     }
 
-    /// Response body bytes. Ciphertext, including framing, when the record
-    /// layer was stubbed out.
     pub fn body_bytes(&self) -> u64 {
         self.parser.body_bytes()
     }
@@ -246,8 +207,7 @@ impl Conn {
         step
     }
 
-    /// Move this connection forward once: drain RX, push TX, advance the TLS
-    /// state machine.
+    /// One non-blocking step: drain RX, push TX, advance TLS.
     pub(crate) fn step(&mut self, sockets: &mut SocketSet<'_>, clk: &MonoClock) -> Step {
         if let Some(done) = self.outcome {
             return done;
@@ -256,8 +216,6 @@ impl Conn {
         let s = sockets.get_mut::<tcp::Socket>(self.handle);
         let state = s.state();
 
-        // `Worker::poll` runs `iface.poll` first, so a socket seen in SynSent
-        // has its SYN on the wire: that is when the handshake starts.
         if self.syn_ns.is_none()
             && matches!(state, tcp::State::SynSent | tcp::State::Established)
         {
@@ -265,16 +223,11 @@ impl Conn {
         }
         let since_syn = now_ns.saturating_sub(self.syn_ns.unwrap_or(now_ns));
 
-        // Leaving SynSent for Established means the SYN-ACK came back on the
-        // right queue, one round trip after the SYN left.
         if !self.settled && state == tcp::State::Established {
             self.settled = true;
             stats::conn_established(since_syn);
         }
 
-        // A SYN that goes unanswered now is a real failure -- lost packet or
-        // unreachable peer, not a wrong port hash -- so fail loudly rather
-        // than abandon it silently.
         if state == tcp::State::SynSent
             && now_ns.saturating_sub(self.connect_start_ns) > SYN_TIMEOUT_NS
         {
@@ -304,9 +257,7 @@ impl Conn {
                 }
             }
         }
-        // Drain until the socket is empty, not once: smoltcp hands back the
-        // largest *contiguous* slice of its ring, so a single call leaves the
-        // remainder behind whenever the data has wrapped.
+        // recv() returns one contiguous slice of the ring, so loop.
         while s.can_recv() {
             match s.recv(|buf| {
                 self.incoming.extend_from_slice(buf);
@@ -322,7 +273,6 @@ impl Conn {
             self.incoming.clear();
         }
 
-        // Without a record layer the socket already holds response bytes.
         if self.tls.is_none() && !self.incoming.is_empty() {
             let parsed = self.parser.feed(&self.incoming, self.sink.as_mut());
             self.incoming.clear();
@@ -335,12 +285,11 @@ impl Conn {
         if let Some(step) = self.pump_tls() {
             return self.finish(step);
         }
+        if self.head_ns.is_none() && self.parser.headers_done() {
+            self.head_ns = Some(now_ns);
+        }
 
-        // Keep-alive: the peer does not close after one response, so
-        // completion has to come from the framing rather than a FIN.
-        // `discard_ciphertext` never reaches this -- it bypasses the parser
-        // via count_opaque above -- and falls through to the FIN check below,
-        // same as always: there is no length to compare against ciphertext.
+        // Keep-alive: completion comes from the framing, not a FIN.
         if self.parser.headers_done() && self.outgoing.is_empty() {
             let done = if has_body(self.parser.status(), self.is_head) {
                 self.parser
@@ -355,29 +304,14 @@ impl Conn {
             }
         }
 
-        // Re-read the state: `state` was sampled before this iteration drained
-        // the socket. Requiring the receive buffer to be empty too stops a
-        // connection being called complete while the peer's FIN arrived with
-        // data still buffered. Fallback for anything the length check above
-        // couldn't decide -- a response with no Content-Length, or the
-        // discard_ciphertext path, which has no head to read one from.
+        // FIN fallback for responses the length check could not decide.
         let s = sockets.get_mut::<tcp::Socket>(self.handle);
         let ended = matches!(
             s.state(),
             tcp::State::Closed | tcp::State::CloseWait | tcp::State::TimeWait
         );
         if self.handshake_done && self.request_queued && ended && self.outgoing.is_empty() && !s.can_recv() {
-            // A closed connection only means "the response ended" if a
-            // response actually started. A peer that closes before answering
-            // -- or a connection reset mid-request -- otherwise arrives at the
-            // caller as a *successful* empty response: rc OK, status 0, zero
-            // bytes, and httpfs keeps whatever was already in the buffer it
-            // handed us. Seen on c6in.large at sf=10 as a range read reporting
-            // want=47 got=0 status=0, and the caller reporting
-            // "HTTP Error: Request returned HTTP 0".
-            //
-            // discard_ciphertext is exempt: it bypasses the parser on purpose,
-            // so it has no head to have finished.
+            // Closed before any head arrived is a failure, not an empty body.
             if !self.discard_ciphertext && !self.parser.headers_done() {
                 println!(
                     "FAIL: q{} port {} closed before answering",
@@ -390,8 +324,7 @@ impl Conn {
         Step::Pending
     }
 
-    /// Advance the record layer until it stops making progress. `Some` means
-    /// the session failed and the connection is finished.
+    /// Advance the record layer until it stops making progress; `Some` is failure.
     fn pump_tls(&mut self) -> Option<Step> {
         let mut progress = self.tls.is_some();
         while progress {
