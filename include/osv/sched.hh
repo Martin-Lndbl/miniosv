@@ -90,14 +90,13 @@ namespace bi = boost::intrusive;
 
 // Maximum number of CPUs the kernel supports. Must be a multiple of 64
 const unsigned max_cpus = 256;
-static_assert(max_cpus % 64 == 0);
+static_assert(max_cpus % 64 == 0 && max_cpus != 0);
 
 // A lock-free set of CPU ids (0 .. max_cpus-1), stored as an array of atomic words.
 class cpu_set {
 private:
     static constexpr unsigned bits_per_word = sizeof(unsigned long) * 8;
-    static constexpr unsigned nr_words =
-        (max_cpus + bits_per_word - 1) / bits_per_word;
+    static constexpr unsigned nr_words = max_cpus / bits_per_word;
 public:
     explicit cpu_set() {
         for (auto& w : _words) {
