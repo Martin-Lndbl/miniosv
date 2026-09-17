@@ -1,10 +1,4 @@
-//! rustls configuration.
-//!
-//! `no_std`, and the trust anchors are the compiled-in Mozilla bundle rather
-//! than a file on disk. The crypto provider is ring: it is `#![no_std]` as
-//! well, and its AES-GCM is around six times the pure-Rust provider's -- see
-//! the note in Cargo.toml for the measurement. `--features rustcrypto` goes
-//! back to the pure-Rust one.
+//! rustls configuration: no_std, compiled-in Mozilla roots, ring (`--features rustcrypto` for the pure-Rust provider).
 
 use alloc::sync::Arc;
 
@@ -15,9 +9,7 @@ use rustls::RootCertStore;
 
 use crate::ffi::shim_time_seconds;
 
-/// Certificate validity needs a wall clock, not a monotonic one. OSv's is
-/// whatever the platform handed it at boot; if it is wrong, every handshake
-/// fails as expired rather than silently accepting anything.
+/// Certificate validity needs the wall clock.
 #[derive(Debug)]
 struct ShimTimeProvider;
 
@@ -29,7 +21,6 @@ impl TimeProvider for ShimTimeProvider {
     }
 }
 
-/// The provider the build selected.
 #[cfg(not(feature = "rustcrypto"))]
 fn provider() -> rustls::crypto::CryptoProvider {
     rustls::crypto::ring::default_provider()
@@ -40,8 +31,7 @@ fn provider() -> rustls::crypto::CryptoProvider {
     rustls_rustcrypto::provider()
 }
 
-/// Built once per worker and shared by its connections: assembling the root
-/// store parses the whole bundle, which is not something to do per connection.
+/// Built once per worker: parsing the root bundle is not per-connection work.
 pub(crate) fn client_config() -> Arc<ClientConfig> {
     let mut roots = RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -56,5 +46,4 @@ pub(crate) fn client_config() -> Arc<ClientConfig> {
     Arc::new(cfg)
 }
 
-/// Sized to hold pipelined records without reallocating during a download.
 pub(crate) const TLS_BUF_CAP: usize = 256 * 1024;

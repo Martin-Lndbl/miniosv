@@ -1,23 +1,12 @@
-//! Unit tests for the parts of the stack that are pure logic.
-//!
-//! Driven by `test/os-mininet.cc` (`make app=test`), not by cargo: the crate is
-//! `no_std` and its FFI is the kernel, so there is no host target to run
-//! `cargo test` against. Running in the guest is also the more honest place for
-//! these -- [`BufferSink`] writes through a raw pointer into the guest's real
-//! allocator, which is exactly where a bounds bug would show up and exactly
-//! what a host-side mock would paper over.
-//!
-//! Every check is a pure function of its inputs: no NIC, no DHCP, no socket, so
-//! this runs on an image with no network at all.
+//! Unit tests for the pure-logic parts, driven by test/os-mininet.cc (make app=test):
+//! no_std, no `cargo test` target, and the guest's real allocator is where a bounds bug shows.
 
 use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::http::{BodySink, BufferSink, ContentRange, ParseError, ResponseParser};
 
-/// Accumulates failures so one run reports every broken case rather than the
-/// first. `check` returns its own verdict too, so a test can bail out of a
-/// sequence that would panic if it kept going.
+/// Accumulates failures so one run reports every broken case.
 pub struct Report {
     pub failures: u32,
     pub checks: u32,
@@ -53,10 +42,7 @@ impl Report {
     }
 }
 
-/// A sink over a heap buffer with guard bytes on both sides, so a write that
-/// lands outside the region it was given is *detected* rather than merely
-/// being unlikely to crash. This is the harness the real BufferSink contract
-/// is checked against.
+/// A sink over a heap buffer with guard bytes, so an out-of-bounds write is detected.
 struct Guarded {
     mem: Vec<u8>,
     off: usize,
@@ -73,8 +59,6 @@ impl Guarded {
     }
 
     fn sink(&mut self) -> BufferSink {
-        // SAFETY: the region [off, off+cap) is inside `mem`, which outlives the
-        // sink -- the sink is dropped at the end of the calling test.
         unsafe { BufferSink::new(self.mem.as_mut_ptr().add(self.off), self.cap) }
     }
 
@@ -106,8 +90,6 @@ fn test_buffer_sink(r: &mut Report) {
     }
 
     // One byte too many: the excess is dropped, not written past the end.
-    // This is the contract the whole design rests on -- Conn hands the sink
-    // whatever the peer sent, and the peer is not trusted to respect cap.
     {
         let mut g = Guarded::new(4);
         {
@@ -134,11 +116,7 @@ fn test_buffer_sink(r: &mut Report) {
         r.check(g.intact(), "repeated writes do not touch guard bands");
     }
 
-    // Writes after the sink is already full must be no-ops, not underflows.
-    // `cap - written` is unsigned: if `written` could ever exceed `cap` this
-    // would wrap to a huge "room" and copy without bound. That is precisely
-    // the shape of the fault seen in BufferSink::write at sf=10, so it is
-    // worth an explicit check rather than trusting the arithmetic by eye.
+    // Writes after full must be no-ops: `cap - written` is unsigned.
     {
         let mut g = Guarded::new(3);
         {
@@ -151,8 +129,7 @@ fn test_buffer_sink(r: &mut Report) {
         r.check(g.intact(), "writes past full do not touch guard bands");
     }
 
-    // A zero-capacity sink still has to absorb writes harmlessly: this is the
-    // HEAD path, which passes a null buffer and cap 0.
+    // A zero-capacity sink (the HEAD path) must absorb writes harmlessly.
     {
         let mut g = Guarded::new(0);
         {
@@ -206,9 +183,7 @@ fn test_response_parser(r: &mut Report) {
         r.check(p.head().etag.as_deref() == Some("\"abc\""), "206 etag");
     }
 
-    // The head arriving in pieces, with the CRLFCRLF terminator split across
-    // feeds. hdr_state exists for exactly this and it is the kind of thing
-    // that works on every response until one day it does not.
+    // The CRLFCRLF terminator split across feeds.
     for split in 1..46usize {
         let msg = b"HTTP/1.1 206 Partial\r\nContent-Length: 3\r\n\r\nabc";
         if split >= msg.len() {
@@ -243,8 +218,7 @@ fn test_response_parser(r: &mut Report) {
         r.check(g.intact(), "multi-feed body does not touch guard bands");
     }
 
-    // A peer that sends more body than it promised must not be able to write
-    // past the buffer that was sized from its own Content-Length.
+    // More body than promised must not write past the buffer.
     {
         let mut g = Guarded::new(4);
         let mut s = g.sink();
@@ -320,16 +294,11 @@ fn test_response_parser(r: &mut Report) {
     }
 }
 
-/// The arithmetic `Conn` uses to decide a response is finished. Getting this
-/// wrong either hangs a connection or declares it complete while bytes are
-/// still arriving -- and a connection declared complete early is then reused
-/// with the previous response still in flight.
+/// The arithmetic `Conn` uses to decide a response is finished.
 fn test_completion_rule(r: &mut Report) {
     println!("-- completion rule");
 
-    // A body is complete when body_bytes reaches content_length, and not
-    // before. Modelled here on the parser directly so the rule is checked
-    // without a socket.
+    // Complete when body_bytes reaches content_length, and not before.
     let mut g = Guarded::new(6);
     let mut s = g.sink();
     let mut p = ResponseParser::new();
@@ -341,9 +310,7 @@ fn test_completion_rule(r: &mut Report) {
     r.check(g.intact(), "completion path does not touch guard bands");
 }
 
-/// A connection that ends without a response is a failure, not an empty
-/// success. Checked on the parser, which is what `Conn` consults: if no head
-/// was ever parsed there is nothing to call complete.
+/// A connection that ends without a response is a failure, not an empty success.
 fn test_close_without_response(r: &mut Report) {
     println!("-- close without a response");
 
@@ -358,8 +325,7 @@ fn test_close_without_response(r: &mut Report) {
         r.check(!p.headers_done(), "an empty feed still has no head");
     }
 
-    // A head that was cut off mid-way is not a head either: the peer closing
-    // here must not be read as a complete response.
+    // A head cut off mid-way is not a head.
     {
         let mut sink = crate::http::NullSink;
         let mut p = ResponseParser::new();
@@ -369,8 +335,7 @@ fn test_close_without_response(r: &mut Report) {
         r.eq_u64(p.status() as u64, 0, "a partial head has no status yet");
     }
 
-    // The completing case, for contrast: a 204 has no body but does have a
-    // head, so a close after it is a real completion.
+    // A 204 has a head, so a close after it is a real completion.
     {
         let mut sink = crate::http::NullSink;
         let mut p = ResponseParser::new();

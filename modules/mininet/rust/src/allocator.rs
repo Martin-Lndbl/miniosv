@@ -1,6 +1,4 @@
-//! Rust's global allocator, routed to OSv's C `malloc` through the shim.
-//! rustls, rustcrypto, webpki and every `Arc<T>` here need a heap, and there is
-//! no `std` to supply one.
+//! Rust's global allocator over OSv's `malloc`, through the shim.
 
 use core::alloc::{GlobalAlloc, Layout};
 
@@ -8,9 +6,7 @@ use crate::ffi::{shim_free, shim_malloc, shim_realloc};
 
 struct ShimAllocator;
 
-/// `malloc` gives 16-byte alignment. A caller that wants more gets an
-/// over-sized block with the raw pointer stashed in the word just before the
-/// aligned slot, so `dealloc` can recover what to free.
+/// Over-aligned requests stash the raw pointer just before the aligned slot.
 unsafe impl GlobalAlloc for ShimAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if layout.align() <= 16 {

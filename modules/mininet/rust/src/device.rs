@@ -1,8 +1,4 @@
-//! A smoltcp `Device` over one minidpdk queue.
-//!
-//! TX writes straight into the mbuf's data area; RX carries the mbuf pointer
-//! through the token and frees it on consume or drop. Nothing is copied on
-//! either path.
+//! A smoltcp `Device` over one minidpdk queue. Nothing is copied on either path.
 
 use alloc::vec::Vec;
 use core::ffi::c_void;
@@ -17,23 +13,16 @@ use crate::stats;
 
 pub(crate) const MTU: usize = 1514;
 
-/// `rte_eth_rx_burst` is cheap in bulk and expensive per call, so RX drains up
-/// to this many mbufs at once and hands them to smoltcp one at a time.
+/// RX drains up to this many mbufs per burst.
 pub(crate) const RX_BURST: usize = 32;
 
 pub(crate) struct DpdkDevice {
     pub(crate) queue_id: u16,
     pub(crate) pool: *mut rte_pktmbuf_pool,
-    /// One fabricated frame to return on the next poll, seeding the neighbour
-    /// cache with the gateway's MAC without an ARP exchange RSS would misroute.
+    /// One fabricated frame, seeding the neighbour cache with the gateway's MAC.
     pub(crate) pending_synth: Option<Vec<u8>>,
-    /// Which destination ports this queue owns, i.e. those whose return
-    /// traffic RSS steers here. `None` accepts everything, which is what the
-    /// DHCP and ARP phase on queue 0 needs.
-    ///
-    /// Since source ports are chosen so ownership always holds, a packet
-    /// failing the test means the prediction was wrong -- so it is counted,
-    /// not merely dropped.
+    /// Ports this queue owns; `None` accepts everything (the DHCP/ARP phase on queue 0).
+    /// A TCP frame for a port not owned is a prediction failure and is counted.
     pub(crate) owned_ports: Option<OwnedPorts>,
     rx_pref_handles: [*mut c_void; RX_BURST],
     rx_pref_data: [*const u8; RX_BURST],
@@ -62,16 +51,13 @@ impl DpdkDevice {
         }
     }
 
-    /// True if the frame should be passed up. Anything that is not TCP/IPv4 is
-    /// not ours to filter; a TCP frame for a port this queue does not own is a
-    /// prediction failure and is counted as one.
+    /// True if the frame should be passed up.
     fn accepts(&self, bytes: &[u8]) -> bool {
         let owned = match &self.owned_ports {
             Some(o) => o,
             None => return true,
         };
-        // Ethernet(14) + IPv4(20 min) + TCP(20 min) = 54; anything shorter
-        // cannot be a TCP flow we care about.
+        // Ethernet(14) + IPv4(20) + TCP(20) = 54.
         if bytes.len() < 54 {
             return true;
         }
@@ -135,9 +121,7 @@ impl TxToken for DpdkTxToken<'_> {
         let mut cap: u16 = 0;
         let data = unsafe { shim_mbuf_alloc_tx(self.dev.pool, self.dev.queue_id, &mut handle, &mut cap) };
         if data.is_null() || handle.is_null() {
-            // Pool exhausted. smoltcp still wants `f` called, so the frame is
-            // discarded -- but count it: dropping a SYN silently here looks
-            // exactly like the peer never answering.
+            // Pool exhausted: smoltcp still wants `f` called; count the discarded frame.
             stats::tx_alloc_fail();
             let mut scratch = [0u8; MTU];
             let n = core::cmp::min(len, scratch.len());

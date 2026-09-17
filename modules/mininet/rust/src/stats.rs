@@ -25,6 +25,8 @@ static POLL_GAPS_OVER_1MS: AtomicU64 = AtomicU64::new(0);
 static POLL_BUSY_NS: AtomicU64 = AtomicU64::new(0);
 static POLL_ACTIVE_ITERS: AtomicU64 = AtomicU64::new(0);
 static POLL_WORK_NS: AtomicU64 = AtomicU64::new(0);
+static POLL_BUSY_NS_MAX: AtomicU64 = AtomicU64::new(0);
+static POLL_LOOP_NS_MAX: AtomicU64 = AtomicU64::new(0);
 static WAKE_N: AtomicU64 = AtomicU64::new(0);
 static WAKE_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static WAKE_NS_MAX: AtomicU64 = AtomicU64::new(0);
@@ -137,6 +139,9 @@ pub struct Stats {
     pub poll_busy_ns: u64,
     pub poll_active_iters: u64,
     pub poll_work_ns: u64,
+    /// Longest single poll, and longest stretch outside poll between two polls.
+    pub poll_busy_ns_max: u64,
+    pub poll_loop_ns_max: u64,
     /// Publish -> submitter running again.
     pub wake_n: u64,
     pub wake_ns_total: u64,
@@ -172,6 +177,8 @@ pub fn snapshot() -> Stats {
         poll_busy_ns: POLL_BUSY_NS.load(Ordering::Relaxed),
         poll_active_iters: POLL_ACTIVE_ITERS.load(Ordering::Relaxed),
         poll_work_ns: POLL_WORK_NS.load(Ordering::Relaxed),
+        poll_busy_ns_max: POLL_BUSY_NS_MAX.load(Ordering::Relaxed),
+        poll_loop_ns_max: POLL_LOOP_NS_MAX.load(Ordering::Relaxed),
         wake_n: WAKE_N.load(Ordering::Relaxed),
         wake_ns_total: WAKE_NS_TOTAL.load(Ordering::Relaxed),
         wake_ns_max: WAKE_NS_MAX.load(Ordering::Relaxed),
@@ -213,6 +220,8 @@ pub(crate) struct PollAcc {
     pub busy_ns: u64,
     pub active_iters: u64,
     pub work_ns: u64,
+    pub busy_ns_max: u64,
+    pub loop_ns_max: u64,
 }
 
 impl PollAcc {
@@ -224,6 +233,8 @@ impl PollAcc {
             self.gaps_over_1ms += 1;
         }
         self.busy_ns += busy_ns;
+        self.busy_ns_max = self.busy_ns_max.max(busy_ns);
+        self.loop_ns_max = self.loop_ns_max.max(gap_ns.saturating_sub(busy_ns));
         if active {
             self.active_iters += 1;
             self.work_ns += busy_ns;
@@ -241,6 +252,8 @@ impl PollAcc {
         POLL_BUSY_NS.fetch_add(self.busy_ns, Ordering::Relaxed);
         POLL_ACTIVE_ITERS.fetch_add(self.active_iters, Ordering::Relaxed);
         POLL_WORK_NS.fetch_add(self.work_ns, Ordering::Relaxed);
+        POLL_BUSY_NS_MAX.fetch_max(self.busy_ns_max, Ordering::Relaxed);
+        POLL_LOOP_NS_MAX.fetch_max(self.loop_ns_max, Ordering::Relaxed);
         *self = Self::default();
     }
 }

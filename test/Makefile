@@ -17,8 +17,7 @@
 #   - os-stress    : concurrency / allocator / TLS stress tests
 #   - os-miniext   : miniext filesystem checks, only when conf_fs_miniext=1
 #                    (needs --emulated-nvme at run time; skips without)
-#   - os-mininet   : network stack unit tests. Needs no NIC: the parser, the
-#                    body sink and the ABI, not a transfer.
+#   - os-mininet   : network stack unit tests, no NIC needed.
 
 app-objects =  test/osv_tests.o
 app-objects += test/os-features.o
@@ -29,8 +28,6 @@ app-objects += test/os-memory.o
 app-objects += test/os-memory-primitives.o
 app-objects += test/os-stress.o
 
-# The stack is linked as a library so the suite reaches it through mininet.hh
-# and the raw ABI, the same way any C++ caller does.
 include modules/mininet/mininet.mk
 app-objects += test/os-mininet.o
 app-objects += $(mininet-lib-objects)

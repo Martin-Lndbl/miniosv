@@ -12,8 +12,7 @@ use crate::ffi::{
 };
 use crate::print::BufWriter;
 
-/// Owns one queue's mempool. Freed when the [`crate::Stack`] holding it drops,
-/// which is after every worker using it has gone.
+/// Owns one queue's mempool; freed with the [`crate::Stack`].
 pub(crate) struct PktPool(*mut rte_pktmbuf_pool);
 
 impl PktPool {
@@ -30,10 +29,7 @@ impl Drop for PktPool {
     }
 }
 
-/// ENA VFs cap io-queue count per instance size, and `rx_queue_setup` for a
-/// queue id past the maximum is a hard reject -- so the clamp has to happen
-/// before anything is configured. A device that reports nothing is taken at
-/// its word rather than second-guessed.
+/// ENA caps io-queue count per instance size and rejects a queue past it.
 pub(crate) fn clamp_queues(requested: u16) -> u16 {
     let mut max_rx: u16 = 0;
     let mut max_tx: u16 = 0;
@@ -46,26 +42,13 @@ pub(crate) fn clamp_queues(requested: u16) -> u16 {
     }
 }
 
-/// Configure and start port 0 with `n_queues` RX+TX queues, RSS-hashing the
-/// TCP/IPv4 4-tuple when there is more than one.
-///
-/// Per-queue mempools eliminate cross-worker contention on the pool spinlock,
-/// which choked throughput badly at 8 queues and made it unstable at 4 under
-/// the shared-pool design.
+/// Configure and start port 0 with `n_queues` RX+TX queues and per-queue mempools.
 pub(crate) fn probe_and_open(n_queues: u16) -> Result<(Vec<PktPool>, [u8; 6]), Error> {
     const DATA_ROOM_SIZE: u16 = 1536;
-    // 1024 descriptors could not absorb the inbound burst while a worker
-    // walked 48 connection state machines between polls: the NIC dropped 3.3%
-    // of all inbound frames for want of a free descriptor (imissed), which is
-    // invisible above the driver and looked like unanswered SYNs.
+    // 1024 descriptors dropped 3.3% of inbound frames (imissed) between polls.
     const DESC_NUM: u16 = 4096;
     const CACHE: u32 = 64;
-    // Size for every simultaneous holder rather than the RX ring plus a
-    // guess: the RX ring pins DESC_NUM-1, the TX ring holds up to DESC_NUM
-    // more awaiting reclaim, the per-core cache holds CACHE, and the RX
-    // prefetch holds RX_BURST. At DESC_NUM*2 the pool fell ~100 mbufs short
-    // of that worst case, and exhaustion silently discarded frames -- a
-    // dropped SYN is then indistinguishable from an unanswered one.
+    // Every simultaneous holder: RX ring, TX ring awaiting reclaim, cache, RX burst.
     let per_queue_size: u32 = (DESC_NUM as u32) * 2 + CACHE + RX_BURST as u32 + 512;
 
     let mut pools: Vec<PktPool> = Vec::with_capacity(n_queues as usize);
@@ -86,8 +69,7 @@ pub(crate) fn probe_and_open(n_queues: u16) -> Result<(Vec<PktPool>, [u8; 6]), E
     }
     let (mut rx_desc, mut tx_desc) = (DESC_NUM, DESC_NUM);
     unsafe { shim_adjust_nb_rx_tx_desc(PORT, &mut rx_desc, &mut tx_desc) };
-    // The device clamps to what it supports, so report what was actually
-    // granted rather than what was asked for.
+    // What was granted, not what was asked.
     if rx_desc != DESC_NUM || tx_desc != DESC_NUM {
         println!(
             "descriptors: asked {}, got rx {} tx {} (device clamp)",
@@ -120,10 +102,7 @@ pub(crate) fn dev_stop() {
     unsafe { shim_dev_stop(PORT) };
 }
 
-/// Device counters. `imissed` is the one that matters for an unanswered SYN: a
-/// SYN-ACK the device dropped for want of a descriptor never reaches any queue,
-/// so from inside the stack it is indistinguishable from a peer that never
-/// replied. Without this the cause cannot be attributed at all.
+/// Device counters. A SYN-ACK dropped for want of a descriptor (imissed) is invisible above.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NicStats {
     pub ipackets: u64,
@@ -153,8 +132,7 @@ pub fn eth_stats() -> Option<NicStats> {
     })
 }
 
-/// Per-queue inbound packet and error counts, truncated to `out.len()` queues.
-/// Returns how many the device reported.
+/// Per-queue inbound packet and error counts; returns how many the device reported.
 pub fn eth_qstats(ipkts: &mut [u64], errs: &mut [u64]) -> usize {
     let n = core::cmp::min(ipkts.len(), errs.len());
     let rc = unsafe { shim_eth_qstats(PORT, ipkts.as_mut_ptr(), errs.as_mut_ptr(), n as u16) };

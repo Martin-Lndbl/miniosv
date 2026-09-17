@@ -1,14 +1,8 @@
-//! The C ABI `modules/mininet/shim/shim.cc` exports.
-//!
-//! Every minidpdk struct is built and read inside the shim; only integers and
-//! opaque pointers cross here. Keep this in sync with `shim/shim.hh` -- there
-//! is no header generation, and a signature that drifts is a silent
-//! miscompile rather than a link error, since the shim is C.
+//! The C ABI shim/shim.cc exports; kept in sync with shim.hh by hand.
 
 use core::ffi::{c_int, c_void};
 
-/// Opaque mempool handle. One per queue: a shared pool serialises workers on
-/// its spinlock, which cost most of the throughput at 8 queues.
+/// Opaque mempool handle, one per queue.
 #[repr(C)]
 pub struct rte_pktmbuf_pool {
     _private: [u8; 0],
@@ -72,7 +66,6 @@ extern "C" {
     pub fn shim_thread_spawn(f: extern "C" fn(*mut c_void), arg: *mut c_void, cpu_id: c_int) -> *mut c_void;
     pub fn shim_thread_join(handle: *mut c_void);
     pub fn shim_thread_current() -> *mut c_void;
-    /// Blocks until `*flag` is nonzero. See shim.hh for why this is not a spin.
     pub fn shim_thread_park(flag: *const u32);
     pub fn shim_thread_unpark(handle: *mut c_void);
 }

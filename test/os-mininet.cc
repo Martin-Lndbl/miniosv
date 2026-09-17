@@ -1,20 +1,6 @@
 /*
- * mininet network-stack tests.
- *
- * Two halves, both runnable on an image with no NIC:
- *
- *   - the Rust stack's own unit tests (parser, body sink, completion rule),
- *     reached through mininet_selftest(). They live next to the code they
- *     check because that code is Rust and `pub(crate)`; this suite is the
- *     driver and the reporting.
- *   - the C++ surface: the ABI structs mininet.hh and capi.rs both describe,
- *     and the argument validation mininet_get() is supposed to do before it
- *     touches any of them.
- *
- * The point of running in the guest rather than on a host is the allocator.
- * The bug this suite was written for is a write through a raw pointer landing
- * outside its allocation (a page fault inside BufferSink::write at sf=10), and
- * a host-side mock heap is exactly what would hide it.
+ * mininet tests, runnable with no NIC: the Rust stack's own unit tests through
+ * mininet_selftest(), then the C++ ABI surface and mininet_get()'s argument checks.
  */
 
 #include <cstdint>
@@ -26,8 +12,6 @@
 extern "C" {
 // The Rust side's unit tests: returns how many checks failed.
 uint32_t mininet_selftest(int verbose);
-// Declared here rather than in mininet.hh because they are the raw ABI, which
-// the header deliberately does not expose.
 int mininet_get(const char *head, uint64_t head_len, void *buf, uint64_t cap, void *out);
 int mininet_is_up(void);
 const char *mininet_strerror(int rc);
@@ -45,9 +29,7 @@ void check(bool ok, const char *what)
 	}
 }
 
-// mininet_get() must reject bad arguments before dereferencing anything, and
-// must say "not up" ahead of everything else -- these run on an image with no
-// NIC, so the stack is never up and that is the expected answer.
+// Argument checks come before any dereference, and "not up" before everything.
 void test_get_argument_validation()
 {
 	printf("-- mininet_get argument validation\n");
@@ -57,8 +39,6 @@ void test_get_argument_validation()
 	char buf[16];
 	mininet::response r {};
 
-	// Not up is checked first, so even a null head reports E_NOT_UP rather
-	// than crashing on the pointer.
 	check(mininet_get(nullptr, 0, buf, sizeof(buf), &r) == mininet::E_NOT_UP,
 	      "null head on a down stack reports not-up, does not fault");
 	check(mininet_get("GET / HTTP/1.1\r\n\r\n", 18, nullptr, 0, &r) == mininet::E_NOT_UP,
@@ -67,9 +47,7 @@ void test_get_argument_validation()
 	      "null buffer with nonzero cap on a down stack reports not-up");
 }
 
-// Every error code has to map to a distinct, non-empty string: strerror() is
-// how a failure reaches the benchmark CSV, and two codes sharing "unknown
-// error" would make two different bugs look like one.
+// Every error code maps to a distinct, non-empty string.
 void test_strerror()
 {
 	printf("-- strerror\n");
@@ -98,10 +76,7 @@ void test_strerror()
 	      "an unknown code is reported as unknown");
 }
 
-// The response struct crosses the FFI by value, so its layout has to match
-// capi.rs. The kernel already static_asserts sizeof and two offsets; this
-// checks the thing those asserts cannot -- that the fixed char arrays are
-// NUL-terminated and sized as the header promises.
+// The fixed char arrays must be NUL-terminated and sized as the header promises.
 void test_response_abi()
 {
 	printf("-- response ABI\n");
@@ -112,8 +87,6 @@ void test_response_abi()
 	check(sizeof(mininet::response {}.last_modified) == mininet::DATE_MAX,
 	      "last_modified is DATE_MAX bytes");
 
-	// A zero-initialised response must read as "no header", not as garbage:
-	// ToResponse() in the httpfs client tests etag[0] for exactly this.
 	mininet::response r {};
 	check(r.etag[0] == '\0', "a zeroed response has an empty etag");
 	check(r.last_modified[0] == '\0', "a zeroed response has an empty last_modified");
@@ -121,9 +94,7 @@ void test_response_abi()
 	      "a zeroed response has no status, bytes or range");
 }
 
-// conn_stats is read once per run and printed straight into the benchmark's
-// output, so a field that silently reads as garbage would become a number in
-// a results table. Without a stack up, every counter must be a clean zero.
+// Without a stack up every counter must be a clean zero.
 void test_stats_zeroed()
 {
 	printf("-- conn_stats\n");
@@ -131,7 +102,6 @@ void test_stats_zeroed()
 	mininet::conn_stats c = mininet::stats();
 	check(c.requests_served == 0, "no requests served before the stack is up");
 	check(c.requests_reused == 0, "no requests reused before the stack is up");
-	// reused can never exceed served, at any point in a run.
 	check(c.requests_reused <= c.requests_served, "reused never exceeds served");
 }
 
@@ -142,8 +112,6 @@ int os_mininet_main()
 	printf("---- mininet network stack ----\n");
 	failures = 0;
 
-	// The Rust unit tests first: if the parser or the body sink is broken,
-	// everything above them is untrustworthy anyway.
 	uint32_t rust_failures = mininet_selftest(0);
 
 	test_get_argument_validation();

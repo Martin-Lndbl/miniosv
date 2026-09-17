@@ -5,10 +5,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::ffi::write;
 
-/// Formats into a fixed buffer so a line reaches the console in exactly one
-/// write. `write_fmt` calls `write_str` once per format fragment, so writing
-/// straight through let concurrent workers interleave *within* a line and
-/// produced output like "q2: 2048 of 16384 ... using q245".
+/// Formats into a fixed buffer so a line reaches the console in one write.
 pub struct BufWriter<'a> {
     buf: &'a mut [u8],
     used: usize,
@@ -21,8 +18,6 @@ impl<'a> BufWriter<'a> {
         Self { buf, used: 0 }
     }
 
-    /// Bytes written so far. Also how a caller renders into a buffer without
-    /// printing -- request heads are built this way.
     pub fn used(&self) -> usize {
         self.used
     }
@@ -37,9 +32,7 @@ impl Write for BufWriter<'_> {
     }
 }
 
-/// Guards the console so two workers cannot interleave their lines. Printing
-/// happens at startup and teardown only, so spinning here costs nothing on the
-/// data path.
+/// Serialises console writers; printing happens off the data path.
 static PRINT_LOCK: AtomicBool = AtomicBool::new(false);
 
 pub fn print_line(args: fmt::Arguments) {
@@ -72,9 +65,7 @@ pub fn print_line(args: fmt::Arguments) {
     PRINT_LOCK.store(false, Ordering::Release);
 }
 
-/// `println!` without `std`. Exported so callers of the library get the same
-/// line-atomic console the stack itself prints to; two console writers with
-/// different locks would interleave again.
+/// `println!` without `std`, on the same lock as the stack's own output.
 #[macro_export]
 macro_rules! println {
     () => { $crate::print::print_line(format_args!("")) };

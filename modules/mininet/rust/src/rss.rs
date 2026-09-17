@@ -1,20 +1,7 @@
-//! The RSS steering model.
-//!
-//! The RX queue a flow lands on is a pure function of its 4-tuple:
-//!
-//! ```text
-//! queue = reta[ toeplitz(key, src_ip || dst_ip || sport || dport) & (len - 1) ]
-//! ```
-//!
-//! The key and table are read from the device at startup rather than assumed.
-//! This exact form was validated against 200k live packets (100% agreement,
-//! against 48-50% for every other key orientation and tuple order tried), and
-//! the Toeplitz implementation against the canonical Microsoft RSS vectors.
-//!
-//! Because we choose our own source port, the function can be inverted: pick
-//! ports whose return traffic provably lands on the queue we are polling. That
-//! is what lets a worker own a queue outright, with no shared state and no
-//! cross-queue delivery.
+//! The RSS steering model: queue = reta[toeplitz(key, 4-tuple) & (len-1)],
+//! key and table read off the device; validated against 200k live packets.
+//! Because we choose the source port it inverts: pick ports whose return
+//! traffic lands on the queue we poll, so a worker owns its queue outright.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -29,20 +16,14 @@ const OWNED_BITMAP_BYTES: usize = EPH_LEN / 8;
 const MAX_KEY: usize = 64;
 const MAX_RETA: usize = 512;
 
-/// The device's steering configuration, copied out once at startup.
-///
-/// A value rather than a global: it is read on every inbound packet by every
-/// worker, and a `Copy` of ~1 KiB per worker buys freedom from shared mutable
-/// state that the hot path would otherwise have to reason about.
+/// The device's steering configuration, copied out once; ~1 KiB per worker.
 #[derive(Clone, Copy)]
 pub(crate) struct Rss {
     key: [u8; MAX_KEY],
     key_len: usize,
     reta: [u16; MAX_RETA],
     reta_len: usize,
-    /// One queue receives everything, so there is nothing to predict. The PMD
-    /// does not configure RSS for a single queue, so the key and table would
-    /// be unreadable anyway.
+    /// One queue receives everything; the PMD configures no RSS for it.
     single_queue: bool,
 }
 
@@ -94,8 +75,7 @@ impl Rss {
         Ok(rss)
     }
 
-    /// Predicted RX queue for a 12-byte tuple in wire order. `u16::MAX` if the
-    /// configuration could not be read.
+    /// Predicted RX queue for a 12-byte tuple in wire order; `u16::MAX` if unreadable.
     fn predict(&self, tuple: &[u8; 12]) -> u16 {
         if self.single_queue {
             return 0;
@@ -107,9 +87,7 @@ impl Rss {
         self.reta[h & (self.reta_len - 1)]
     }
 
-    /// Which RX queue an inbound packet for `local_port` would be steered to.
-    /// The peer is the source and we are the destination: the direction the
-    /// NIC hashes.
+    /// RX queue for an inbound packet to `local_port`; the peer is the source.
     fn queue_for_local_port(&self, peer_ip: [u8; 4], peer_port: u16, our_ip: [u8; 4], local_port: u16) -> u16 {
         let mut tuple = [0u8; 12];
         tuple[0..4].copy_from_slice(&peer_ip);
@@ -119,11 +97,7 @@ impl Rss {
         self.predict(&tuple)
     }
 
-    /// Every ephemeral source port whose return traffic from `peer` lands on
-    /// `queue_id`, as a bitmap over the ephemeral range.
-    ///
-    /// The set depends on the peer's address, so it is per-endpoint, not
-    /// per-worker: two buckets in different regions do not share a partition.
+    /// Ephemeral source ports whose return traffic from `peer` lands on `queue_id`.
     pub(crate) fn owned_ports(
         &self,
         peer_ip: [u8; 4],
@@ -144,8 +118,7 @@ impl Rss {
     }
 }
 
-/// The ephemeral ports one worker may use, as a bitmap the RX filter can test
-/// in constant time.
+/// One worker's ephemeral ports, as a bitmap.
 pub(crate) struct OwnedPorts {
     bitmap: Vec<u8>,
     count: u32,
@@ -168,10 +141,7 @@ impl OwnedPorts {
         }
     }
 
-    /// Up to `want` ports, spread across the range rather than taken
-    /// consecutively. Adjacent ports are no more likely to collide, but
-    /// spreading keeps the choice independent of any local structure in the
-    /// hash.
+    /// Up to `want` ports, spread across the range.
     pub(crate) fn spread(&self, want: usize) -> Vec<u16> {
         let mut out = Vec::with_capacity(want);
         if want == 0 {

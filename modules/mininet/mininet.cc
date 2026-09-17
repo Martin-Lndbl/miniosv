@@ -49,6 +49,8 @@ struct mininet_conn_stats_abi {
     uint64_t poll_busy_ns;
     uint64_t poll_active_iters;
     uint64_t poll_work_ns;
+    uint64_t poll_busy_ns_max;
+    uint64_t poll_loop_ns_max;
     uint64_t wake_n;
     uint64_t wake_ns_total;
     uint64_t wake_ns_max;
