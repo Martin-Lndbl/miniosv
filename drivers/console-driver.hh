@@ -25,8 +25,6 @@ public:
     virtual void write(const char *str, size_t len) = 0;
     virtual void flush() = 0;
     virtual int read_char() { return -1; }
-    //! Whether a byte is waiting, without consuming it. select()/poll() need
-    //! to answer "is input ready" without taking the byte away from read().
     virtual bool input_available() { return false; }
     void start();
 private:
