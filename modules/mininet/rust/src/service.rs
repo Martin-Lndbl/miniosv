@@ -217,6 +217,7 @@ impl Service {
             return Err(Error::NoDevice);
         }
         let t0 = unsafe { shim_time_ns() };
+        stats::get_started(t0);
         let slot = Slot {
             head: head.as_ptr(),
             head_len: head.len(),
@@ -242,6 +243,7 @@ impl Service {
         stats::get_finished(
             t1.saturating_sub(t0),
             t1.saturating_sub(slot.published_ns.load(Ordering::Relaxed)),
+            t1,
         );
 
         unsafe { (*slot.outcome.get()).take() }.unwrap_or(Err(Error::BadResponse))
