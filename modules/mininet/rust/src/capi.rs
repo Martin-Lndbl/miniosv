@@ -268,92 +268,9 @@ pub extern "C" fn mininet_get(
     }
 }
 
-#[repr(C)]
-pub struct mininet_conn_stats {
-    pub requests_served: u64,
-    pub requests_reused: u64,
-    pub requests_retried: u64,
-    pub requests_done: u64,
-    pub queue_ns_total: u64,
-    pub wire_ns_total: u64,
-    pub body_bytes: u64,
-    pub ttfb_ns_total: u64,
-    pub ttfb_n: u64,
-    pub xfer_ns_total: u64,
-    pub xfer_n: u64,
-    pub poll_iters: u64,
-    pub poll_gap_ns_total: u64,
-    pub poll_gap_ns_max: u64,
-    pub poll_gaps_over_1ms: u64,
-    pub poll_busy_ns: u64,
-    pub poll_active_iters: u64,
-    pub poll_work_ns: u64,
-    pub poll_busy_ns_max: u64,
-    pub poll_loop_ns_max: u64,
-    pub wake_n: u64,
-    pub wake_ns_total: u64,
-    pub wake_ns_max: u64,
-    pub get_calls: u64,
-    pub get_ns_total: u64,
-    pub conns_established: u64,
-    pub conns_failed: u64,
-    pub setup_us_avg: u64,
-    pub setup_us_max: u64,
-    pub dial_us_avg: u64,
-    pub misrouted_drops: u64,
-    pub tx_alloc_fail: u64,
-    pub tx_burst_fail: u64,
-    pub nic_ipackets: u64,
-    pub nic_ibytes: u64,
-    pub nic_imissed: u64,
-    pub nic_ierrors: u64,
-    pub nic_rx_nombuf: u64,
-}
-
 #[unsafe(no_mangle)]
-pub extern "C" fn mininet_conn_stats() -> mininet_conn_stats {
-    let s = crate::stats::snapshot();
-    let nic = crate::nic::eth_stats().unwrap_or_default();
-    mininet_conn_stats {
-        requests_served: s.requests_served,
-        requests_reused: s.requests_reused,
-        requests_retried: s.requests_retried,
-        requests_done: s.requests_done,
-        queue_ns_total: s.queue_ns_total,
-        wire_ns_total: s.wire_ns_total,
-        body_bytes: s.body_bytes,
-        ttfb_ns_total: s.ttfb_ns_total,
-        ttfb_n: s.ttfb_n,
-        xfer_ns_total: s.xfer_ns_total,
-        xfer_n: s.xfer_n,
-        poll_iters: s.poll_iters,
-        poll_gap_ns_total: s.poll_gap_ns_total,
-        poll_gap_ns_max: s.poll_gap_ns_max,
-        poll_gaps_over_1ms: s.poll_gaps_over_1ms,
-        poll_busy_ns: s.poll_busy_ns,
-        poll_active_iters: s.poll_active_iters,
-        poll_work_ns: s.poll_work_ns,
-        poll_busy_ns_max: s.poll_busy_ns_max,
-        poll_loop_ns_max: s.poll_loop_ns_max,
-        wake_n: s.wake_n,
-        wake_ns_total: s.wake_ns_total,
-        wake_ns_max: s.wake_ns_max,
-        get_calls: s.get_calls,
-        get_ns_total: s.get_ns_total,
-        conns_established: s.conns_established,
-        conns_failed: s.conns_failed,
-        setup_us_avg: s.setup.us_avg,
-        setup_us_max: s.setup.us_max,
-        dial_us_avg: s.dial.us_avg,
-        misrouted_drops: s.misrouted_drops,
-        tx_alloc_fail: s.tx_alloc_fail,
-        tx_burst_fail: s.tx_burst_fail,
-        nic_ipackets: nic.ipackets,
-        nic_ibytes: nic.ibytes,
-        nic_imissed: nic.imissed,
-        nic_ierrors: nic.ierrors,
-        nic_rx_nombuf: nic.rx_nombuf,
-    }
+pub extern "C" fn mininet_conn_stats() -> crate::stats::Stats {
+    crate::stats::snapshot()
 }
 
 /// Run the stack's pure-logic unit tests and return how many checks failed.

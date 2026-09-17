@@ -1002,6 +1002,7 @@ struct cpu : private timer_base::client {
     std::atomic<bool> idle_poll = { false };
     // if true, a pinned thread owns this cpu and unpinned ones keep off it
     std::atomic<bool> reserved = { false };
+    std::atomic<uint64_t> tlb_ipis = { 0 };
     // for each cpu, a list of threads that are migrating into this cpu:
     typedef lockless_queue<thread, &thread::_wakeup_link> incoming_wakeup_queue;
     cpu_set incoming_wakeups_mask;

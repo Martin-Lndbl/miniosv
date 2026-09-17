@@ -345,6 +345,12 @@ fn test_close_without_response(r: &mut Report) {
     }
 }
 
+fn test_queue(r: &mut Report) {
+    let (got, dups, total) = crate::service::queue_selftest();
+    r.eq_u64(got, total, "lock-free queue delivers every push");
+    r.eq_u64(dups, 0, "lock-free queue delivers each push once");
+}
+
 /// Runs every check. Returns the number that failed.
 pub fn run(verbose: bool) -> u32 {
     let mut r = Report::new(verbose);
@@ -352,6 +358,7 @@ pub fn run(verbose: bool) -> u32 {
     test_response_parser(&mut r);
     test_completion_rule(&mut r);
     test_close_without_response(&mut r);
+    test_queue(&mut r);
     println!(
         "mininet selftest: {} checks, {} failed",
         r.checks, r.failures

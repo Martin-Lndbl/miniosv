@@ -11,7 +11,6 @@ use rustls::unbuffered::{ConnectionState, UnbufferedStatus};
 use smoltcp::iface::{SocketHandle, SocketSet};
 use smoltcp::socket::tcp;
 
-use crate::clock::MonoClock;
 use crate::endpoint::{Endpoint, Request};
 use crate::error::Error;
 use crate::http::{BodySink, NullSink, ResponseHead, ResponseParser};
@@ -24,6 +23,7 @@ const SYN_TIMEOUT_NS: u64 = 5_000_000_000;
 pub(crate) struct ConnBufs {
     incoming: Vec<u8>,
     outgoing: Vec<u8>,
+    head: Vec<u8>,
 }
 
 impl ConnBufs {
@@ -31,6 +31,7 @@ impl ConnBufs {
         Self {
             incoming: Vec::with_capacity(TLS_BUF_CAP),
             outgoing: Vec::with_capacity(TLS_BUF_CAP),
+            head: Vec::with_capacity(512),
         }
     }
 }
@@ -111,7 +112,12 @@ impl Conn {
             tls,
             incoming: bufs.incoming,
             outgoing: bufs.outgoing,
-            head: req.head.to_vec(),
+            head: {
+                let mut h = bufs.head;
+                h.clear();
+                h.extend_from_slice(req.head);
+                h
+            },
             request_queued: false,
             handshake_done: false,
             discard_ciphertext,
@@ -135,9 +141,11 @@ impl Conn {
     pub(crate) fn into_bufs(mut self) -> ConnBufs {
         self.incoming.clear();
         self.outgoing.clear();
+        self.head.clear();
         ConnBufs {
             incoming: self.incoming,
             outgoing: self.outgoing,
+            head: self.head,
         }
     }
 
@@ -150,7 +158,8 @@ impl Conn {
     /// it may hold a partial record of the same TLS stream.
     pub(crate) fn reset_for(&mut self, req: &Request<'_>, now_ns: u64) {
         debug_assert!(self.outgoing.is_empty(), "reuse with unsent request bytes");
-        self.head = req.head.to_vec();
+        self.head.clear();
+        self.head.extend_from_slice(req.head);
         self.request_queued = false;
         self.discard_ciphertext = req.discard_ciphertext && self.tls.is_some();
         self.parser = ResponseParser::new();
@@ -186,6 +195,10 @@ impl Conn {
         self.parser.head()
     }
 
+    pub(crate) fn head_mut(&mut self) -> &mut ResponseHead {
+        self.parser.head_mut()
+    }
+
     pub fn body_bytes(&self) -> u64 {
         self.parser.body_bytes()
     }
@@ -208,11 +221,10 @@ impl Conn {
     }
 
     /// One non-blocking step: drain RX, push TX, advance TLS.
-    pub(crate) fn step(&mut self, sockets: &mut SocketSet<'_>, clk: &MonoClock) -> Step {
+    pub(crate) fn step(&mut self, sockets: &mut SocketSet<'_>, now_ns: u64) -> Step {
         if let Some(done) = self.outcome {
             return done;
         }
-        let now_ns = clk.elapsed_ns();
         let s = sockets.get_mut::<tcp::Socket>(self.handle);
         let state = s.state();
 

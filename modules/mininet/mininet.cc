@@ -30,46 +30,6 @@ struct mininet_response_abi {
     char last_modified[64];
 };
 
-struct mininet_conn_stats_abi {
-    uint64_t requests_served;
-    uint64_t requests_reused;
-    uint64_t requests_retried;
-    uint64_t requests_done;
-    uint64_t queue_ns_total;
-    uint64_t wire_ns_total;
-    uint64_t body_bytes;
-    uint64_t ttfb_ns_total;
-    uint64_t ttfb_n;
-    uint64_t xfer_ns_total;
-    uint64_t xfer_n;
-    uint64_t poll_iters;
-    uint64_t poll_gap_ns_total;
-    uint64_t poll_gap_ns_max;
-    uint64_t poll_gaps_over_1ms;
-    uint64_t poll_busy_ns;
-    uint64_t poll_active_iters;
-    uint64_t poll_work_ns;
-    uint64_t poll_busy_ns_max;
-    uint64_t poll_loop_ns_max;
-    uint64_t wake_n;
-    uint64_t wake_ns_total;
-    uint64_t wake_ns_max;
-    uint64_t get_calls;
-    uint64_t get_ns_total;
-    uint64_t conns_established;
-    uint64_t conns_failed;
-    uint64_t setup_us_avg;
-    uint64_t setup_us_max;
-    uint64_t dial_us_avg;
-    uint64_t misrouted_drops;
-    uint64_t tx_alloc_fail;
-    uint64_t tx_burst_fail;
-    uint64_t nic_ipackets;
-    uint64_t nic_ibytes;
-    uint64_t nic_imissed;
-    uint64_t nic_ierrors;
-    uint64_t nic_rx_nombuf;
-};
 
 int mininet_up(const mininet_config_abi *cfg);
 int mininet_is_up(void);
@@ -77,15 +37,13 @@ const char *mininet_host(void);
 int mininet_get(const char *head, uint64_t head_len, void *buf, uint64_t cap,
                 mininet_response_abi *out);
 const char *mininet_strerror(int rc);
-mininet_conn_stats_abi mininet_conn_stats(void);
+mininet::conn_stats mininet_conn_stats(void);
 }
 
 static_assert(sizeof(mininet::config) == sizeof(mininet_config_abi),
               "mininet::config must match capi.rs");
 static_assert(sizeof(mininet::response) == sizeof(mininet_response_abi),
               "mininet::response must match capi.rs");
-static_assert(sizeof(mininet::conn_stats) == sizeof(mininet_conn_stats_abi),
-              "mininet::conn_stats must match capi.rs");
 static_assert(offsetof(mininet::response, etag) == offsetof(mininet_response_abi, etag),
               "mininet::response field order must match capi.rs");
 static_assert(offsetof(mininet::response, last_modified) ==
@@ -123,11 +81,7 @@ const char *strerror(int rc)
 
 conn_stats stats()
 {
-	auto s = mininet_conn_stats();
-	conn_stats out;
-	static_assert(sizeof(out) == sizeof(s), "layout");
-	__builtin_memcpy(&out, &s, sizeof(out));
-	return out;
+	return mininet_conn_stats();
 }
 
 } // namespace mininet

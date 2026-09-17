@@ -2436,10 +2436,10 @@ int ena_attach(pci::device *dev, ena_adapter **_adapter) {
 
   /* Assign default devargs values */
   adapter->missing_tx_completion_to = ENA_TX_TIMEOUT;
-  // LLQ is ENA's TX fast path: the descriptor + inline header is
-  // written to the device via a single MMIO burst into the LLQ BAR,
-  // rather than a descriptor+DMA round-trip. Cuts per-TX-packet CPU.
-  adapter->llq_header_policy = ENA_LLQ_POLICY_RECOMMENDED;
+  // Host-memory TX queues. LLQ writes each frame's 128-byte entry into the
+  // device BAR, which this kernel maps uncached: 16 serialized stores, ~3.5 us
+  // per transmitted frame, measured as 7-9 ms per poll under load.
+  adapter->llq_header_policy = ENA_LLQ_POLICY_DISABLED;
 
   rc = ena_com_allocate_customer_metrics_buffer(ena_dev);
   if (rc != 0) {

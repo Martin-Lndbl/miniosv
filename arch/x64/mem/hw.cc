@@ -56,6 +56,7 @@ static std::atomic<const uintptr_t *> flush_va;
 static std::atomic<size_t> flush_va_count;
 
 static inter_processor_interrupt flush_ipi{IPI_TLB_FLUSH, [] {
+        sched::cpu::current()->tlb_ipis.fetch_add(1, std::memory_order_relaxed);
         auto *va = flush_va.load(std::memory_order_acquire);
         if (va) {
             tlb_flush_pages(va, flush_va_count.load(std::memory_order_relaxed));
