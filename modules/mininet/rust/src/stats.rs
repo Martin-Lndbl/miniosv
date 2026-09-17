@@ -24,6 +24,9 @@ static WAKE_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static WAKE_NS_MAX: AtomicU64 = AtomicU64::new(0);
 static GET_CALLS: AtomicU64 = AtomicU64::new(0);
 static GET_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_SINCE_NS: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 static SETUP_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SETUP_NS_MAX: AtomicU64 = AtomicU64::new(0);
@@ -31,17 +34,17 @@ static SETUP_HIST: [AtomicU64; BUCKETS] = [const { AtomicU64::new(0) }; BUCKETS]
 static DIAL_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static DIAL_HIST: [AtomicU64; BUCKETS] = [const { AtomicU64::new(0) }; BUCKETS];
 
-/// Worker-loop counters, in `Stats` order: sums up to `WorkNs`, maxima after.
+/// Worker-loop counters: sums up to `WorkNs`, maxima after.
 #[derive(Clone, Copy)]
 #[repr(usize)]
 pub(crate) enum Poll {
     Iters,
     GapNsTotal,
-    GapNsMax,
     GapsOver1ms,
     BusyNs,
     ActiveIters,
     WorkNs,
+    GapNsMax,
     BusyNsMax,
     LoopNsMax,
     IfaceNsMax,
@@ -169,6 +172,8 @@ pub struct Stats {
     pub wake_ns_max: u64,
     pub get_calls: u64,
     pub get_ns_total: u64,
+    /// Wall time during which at least one request was outstanding.
+    pub active_ns_total: u64,
     /// Off the device; a frame it dropped never reached any queue.
     pub nic_ipackets: u64,
     pub nic_ibytes: u64,
@@ -220,6 +225,7 @@ pub fn snapshot() -> Stats {
         wake_ns_max: WAKE_NS_MAX.load(Ordering::Relaxed),
         get_calls: GET_CALLS.load(Ordering::Relaxed),
         get_ns_total: GET_NS_TOTAL.load(Ordering::Relaxed),
+        active_ns_total: ACTIVE_NS_TOTAL.load(Ordering::Relaxed),
         nic_ipackets: nic.ipackets,
         nic_ibytes: nic.ibytes,
         nic_imissed: nic.imissed,
@@ -291,7 +297,17 @@ impl PollAcc {
     }
 }
 
-pub(crate) fn get_finished(total_ns: u64, wake_ns: u64) {
+pub(crate) fn get_started(now_ns: u64) {
+    if IN_FLIGHT.fetch_add(1, Ordering::AcqRel) == 0 {
+        ACTIVE_SINCE_NS.store(now_ns, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn get_finished(total_ns: u64, wake_ns: u64, now_ns: u64) {
+    if IN_FLIGHT.fetch_sub(1, Ordering::AcqRel) == 1 {
+        let since = ACTIVE_SINCE_NS.load(Ordering::Relaxed);
+        ACTIVE_NS_TOTAL.fetch_add(now_ns.saturating_sub(since), Ordering::Relaxed);
+    }
     GET_CALLS.fetch_add(1, Ordering::Relaxed);
     GET_NS_TOTAL.fetch_add(total_ns, Ordering::Relaxed);
     WAKE_N.fetch_add(1, Ordering::Relaxed);

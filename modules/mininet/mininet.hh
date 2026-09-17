@@ -113,6 +113,7 @@ struct conn_stats {
     uint64_t wake_ns_max;
     uint64_t get_calls;
     uint64_t get_ns_total;
+    uint64_t active_ns_total;
     uint64_t nic_ipackets;
     uint64_t nic_ibytes;
     uint64_t nic_imissed;
