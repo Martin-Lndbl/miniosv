@@ -1523,9 +1523,7 @@ timer::timer(thread& t)
 
 extern std::vector<cpu*> cpus;
 
-// Give a cpu to a pinned thread that never yields, so that placement and the
-// load balancer stop offering it work it cannot run. Refuses to reserve the
-// last unreserved cpu; returns whether the cpu is reserved on return.
+// Keep unpinned threads off `id`; refuses to reserve the last free cpu.
 bool reserve_cpu(unsigned id);
 
 inline void migrate_disable()

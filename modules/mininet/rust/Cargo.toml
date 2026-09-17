@@ -3,10 +3,7 @@ name = "mininet"
 version = "0.1.0"
 edition = "2021"
 
-# staticlib for callers that are not Rust -- app/miniduckdb links libmininet.a
-# and talks to it through mininet.hh. rlib for callers that are: the benchmark
-# depends on this crate directly, and would otherwise get a second copy of the
-# allocator and the panic handler.
+# staticlib for C++ callers, rlib for Rust ones.
 [lib]
 crate-type = ["staticlib", "rlib"]
 
@@ -27,38 +24,22 @@ features = [
     "socket-dhcpv4",
 ]
 
-# Which crypto provider rustls uses. ring by default; `rustcrypto` switches
-# back to the pure-Rust one, which is what the A/B against it needs.
 [features]
 default = []
 rustcrypto = ["dep:rustls-rustcrypto"]
 
-# --- TLS stack -----------------------------------------------------------
-# rustls in no_std mode: no `std` feature, no default logging (we don't
-# have `log`), only tls12 for a smaller footprint. `ring` does not pull in
-# `std` -- it is only the provider, and it brings its own asm.
+# rustls no_std, tls12 only; ring is the provider.
 [dependencies.rustls]
 version = "0.23"
 default-features = false
 features = ["tls12", "ring"]
 
-# The pure-Rust provider, kept behind a feature rather than deleted: it is the
-# only thing to fall back to if ring's asm ever fails to build for a target.
-#
-# It is not the default because its GHASH is one CLMUL multiply and a full
-# reduction per 16-byte block (polyval 0.6, `ParBlocksSize = U1`), where ring
-# aggregates eight blocks against precomputed powers of H and reduces once.
-# Measured on a Zen 4 core, 16 KiB records: 1.03 GB/s against ring's 6.2, and
-# 79% of that time is the GHASH rather than the AES -- the CTR half alone runs
-# at 5.6 GB/s. The benchmark's own tls_stub numbers say the same thing from
-# the other side: TLS costs ~0.92 ns per byte, which is what this provider's
-# AEAD costs and roughly six times what ring's does.
+# Pure-Rust fallback provider: ~6x slower AES-GCM than ring (GHASH-bound).
 [dependencies.rustls-rustcrypto]
 version = "0.0.2-alpha"
 default-features = false
 features = ["alloc", "tls12"]
 optional = true
 
-# Compiled-in Mozilla root CA bundle for cert-chain verification.
 [dependencies.webpki-roots]
 version = "0.26"

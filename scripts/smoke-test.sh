@@ -96,9 +96,7 @@ fi
 # QEMU_EFI works too.
 codecopy="$work/code.fd"; cp "$code" "$codecopy"
 varscopy="$work/vars.fd"; cp "$vars" "$varscopy"
-# Writable, because the copy inherits the source's mode and the source may be
-# read-only -- a nix store path is 0444, and qemu then fails to open the pflash
-# drive with "Permission denied" and no kernel ever starts.
+# Writable: a nix store path is 0444 and qemu cannot open it as pflash.
 chmod u+w "$codecopy" "$varscopy"
 if [ "$arch" = aarch64 ]; then
     truncate -s 64M "$codecopy"

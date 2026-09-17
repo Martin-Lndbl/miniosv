@@ -1,6 +1,4 @@
-// Implementation of the extern "C" bridge declared in shim.hh. See that
-// file for the rationale: every real DPDK/minidpdk struct is built and
-// read here, so only integers and opaque pointers ever cross into Rust.
+// The extern "C" bridge declared in shim.hh; only integers and opaque pointers cross into Rust.
 
 #include "shim.hh"
 
@@ -17,9 +15,7 @@
 
 namespace {
 
-// Checksum offloads we ask ENA to do for us. TX asks the NIC to compute
-// IPv4/TCP/UDP checksums; RX makes the NIC verify them. What each queue
-// actually accepts is filled in below by shim_eth_dev_configure.
+// Checksum offloads asked of ENA; what each queue accepts is filled in by shim_eth_dev_configure.
 constexpr uint64_t kWantedTxOffloads =
     RTE_ETH_TX_OFFLOAD_IPV4_CKSUM |
     RTE_ETH_TX_OFFLOAD_TCP_CKSUM |
@@ -29,10 +25,7 @@ constexpr uint64_t kWantedRxOffloads =
     RTE_ETH_RX_OFFLOAD_IPV4_CKSUM |
     RTE_ETH_RX_OFFLOAD_TCP_CKSUM |
     RTE_ETH_RX_OFFLOAD_UDP_CKSUM |
-    // Ask the NIC to hand us the RSS hash it computed for each packet.
-    // Besides being the ground truth for validating a software Toeplitz,
-    // this bit also gates ena_rss_reta_query() and ena_rss_hash_conf_get()
-    // — without it the guest cannot read back either the table or the key.
+    // The per-packet RSS hash also gates reading the RETA and the key back.
     RTE_ETH_RX_OFFLOAD_RSS_HASH;
 
 uint64_t g_tx_offloads = 0;
@@ -89,8 +82,7 @@ int shim_eth_dev_configure(uint16_t port_id, uint16_t nb_rx_q,
   std::memset(&conf, 0, sizeof(conf));
   conf.txmode.offloads = g_tx_offloads;
   conf.rxmode.offloads = g_rx_offloads;
-  // Multi-queue: RSS on the TCP/IPv4 4-tuple so parallel flows land on
-  // distinct RX queues. Without this, all traffic goes to queue 0.
+  // RSS on the TCP/IPv4 4-tuple, else everything goes to queue 0.
   if (nb_rx_q > 1) {
     conf.rxmode.mq_mode = RTE_ETH_MQ_RX_RSS;
     conf.rx_adv_conf.rss_conf.rss_hf = RTE_ETH_RSS_NONFRAG_IPV4_TCP;
@@ -135,8 +127,7 @@ void shim_macaddr_get(uint16_t port_id, uint8_t *addr_bytes) {
   std::memcpy(addr_bytes, addr.addr.data(), RTE_ETHER_ADDR_LEN);
 }
 
-// Patch mbuf offload metadata + zero the cksum fields for the NIC to
-// fill in. Applies only to IPv4 + (TCP|UDP) frames.
+// Offload metadata for IPv4 + (TCP|UDP) frames; the NIC fills the checksums.
 static void ena_tx_offload_prepare(rte_mbuf *m, uint8_t *buf, uint16_t len) {
   m->ol_flags = 0;
   m->l2_len = 0;
@@ -207,8 +198,7 @@ void shim_mbuf_free(void *handle) {
   if (handle) rte_pktmbuf_free(static_cast<rte_mbuf *>(handle));
 }
 
-// The RSS hash the NIC computed for this packet, or 0 if the device did
-// not tag it. Ground truth for validating a software Toeplitz.
+// The NIC's RSS hash for this packet, or 0 if untagged.
 uint32_t shim_mbuf_rss_hash(void *handle) {
   auto *m = static_cast<rte_mbuf *>(handle);
   if (m == nullptr || !(m->ol_flags & RTE_MBUF_F_RX_RSS_HASH)) return 0;
@@ -218,9 +208,6 @@ uint32_t shim_mbuf_rss_hash(void *handle) {
 // What the device actually accepted, after masking against rx_offload_capa.
 uint64_t shim_rx_offloads(void) { return g_rx_offloads; }
 
-// NIC-side counters. The only place a frame the hardware dropped before any
-// queue saw it shows up — an unanswered SYN and a SYN-ACK the NIC discarded
-// are indistinguishable from inside the stack without these.
 // out: [ipackets, opackets, ibytes, obytes, imissed, ierrors, oerrors, rx_nombuf]
 int shim_eth_stats(uint16_t port_id, uint64_t *out, uint16_t n) {
   rte_eth_dev *dev = lookup_dev(port_id);
@@ -239,8 +226,7 @@ int shim_eth_stats(uint16_t port_id, uint64_t *out, uint16_t n) {
   return 0;
 }
 
-// Per-queue receive counters, so a drop can be attributed to the queue whose
-// connection failed rather than only to the port as a whole.
+// Per-queue receive counters.
 int shim_eth_qstats(uint16_t port_id, uint64_t *ipkts, uint64_t *errs,
                     uint16_t nq) {
   rte_eth_dev *dev = lookup_dev(port_id);
@@ -256,10 +242,7 @@ int shim_eth_qstats(uint16_t port_id, uint64_t *ipkts, uint64_t *errs,
   return n;
 }
 
-// --- RSS introspection -----------------------------------------------------
-// The key the NIC is hashing with, and the indirection table it steers by.
-// Both are read from the device/driver rather than assumed, so the port ->
-// queue prediction can be built on measured values.
+// RSS introspection: the key and the indirection table, read off the device.
 
 int shim_rss_hash_key(uint16_t port_id, uint8_t *out_key, uint16_t out_len) {
   rte_eth_dev *dev = lookup_dev(port_id);
@@ -298,8 +281,7 @@ int shim_rss_reta(uint16_t port_id, uint16_t *out, uint16_t out_entries) {
   uint16_t n = static_cast<uint16_t>(reta_size);
   if (n > out_entries) n = out_entries;
 
-  // The query API works in groups of RTE_ETH_RETA_GROUP_SIZE entries, each
-  // with a bitmask selecting which entries of the group to fill.
+  // The query API works in groups of RTE_ETH_RETA_GROUP_SIZE entries.
   const uint16_t groups =
       (n + RTE_ETH_RETA_GROUP_SIZE - 1) / RTE_ETH_RETA_GROUP_SIZE;
   if (groups > 8) return -1;  // 8 * 64 = 512 entries, the largest ENA table
@@ -316,10 +298,7 @@ int shim_rss_reta(uint16_t port_id, uint16_t *out, uint16_t out_entries) {
   return n;
 }
 
-// Batched RX: pulls up to `max` mbufs from the NIC in one call.
-// The three output arrays are parallel; entries [0..returned) are
-// filled with (mbuf handle, data pointer, data length). Bad-cksum
-// packets are freed and skipped, so returned <= drained.
+// Batched RX into three parallel arrays; bad-cksum packets are freed and skipped.
 uint16_t shim_mbuf_rx_burst_n(uint16_t port_id, uint16_t queue_id,
                                void **out_handles, const uint8_t **out_data,
                                uint16_t *out_lens, uint16_t max) {
@@ -365,9 +344,7 @@ void *shim_thread_spawn(void (*fn)(void *), void *arg, int cpu_id) {
   sched::thread::attr attrs;
   if (cpu_id >= 0 && static_cast<size_t>(cpu_id) < sched::cpus.size()) {
     attrs.pin(sched::cpus[cpu_id]);
-    // Every pinned thread the shim spawns is a worker that polls without
-    // yielding, so the cpu is not shareable. Reserve before starting: a
-    // thread placed in the window would have to be migrated back out.
+    // A pinned shim thread is a poller that never yields; reserve its cpu first.
     sched::reserve_cpu(static_cast<unsigned>(cpu_id));
   }
   sched::thread *t =
@@ -384,9 +361,7 @@ void shim_thread_join(void *handle) {
 
 void *shim_thread_current() { return sched::thread::current(); }
 
-// wait_until re-evaluates the predicate under the wait guard, so a wake that
-// arrives between the caller's last check and the park is not lost: the
-// predicate simply reads true and the park returns immediately.
+// wait_until re-checks the predicate under the wait guard, so no wake is lost.
 void shim_thread_park(const unsigned int *flag) {
   sched::thread::wait_until([flag] {
     return __atomic_load_n(flag, __ATOMIC_ACQUIRE) != 0;
@@ -407,9 +382,7 @@ void *shim_realloc(void *ptr, uint64_t size) {
   return std::realloc(ptr, static_cast<size_t>(size));
 }
 
-// The getrandom crate's non-custom path syscalls into SYS_getrandom.
-// OSv has no Linux syscall table; fill from RDRAND instead. Only
-// SYS_getrandom is recognized — anything else returns ENOSYS.
+// OSv has no syscall table; SYS_getrandom is answered from RDRAND, anything else ENOSYS.
 long syscall(long number, ...) {
   constexpr long SYS_getrandom = 318;
   if (number != SYS_getrandom) return -1;

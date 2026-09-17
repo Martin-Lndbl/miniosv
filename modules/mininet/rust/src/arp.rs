@@ -1,9 +1,5 @@
-//! ARP, done by hand rather than through smoltcp.
-//!
-//! The gateway is resolved once, on queue 0. Per-worker interfaces on other
-//! queues cannot do it for themselves: an ARP reply is not hashed onto a queue
-//! by the 4-tuple, so it would arrive somewhere arbitrary. Instead every worker
-//! is handed the answer and seeds its neighbour cache with a fabricated reply.
+//! ARP by hand: the gateway is resolved once on queue 0, since replies are not
+//! steered by the 4-tuple, and every worker seeds its cache with a fabricated reply.
 
 use alloc::vec::Vec;
 
@@ -35,8 +31,7 @@ pub(crate) fn request(our_mac: [u8; 6], our_ip: [u8; 4], target_ip: [u8; 4]) -> 
     arp_frame([0xff; 6], our_mac, 1, our_ip, [0; 6], target_ip)
 }
 
-/// A reply the gateway never sent, synthesised so a worker's interface learns
-/// the MAC on its first poll.
+/// A reply the gateway never sent, for a worker's neighbour cache.
 pub(crate) fn synthetic_reply(
     sender_mac: [u8; 6],
     sender_ip: [u8; 4],

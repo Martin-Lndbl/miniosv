@@ -1,8 +1,4 @@
-/*
- * mininet: a userspace network stack for miniOSv (smoltcp + rustls over
- * minidpdk, in modules/mininet/rust). One endpoint per image, no resolver.
- * This header is the whole C++ surface.
- */
+// mininet: a userspace network stack (smoltcp + rustls over minidpdk); one endpoint per image.
 
 #ifndef MININET_HH
 #define MININET_HH
@@ -31,63 +27,49 @@ enum : int {
 };
 
 struct config {
-    //! `Host:` header and TLS server name.
     const char *host;
-    //! Dotted quad; what gets dialled.
     const char *address;
     //! 0 dials plain HTTP on port 80.
     int tls;
-    //! Worker threads (RSS queues), clamped to the device; 0 sizes to the
-    //! machine, one per sixteen cpus.
+    //! 0 sizes to the machine, one per sixteen cpus.
     uint32_t workers;
     //! `workers * conns_per_worker` is the in-flight ceiling.
     uint32_t conns_per_worker;
-    //! Per-socket receive buffer, or 0 for the default.
     uint64_t rx_buffer;
 };
 
-//! Fixed arrays so a response crosses by value; a longer ETag is truncated.
 enum : size_t {
     ETAG_MAX = 128,
     DATE_MAX = 64,
 };
 
 struct response {
-    //! 0 if no head was read.
     uint32_t status;
     uint64_t content_length;
-    //! Bytes written into the caller's buffer.
     uint64_t bytes;
     uint32_t has_range;
     uint64_t range_first;
     uint64_t range_last;
     //! 0 when the server sent `*` for the total.
     uint64_t range_total;
-    //! NUL-terminated; empty when the header was absent.
     char etag[ETAG_MAX];
     char last_modified[DATE_MAX];
 };
 
-//! Start the NIC, take a DHCP lease, resolve the gateway, spawn one pinned
-//! worker per queue. Call once; a second call is a no-op.
+//! Call once; a second call is a no-op.
 int up(const config &c);
 
 bool is_up();
 
-//! The host the stack was brought up for, or nullptr when it is not up.
 const char *host();
 
-//! Send the caller-rendered request `head` and write the body into `buf`.
-//! Blocks (parked); any number of threads may call it at once. A body larger
-//! than `cap` is E_BUFFER_TOO_SMALL.
+//! Blocks, parked. A body larger than `cap` is E_BUFFER_TOO_SMALL.
 int get(const char *head, size_t head_len, void *buf, size_t cap, response *out);
 
 //! Never null.
 const char *strerror(int rc);
 
-//! Cumulative since up(). Per request: queue (submit -> pick-up), wire
-//! (pick-up -> complete), ttfb/xfer (wire split at the first head byte),
-//! get (submitter wall), wake (publish -> submitter running).
+//! Cumulative since up(); stats.rs names the fields.
 struct conn_stats {
     uint64_t requests_served;
     uint64_t requests_reused;
@@ -107,6 +89,8 @@ struct conn_stats {
     uint64_t poll_busy_ns;
     uint64_t poll_active_iters;
     uint64_t poll_work_ns;
+    uint64_t poll_busy_ns_max;
+    uint64_t poll_loop_ns_max;
     uint64_t wake_n;
     uint64_t wake_ns_total;
     uint64_t wake_ns_max;

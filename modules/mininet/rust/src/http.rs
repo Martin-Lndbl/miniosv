@@ -1,26 +1,14 @@
-//! Just enough HTTP/1.1 to find the response head, read the few fields a
-//! caller needs from it, and hand the body onward.
-//!
-//! Deliberately small. It does *not* understand chunked transfer-encoding: S3
-//! answers a ranged GET with `206` and a `Content-Length`, so nothing here has
-//! needed it yet. Chunked is rejected rather than guessed at -- guessing would
-//! silently truncate a transfer instead of failing one.
+//! Just enough HTTP/1.1 to find the response head and hand the body on.
+//! Chunked transfer-encoding is rejected, not guessed at.
 
 use alloc::string::String;
 use alloc::vec::Vec;
 
 /// Where a response body goes.
-///
-/// The benchmark only wants the count, which the parser keeps regardless, so
-/// it sinks into [`NullSink`]. A caller that wants the bytes -- DuckDB reading
-/// a range into a page -- uses [`BufferSink`] or its own implementation.
 pub trait BodySink {
     fn write(&mut self, data: &[u8]);
 
-    /// Bytes the sink actually stored, less than the body if it discarded
-    /// some or ran out of room. A trait method, not something the caller
-    /// reads off its own sink afterwards, because [`crate::Conn`] owns the
-    /// sink once installed and `dyn BodySink` cannot be downcast back.
+    /// Bytes the sink stored.
     fn written(&self) -> u64 {
         0
     }
@@ -38,12 +26,7 @@ impl BodySink for NullSink {
     fn write(&mut self, _data: &[u8]) {}
 }
 
-/// Writes the body straight into a caller-owned buffer.
-///
-/// Holds a raw pointer rather than a slice: a lifetime here would put that
-/// lifetime on [`crate::Conn`] and on the worker that owns it. The caller
-/// keeps the buffer alive and unaliased until the request reports done --
-/// that contract is why the constructor is unsafe.
+/// Writes the body into a caller-owned buffer that outlives the request.
 pub struct BufferSink {
     buf: *mut u8,
     cap: usize,
@@ -51,15 +34,11 @@ pub struct BufferSink {
     overflowed: bool,
 }
 
-// SAFETY: the buffer is handed to exactly one connection, which is polled by
-// exactly one worker thread.
 unsafe impl Send for BufferSink {}
 
 impl BufferSink {
     /// # Safety
-    ///
-    /// `buf` must point to `cap` writable bytes that stay valid, and stay
-    /// unread by anyone else, until the connection using this sink finishes.
+    /// `buf` points to `cap` writable bytes nobody else touches until the request finishes.
     pub unsafe fn new(buf: *mut u8, cap: usize) -> Self {
         Self {
             buf,
@@ -73,10 +52,7 @@ impl BufferSink {
         self.written
     }
 
-    /// True if the peer sent more than the buffer could hold. The excess is
-    /// dropped, not written past the end -- but the response is then not the
-    /// one that was asked for, and the caller has to treat it as a failure
-    /// rather than a short read.
+    /// The peer sent more than the buffer holds; the excess was dropped.
     pub fn overflowed(&self) -> bool {
         self.overflowed
     }
@@ -98,8 +74,6 @@ impl BodySink for BufferSink {
             self.overflowed = true;
         }
         if n > 0 {
-            // SAFETY: n <= cap - written, and the constructor's contract makes
-            // buf..buf+cap writable for as long as this sink lives.
             unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), self.buf.add(self.written), n) };
             self.written += n;
         }
@@ -125,9 +99,7 @@ impl ContentRange {
     }
 }
 
-/// What the response head said. Only the fields something above this layer
-/// reads: httpfs needs these four to size a file, validate a range and detect
-/// that an object changed under it.
+/// The head fields something above this layer reads.
 #[derive(Debug, Default, Clone)]
 pub struct ResponseHead {
     pub status: u16,
@@ -137,22 +109,18 @@ pub struct ResponseHead {
     pub last_modified: Option<String>,
 }
 
-/// A head this large is a peer doing something wrong, not a large response.
-/// Bounded because the head is buffered to be parsed as a whole.
+/// Bounded because the head is buffered whole.
 const MAX_HEAD: usize = 64 * 1024;
 
 pub(crate) struct ResponseParser {
     pending: Vec<u8>,
     headers_done: bool,
-    /// How much of the CRLFCRLF terminator has been seen. Carried across calls
-    /// because it can straddle two TLS records.
+    /// CRLFCRLF progress; it can straddle two TLS records.
     hdr_state: u8,
     head: ResponseHead,
     body_bytes: u64,
 }
 
-/// Why a response could not be read. Returned rather than logged so the
-/// connection fails visibly instead of delivering a short body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ParseError {
     /// No status line, or one that is not `HTTP/1.x NNN`.
@@ -182,9 +150,7 @@ impl ResponseParser {
         &self.head
     }
 
-    /// Body bytes only. The head is application data as far as TLS is
-    /// concerned, so counting raw decrypted length overcounts by one head per
-    /// connection and makes a byte-exact check impossible.
+    /// Body bytes only.
     pub(crate) fn body_bytes(&self) -> u64 {
         self.body_bytes
     }
@@ -226,9 +192,7 @@ impl ResponseParser {
         Ok(())
     }
 
-    /// Count bytes without looking at them. Used when the record layer is
-    /// stubbed out: the payload is ciphertext, so there is no head to find and
-    /// no body to separate.
+    /// Count bytes without parsing: the stubbed record layer has no head.
     pub(crate) fn count_opaque(&mut self, n: usize) {
         self.body_bytes += n as u64;
     }

@@ -1,32 +1,21 @@
-//! Why bringing the stack up, or a connection, failed.
-//!
-//! Deliberately coarse. Each variant names something a human has to act on --
-//! a wrong instance type, a stale address, a bucket that refuses the request --
-//! rather than an errno the caller could only print.
+//! Why the stack, or a connection, failed; coarse on purpose.
 
 use core::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     NoDevice,
-    /// Sizing is fixed, so a failed mempool allocation is a memory shortage.
     NoMemory,
-    /// The Toeplitz key or the indirection table could not be read, or the
-    /// table is not a power of two. Without both, source ports cannot be
-    /// chosen to steer, and every worker would see other workers' traffic.
+    /// Key or table unreadable, or table not a power of two.
     RssUnavailable,
-    /// Usually means the queue-0 RX path is not delivering.
     DhcpTimeout,
     ArpTimeout,
-    /// Only possible with a pathological indirection table.
     NoPorts,
     ConnectRejected,
     SynTimeout,
     Tls,
     /// Includes chunked transfer-encoding, which is not implemented.
     BadResponse,
-    /// The excess was dropped rather than written past the end, so what
-    /// arrived is not the response that was asked for.
     BufferTooSmall,
 }
 
