@@ -20,7 +20,7 @@ use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address};
 
 use crate::arp;
 use crate::clock::MonoClock;
-use crate::conn::{Conn, Step};
+use crate::conn::{Conn, ConnBufs, Step};
 use crate::device::DpdkDevice;
 use crate::endpoint::{Endpoint, Request};
 use crate::error::Error;
@@ -88,6 +88,8 @@ pub struct Worker {
     sockets: SocketSet<'static>,
     handles: Vec<SocketHandle>,
     conns: Vec<Option<Conn>>,
+    /// Parked here while the slot is idle; `None` while its connection holds them.
+    bufs: Vec<Option<ConnBufs>>,
     ports: Vec<u16>,
     rotation: Vec<u16>,
     next_port: usize,
@@ -173,6 +175,10 @@ impl Worker {
         let mut conns = Vec::with_capacity(slots);
         conns.resize_with(slots, || None);
 
+        // With the socket buffers, not per dial. See `ConnBufs`.
+        let mut bufs = Vec::with_capacity(slots);
+        bufs.resize_with(slots, || Some(ConnBufs::new()));
+
         Ok(Worker {
             queue_id: h.queue_id,
             iface,
@@ -180,6 +186,7 @@ impl Worker {
             sockets,
             handles,
             conns,
+            bufs,
             ports,
             rotation,
             next_port: 0,
@@ -230,8 +237,10 @@ impl Worker {
         if let Some(&handle) = self.handles.get(slot) {
             self.sockets.get_mut::<tcp::Socket>(handle).abort();
         }
-        if let Some(c) = self.conns.get_mut(slot) {
-            *c = None;
+        if let Some(c) = self.conns.get_mut(slot).and_then(Option::take) {
+            if let Some(b) = self.bufs.get_mut(slot) {
+                *b = Some(c.into_bufs());
+            }
         }
     }
 
@@ -250,10 +259,10 @@ impl Worker {
     /// Reuse the connection already open on `slot` for `req`. Only call when
     /// [`Worker::idle_reusable`] was just true for this slot.
     pub(crate) fn reuse(&mut self, slot: usize, req: &Request<'_>) -> Result<(), Error> {
-        let now_ms = self.clk.elapsed_ms();
+        let now_ns = self.clk.elapsed_ns();
         match self.conns.get_mut(slot).and_then(|c| c.as_mut()) {
             Some(c) => {
-                c.reset_for(req, now_ms);
+                c.reset_for(req, now_ns);
                 crate::stats::request_started(true);
                 Ok(())
             }
@@ -275,6 +284,11 @@ impl Worker {
     fn connect_on(&mut self, slot: usize, src_port: u16, req: &Request<'_>) -> Result<(), Error> {
         let handle = *self.handles.get(slot).ok_or(Error::ConnectRejected)?;
         let dst = (Ipv4Address::from_octets(self.peer.ip), self.peer.port);
+        let dial_start_ns = self.clk.elapsed_ns();
+
+        // Before the socket is armed and before the slot gives up its buffers:
+        // the one step that can fail, and the only expensive one left.
+        let tls = Conn::session(&self.peer, &self.tls_config)?;
 
         {
             let s = self.sockets.get_mut::<tcp::Socket>(handle);
@@ -285,16 +299,23 @@ impl Worker {
         }
         crate::stats::request_started(false);
 
-        let conn = Conn::new(
+        // A slot re-dialled without a `release` still owns its buffers.
+        let bufs = match self.conns[slot].take() {
+            Some(old) => old.into_bufs(),
+            None => self.bufs[slot].take().unwrap_or_else(ConnBufs::new),
+        };
+
+        let now_ns = self.clk.elapsed_ns();
+        self.conns[slot] = Some(Conn::new(
             handle,
             self.queue_id,
             src_port,
-            &self.peer,
+            tls,
             req,
-            &self.tls_config,
-            self.clk.elapsed_ms(),
-        )?;
-        self.conns[slot] = Some(conn);
+            bufs,
+            now_ns,
+        ));
+        crate::stats::conn_dialled(now_ns.saturating_sub(dial_start_ns));
         Ok(())
     }
 
