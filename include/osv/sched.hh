@@ -1000,6 +1000,8 @@ struct cpu : private timer_base::client {
     thread* idle_thread;
     // if true, cpu is now polling incoming_wakeups_mask
     std::atomic<bool> idle_poll = { false };
+    // if true, a pinned thread owns this cpu and unpinned ones keep off it
+    std::atomic<bool> reserved = { false };
     // for each cpu, a list of threads that are migrating into this cpu:
     typedef lockless_queue<thread, &thread::_wakeup_link> incoming_wakeup_queue;
     cpu_set incoming_wakeups_mask;
@@ -1520,6 +1522,11 @@ timer::timer(thread& t)
 }
 
 extern std::vector<cpu*> cpus;
+
+// Give a cpu to a pinned thread that never yields, so that placement and the
+// load balancer stop offering it work it cannot run. Refuses to reserve the
+// last unreserved cpu; returns whether the cpu is reserved on return.
+bool reserve_cpu(unsigned id);
 
 inline void migrate_disable()
 {

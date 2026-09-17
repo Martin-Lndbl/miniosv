@@ -365,6 +365,10 @@ void *shim_thread_spawn(void (*fn)(void *), void *arg, int cpu_id) {
   sched::thread::attr attrs;
   if (cpu_id >= 0 && static_cast<size_t>(cpu_id) < sched::cpus.size()) {
     attrs.pin(sched::cpus[cpu_id]);
+    // Every pinned thread the shim spawns is a worker that polls without
+    // yielding, so the cpu is not shareable. Reserve before starting: a
+    // thread placed in the window would have to be migrated back out.
+    sched::reserve_cpu(static_cast<unsigned>(cpu_id));
   }
   sched::thread *t =
       sched::thread::make([fn, arg]() { fn(arg); }, attrs);
