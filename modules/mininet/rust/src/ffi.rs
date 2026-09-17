@@ -48,6 +48,7 @@ extern "C" {
         out_cap: *mut u16,
     ) -> *mut u8;
     pub fn shim_mbuf_tx(port_id: u16, queue_id: u16, handle: *mut c_void, len: u16) -> c_int;
+    pub fn shim_mbuf_tx_burst(port_id: u16, queue_id: u16, handles: *mut *mut c_void, lens: *const u16, n: u16) -> u16;
     pub fn shim_mbuf_free(handle: *mut c_void);
     pub fn shim_mbuf_rx_burst_n(
         port_id: u16,

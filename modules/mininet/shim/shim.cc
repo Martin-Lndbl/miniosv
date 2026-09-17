@@ -194,6 +194,25 @@ int shim_mbuf_tx(uint16_t port_id, uint16_t queue_id, void *handle,
   return 0;
 }
 
+// One doorbell for up to 64 frames; what the ring refuses is freed.
+uint16_t shim_mbuf_tx_burst(uint16_t port_id, uint16_t queue_id, void **handles,
+                            const uint16_t *lens, uint16_t n) {
+  rte_mbuf *ms[64];
+  if (n > 64) n = 64;
+  for (uint16_t i = 0; i < n; i++) {
+    auto *m = static_cast<rte_mbuf *>(handles[i]);
+    m->data_len = lens[i];
+    m->pkt_len = lens[i];
+    m->nb_segs = 1;
+    m->next = nullptr;
+    ena_tx_offload_prepare(m, rte_pktmbuf_mtod(m, uint8_t *), lens[i]);
+    ms[i] = m;
+  }
+  uint16_t sent = rte_eth_tx_burst(port_id, queue_id, ms, n);
+  for (uint16_t i = sent; i < n; i++) rte_pktmbuf_free(ms[i]);
+  return sent;
+}
+
 void shim_mbuf_free(void *handle) {
   if (handle) rte_pktmbuf_free(static_cast<rte_mbuf *>(handle));
 }

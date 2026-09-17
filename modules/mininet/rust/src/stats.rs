@@ -18,15 +18,7 @@ static TTFB_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static TTFB_N: AtomicU64 = AtomicU64::new(0);
 static XFER_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static XFER_N: AtomicU64 = AtomicU64::new(0);
-static POLL_ITERS: AtomicU64 = AtomicU64::new(0);
-static POLL_GAP_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
-static POLL_GAP_NS_MAX: AtomicU64 = AtomicU64::new(0);
-static POLL_GAPS_OVER_1MS: AtomicU64 = AtomicU64::new(0);
-static POLL_BUSY_NS: AtomicU64 = AtomicU64::new(0);
-static POLL_ACTIVE_ITERS: AtomicU64 = AtomicU64::new(0);
-static POLL_WORK_NS: AtomicU64 = AtomicU64::new(0);
-static POLL_BUSY_NS_MAX: AtomicU64 = AtomicU64::new(0);
-static POLL_LOOP_NS_MAX: AtomicU64 = AtomicU64::new(0);
+static DIAL_NS_MAX: AtomicU64 = AtomicU64::new(0);
 static WAKE_N: AtomicU64 = AtomicU64::new(0);
 static WAKE_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static WAKE_NS_MAX: AtomicU64 = AtomicU64::new(0);
@@ -37,8 +29,28 @@ static SETUP_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SETUP_NS_MAX: AtomicU64 = AtomicU64::new(0);
 static SETUP_HIST: [AtomicU64; BUCKETS] = [const { AtomicU64::new(0) }; BUCKETS];
 static DIAL_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
-static DIAL_NS_MAX: AtomicU64 = AtomicU64::new(0);
 static DIAL_HIST: [AtomicU64; BUCKETS] = [const { AtomicU64::new(0) }; BUCKETS];
+
+/// Worker-loop counters, in `Stats` order: sums up to `WorkNs`, maxima after.
+#[derive(Clone, Copy)]
+#[repr(usize)]
+pub(crate) enum Poll {
+    Iters,
+    GapNsTotal,
+    GapNsMax,
+    GapsOver1ms,
+    BusyNs,
+    ActiveIters,
+    WorkNs,
+    BusyNsMax,
+    LoopNsMax,
+    IfaceNsMax,
+    StepsNsMax,
+    RxPktsMax,
+    TxPktsMax,
+    N,
+}
+static POLL: [AtomicU64; Poll::N as usize] = [const { AtomicU64::new(0) }; Poll::N as usize];
 
 /// Log2 histogram over microseconds: bucket `k > 0` holds `[2^(k-1), 2^k)`.
 const BUCKETS: usize = 32;
@@ -81,6 +93,7 @@ fn percentile(hist: &[u64; BUCKETS], p: u64) -> u64 {
 }
 
 /// One measured duration, in microseconds.
+#[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Dist {
     pub n: u64,
@@ -106,6 +119,8 @@ fn dist(hist: &[AtomicU64; BUCKETS], total: &AtomicU64, max: &AtomicU64) -> Dist
     }
 }
 
+/// The C ABI too: `mininet::conn_stats` in mininet.hh mirrors this layout.
+#[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Stats {
     /// Nonzero means the RSS model no longer matches the hardware.
@@ -142,15 +157,32 @@ pub struct Stats {
     /// Longest single poll, and longest stretch outside poll between two polls.
     pub poll_busy_ns_max: u64,
     pub poll_loop_ns_max: u64,
+    /// Longest device poll and longest pass over the connections.
+    pub iface_ns_max: u64,
+    pub steps_ns_max: u64,
+    /// Most packets one poll received and transmitted.
+    pub rx_pkts_max: u64,
+    pub tx_pkts_max: u64,
     /// Publish -> submitter running again.
     pub wake_n: u64,
     pub wake_ns_total: u64,
     pub wake_ns_max: u64,
     pub get_calls: u64,
     pub get_ns_total: u64,
+    /// Off the device; a frame it dropped never reached any queue.
+    pub nic_ipackets: u64,
+    pub nic_ibytes: u64,
+    pub nic_imissed: u64,
+    pub nic_ierrors: u64,
+    pub nic_rx_nombuf: u64,
+}
+
+fn poll(k: Poll) -> u64 {
+    POLL[k as usize].load(Ordering::Relaxed)
 }
 
 pub fn snapshot() -> Stats {
+    let nic = crate::nic::eth_stats().unwrap_or_default();
     Stats {
         misrouted_drops: MISROUTED_DROPS.load(Ordering::Relaxed),
         tx_alloc_fail: TX_ALLOC_FAIL.load(Ordering::Relaxed),
@@ -170,20 +202,29 @@ pub fn snapshot() -> Stats {
         ttfb_n: TTFB_N.load(Ordering::Relaxed),
         xfer_ns_total: XFER_NS_TOTAL.load(Ordering::Relaxed),
         xfer_n: XFER_N.load(Ordering::Relaxed),
-        poll_iters: POLL_ITERS.load(Ordering::Relaxed),
-        poll_gap_ns_total: POLL_GAP_NS_TOTAL.load(Ordering::Relaxed),
-        poll_gap_ns_max: POLL_GAP_NS_MAX.load(Ordering::Relaxed),
-        poll_gaps_over_1ms: POLL_GAPS_OVER_1MS.load(Ordering::Relaxed),
-        poll_busy_ns: POLL_BUSY_NS.load(Ordering::Relaxed),
-        poll_active_iters: POLL_ACTIVE_ITERS.load(Ordering::Relaxed),
-        poll_work_ns: POLL_WORK_NS.load(Ordering::Relaxed),
-        poll_busy_ns_max: POLL_BUSY_NS_MAX.load(Ordering::Relaxed),
-        poll_loop_ns_max: POLL_LOOP_NS_MAX.load(Ordering::Relaxed),
+        poll_iters: poll(Poll::Iters),
+        poll_gap_ns_total: poll(Poll::GapNsTotal),
+        poll_gap_ns_max: poll(Poll::GapNsMax),
+        poll_gaps_over_1ms: poll(Poll::GapsOver1ms),
+        poll_busy_ns: poll(Poll::BusyNs),
+        poll_active_iters: poll(Poll::ActiveIters),
+        poll_work_ns: poll(Poll::WorkNs),
+        poll_busy_ns_max: poll(Poll::BusyNsMax),
+        poll_loop_ns_max: poll(Poll::LoopNsMax),
+        iface_ns_max: poll(Poll::IfaceNsMax),
+        steps_ns_max: poll(Poll::StepsNsMax),
+        rx_pkts_max: poll(Poll::RxPktsMax),
+        tx_pkts_max: poll(Poll::TxPktsMax),
         wake_n: WAKE_N.load(Ordering::Relaxed),
         wake_ns_total: WAKE_NS_TOTAL.load(Ordering::Relaxed),
         wake_ns_max: WAKE_NS_MAX.load(Ordering::Relaxed),
         get_calls: GET_CALLS.load(Ordering::Relaxed),
         get_ns_total: GET_NS_TOTAL.load(Ordering::Relaxed),
+        nic_ipackets: nic.ipackets,
+        nic_ibytes: nic.ibytes,
+        nic_imissed: nic.imissed,
+        nic_ierrors: nic.ierrors,
+        nic_rx_nombuf: nic.rx_nombuf,
     }
 }
 
@@ -212,51 +253,44 @@ pub(crate) fn request_finished(
 }
 /// Per-worker, flushed in batches so workers do not share cache lines per iteration.
 #[derive(Default)]
-pub(crate) struct PollAcc {
-    pub iters: u64,
-    pub gap_ns_total: u64,
-    pub gap_ns_max: u64,
-    pub gaps_over_1ms: u64,
-    pub busy_ns: u64,
-    pub active_iters: u64,
-    pub work_ns: u64,
-    pub busy_ns_max: u64,
-    pub loop_ns_max: u64,
-}
+pub(crate) struct PollAcc([u64; Poll::N as usize]);
 
 impl PollAcc {
+    pub(crate) fn add(&mut self, k: Poll, n: u64) {
+        self.0[k as usize] += n;
+    }
+
+    pub(crate) fn max(&mut self, k: Poll, n: u64) {
+        self.0[k as usize] = self.0[k as usize].max(n);
+    }
+
     pub(crate) fn tick(&mut self, gap_ns: u64, busy_ns: u64, active: bool) {
-        self.iters += 1;
-        self.gap_ns_total += gap_ns;
-        self.gap_ns_max = self.gap_ns_max.max(gap_ns);
-        if gap_ns > 1_000_000 {
-            self.gaps_over_1ms += 1;
-        }
-        self.busy_ns += busy_ns;
-        self.busy_ns_max = self.busy_ns_max.max(busy_ns);
-        self.loop_ns_max = self.loop_ns_max.max(gap_ns.saturating_sub(busy_ns));
-        if active {
-            self.active_iters += 1;
-            self.work_ns += busy_ns;
-        }
-        if self.iters >= 1024 {
+        self.add(Poll::Iters, 1);
+        self.add(Poll::GapNsTotal, gap_ns);
+        self.max(Poll::GapNsMax, gap_ns);
+        self.add(Poll::GapsOver1ms, (gap_ns > 1_000_000) as u64);
+        self.add(Poll::BusyNs, busy_ns);
+        self.add(Poll::ActiveIters, active as u64);
+        self.add(Poll::WorkNs, if active { busy_ns } else { 0 });
+        self.max(Poll::BusyNsMax, busy_ns);
+        self.max(Poll::LoopNsMax, gap_ns.saturating_sub(busy_ns));
+        if self.0[Poll::Iters as usize] >= 1024 {
             self.flush();
         }
     }
 
     pub(crate) fn flush(&mut self) {
-        POLL_ITERS.fetch_add(self.iters, Ordering::Relaxed);
-        POLL_GAP_NS_TOTAL.fetch_add(self.gap_ns_total, Ordering::Relaxed);
-        POLL_GAP_NS_MAX.fetch_max(self.gap_ns_max, Ordering::Relaxed);
-        POLL_GAPS_OVER_1MS.fetch_add(self.gaps_over_1ms, Ordering::Relaxed);
-        POLL_BUSY_NS.fetch_add(self.busy_ns, Ordering::Relaxed);
-        POLL_ACTIVE_ITERS.fetch_add(self.active_iters, Ordering::Relaxed);
-        POLL_WORK_NS.fetch_add(self.work_ns, Ordering::Relaxed);
-        POLL_BUSY_NS_MAX.fetch_max(self.busy_ns_max, Ordering::Relaxed);
-        POLL_LOOP_NS_MAX.fetch_max(self.loop_ns_max, Ordering::Relaxed);
+        for (i, v) in self.0.iter().enumerate() {
+            if i <= Poll::WorkNs as usize {
+                POLL[i].fetch_add(*v, Ordering::Relaxed);
+            } else {
+                POLL[i].fetch_max(*v, Ordering::Relaxed);
+            }
+        }
         *self = Self::default();
     }
 }
+
 pub(crate) fn get_finished(total_ns: u64, wake_ns: u64) {
     GET_CALLS.fetch_add(1, Ordering::Relaxed);
     GET_NS_TOTAL.fetch_add(total_ns, Ordering::Relaxed);

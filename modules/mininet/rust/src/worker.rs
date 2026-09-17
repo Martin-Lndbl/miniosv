@@ -75,7 +75,9 @@ pub struct Worker {
     clk: MonoClock,
     last_poll_ns: u64,
     last_busy_ns: u64,
+    last_iface_ns: u64,
     last_active: bool,
+    last_dev: (u64, u64),
 }
 
 impl Worker {
@@ -164,7 +166,9 @@ impl Worker {
             clk,
             last_poll_ns: 0,
             last_busy_ns: 0,
+            last_iface_ns: 0,
             last_active: false,
+            last_dev: (0, 0),
         })
     }
 
@@ -280,10 +284,14 @@ impl Worker {
             .iface
             .poll(Instant::from_millis(now_ms), &mut self.dev, &mut self.sockets);
         self.last_active = matches!(res, PollResult::SocketStateChanged);
+        self.dev.flush_tx();
+        let now_ns = self.clk.elapsed_ns();
+        self.last_iface_ns = now_ns.saturating_sub(start_ns);
+        self.last_dev = self.dev.take_counts();
 
         let mut all_done = true;
         for slot in self.conns.iter_mut().flatten() {
-            if slot.step(&mut self.sockets, &self.clk) == Step::Pending {
+            if slot.step(&mut self.sockets, now_ns) == Step::Pending {
                 all_done = false;
             }
         }
@@ -297,6 +305,14 @@ impl Worker {
 
     pub fn last_busy_ns(&self) -> u64 {
         self.last_busy_ns
+    }
+
+    pub fn last_iface_ns(&self) -> u64 {
+        self.last_iface_ns
+    }
+
+    pub fn last_dev(&self) -> (u64, u64) {
+        self.last_dev
     }
 
     pub fn last_active(&self) -> bool {

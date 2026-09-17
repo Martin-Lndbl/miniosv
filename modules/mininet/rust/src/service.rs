@@ -2,13 +2,14 @@
 //! polling thread per worker, and a blocking [`Service::get`] for everyone
 //! else. The ceiling is `workers * conns_per_worker` requests in flight.
 
-use alloc::collections::VecDeque;
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::ptr;
+use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::endpoint::{Endpoint, Request};
 use crate::error::Error;
@@ -51,10 +52,27 @@ struct Slot {
     published_ns: AtomicU64,
     waiter: *mut c_void,
     state: AtomicU32,
+    next: AtomicPtr<Slot>,
     outcome: UnsafeCell<Option<Result<GetResult, Error>>>,
 }
 
 impl Slot {
+    fn stub() -> Slot {
+        Slot {
+            head: ptr::null(),
+            head_len: 0,
+            buf: ptr::null_mut(),
+            buf_cap: 0,
+            discard_ciphertext: false,
+            submitted_ns: 0,
+            published_ns: AtomicU64::new(0),
+            waiter: ptr::null_mut(),
+            state: AtomicU32::new(RELEASED),
+            next: AtomicPtr::new(ptr::null_mut()),
+            outcome: UnsafeCell::new(None),
+        }
+    }
+
     /// # Safety
     /// `p` is a slot this worker popped and has not released.
     unsafe fn complete(p: *mut Slot, res: Result<GetResult, Error>) {
@@ -70,10 +88,13 @@ impl Slot {
     }
 }
 
-/// Multi-producer, single-consumer handoff to one worker; one push per request.
+/// Multi-producer, single-consumer handoff to one worker: Vyukov's intrusive
+/// queue, so a producer preempted mid-push cannot stall the worker on a lock.
 struct Queue {
-    lock: AtomicBool,
-    items: UnsafeCell<VecDeque<*mut Slot>>,
+    head: AtomicPtr<Slot>,
+    tail: UnsafeCell<*mut Slot>,
+    /// Boxed so its address survives the queue being moved into its `Arc`.
+    stub: Box<Slot>,
 }
 
 unsafe impl Send for Queue {}
@@ -81,37 +102,50 @@ unsafe impl Sync for Queue {}
 
 impl Queue {
     fn new() -> Self {
+        let stub = Box::new(Slot::stub());
+        let p = &*stub as *const Slot as *mut Slot;
         Self {
-            lock: AtomicBool::new(false),
-            items: UnsafeCell::new(VecDeque::new()),
+            head: AtomicPtr::new(p),
+            tail: UnsafeCell::new(p),
+            stub,
         }
-    }
-
-    fn acquire(&self) {
-        while self
-            .lock
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
-        }
-    }
-
-    fn release(&self) {
-        self.lock.store(false, Ordering::Release);
     }
 
     fn push(&self, slot: *mut Slot) {
-        self.acquire();
-        unsafe { (*self.items.get()).push_back(slot) };
-        self.release();
+        unsafe { (*slot).next.store(ptr::null_mut(), Ordering::Relaxed) };
+        let prev = self.head.swap(slot, Ordering::AcqRel);
+        unsafe { (*prev).next.store(slot, Ordering::Release) };
     }
 
+    /// `None` also while a producer is between its two stores; try again next poll.
     fn pop(&self) -> Option<*mut Slot> {
-        self.acquire();
-        let out = unsafe { (*self.items.get()).pop_front() };
-        self.release();
-        out
+        let stub = &*self.stub as *const Slot as *mut Slot;
+        unsafe {
+            let mut tail = *self.tail.get();
+            let mut next = (*tail).next.load(Ordering::Acquire);
+            if tail == stub {
+                if next.is_null() {
+                    return None;
+                }
+                *self.tail.get() = next;
+                tail = next;
+                next = (*next).next.load(Ordering::Acquire);
+            }
+            if !next.is_null() {
+                *self.tail.get() = next;
+                return Some(tail);
+            }
+            if self.head.load(Ordering::Acquire) != tail {
+                return None;
+            }
+            self.push(stub);
+            next = (*tail).next.load(Ordering::Acquire);
+            if !next.is_null() {
+                *self.tail.get() = next;
+                return Some(tail);
+            }
+            None
+        }
     }
 }
 
@@ -193,6 +227,7 @@ impl Service {
             published_ns: AtomicU64::new(0),
             waiter: unsafe { shim_thread_current() },
             state: AtomicU32::new(PENDING),
+            next: AtomicPtr::new(ptr::null_mut()),
             outcome: UnsafeCell::new(None),
         };
 
@@ -211,6 +246,90 @@ impl Service {
 
         unsafe { (*slot.outcome.get()).take() }.unwrap_or(Err(Error::BadResponse))
     }
+}
+
+/// Producers on their own threads, one consumer here: every slot pushed comes
+/// out exactly once. Returns (received, duplicates, expected).
+pub(crate) fn queue_selftest() -> (u64, u64, u64) {
+    const PRODUCERS: usize = 4;
+    const EACH: usize = 4000;
+    let q = Arc::new(Queue::new());
+    let mut threads = Vec::new();
+    for p in 0..PRODUCERS {
+        let q = q.clone();
+        threads.push(thread::spawn(
+            move || {
+                for i in 0..EACH {
+                    let s = Box::into_raw(Box::new(Slot::stub()));
+                    unsafe { (*s).head_len = p * EACH + i + 1 };
+                    q.push(s);
+                }
+            },
+            None,
+        ));
+    }
+    let total = (PRODUCERS * EACH) as u64;
+    let mut seen = alloc::vec![false; PRODUCERS * EACH + 1];
+    let (mut got, mut dups, mut idle) = (0u64, 0u64, 0u64);
+    while got < total && idle < 200_000_000 {
+        match q.pop() {
+            Some(p) => {
+                let id = unsafe { (*p).head_len };
+                if id == 0 || id > PRODUCERS * EACH || seen[id] {
+                    dups += 1;
+                } else {
+                    seen[id] = true;
+                }
+                drop(unsafe { Box::from_raw(p) });
+                got += 1;
+                idle = 0;
+            }
+            None => {
+                idle += 1;
+                core::hint::spin_loop();
+            }
+        }
+    }
+    for t in threads {
+        t.join();
+    }
+    (got, dups, total)
+}
+
+#[derive(Clone, Copy)]
+struct Pending {
+    slot: *mut Slot,
+    reused: bool,
+    retried: bool,
+    picked_ns: u64,
+}
+
+fn request_of(s: &Slot) -> Request<'_> {
+    Request {
+        head: unsafe { core::slice::from_raw_parts(s.head, s.head_len) },
+        discard_ciphertext: s.discard_ciphertext,
+    }
+}
+
+fn attach_sink(w: &mut Worker, slot: usize, s: &Slot) {
+    let sink = unsafe { BufferSink::new(s.buf, s.buf_cap) };
+    if let Some(c) = w.conn_mut(slot) {
+        c.set_sink(Box::new(sink));
+    }
+}
+
+fn result_of(c: &mut crate::Conn) -> Result<GetResult, Error> {
+    if c.sink_overflowed() {
+        return Err(Error::BufferTooSmall);
+    }
+    Ok(GetResult {
+        status: c.status(),
+        written: c.sink_written(),
+        content_length: c.head().content_length,
+        content_range: c.head().content_range,
+        etag: c.head_mut().etag.take(),
+        last_modified: c.head_mut().last_modified.take(),
+    })
 }
 
 fn serve(
@@ -240,112 +359,79 @@ fn serve(
         }
     };
 
-    // (slot, was_reused, retried, picked_up_ns)
-    let mut pending: Vec<Option<(*mut Slot, bool, bool, u64)>> = Vec::new();
-    pending.resize(w.slots(), None);
+    let mut pending: Vec<Option<Pending>> = (0..w.slots()).map(|_| None).collect();
     let epoch_ns = w.clock().epoch_ns();
     let mut prev_poll_ns = 0u64;
+    let mut prev_busy_ns = 0u64;
     let mut acc = stats::PollAcc::default();
 
     loop {
         w.poll();
         let now_ns = w.last_poll_ns();
         if prev_poll_ns != 0 {
-            acc.tick(now_ns.saturating_sub(prev_poll_ns), w.last_busy_ns(), w.last_active());
+            acc.tick(now_ns.saturating_sub(prev_poll_ns), prev_busy_ns, w.last_active());
+            acc.max(stats::Poll::IfaceNsMax, w.last_iface_ns());
+            acc.max(stats::Poll::StepsNsMax, w.last_busy_ns().saturating_sub(w.last_iface_ns()));
+            let (rxp, txp) = w.last_dev();
+            acc.max(stats::Poll::RxPktsMax, rxp);
+            acc.max(stats::Poll::TxPktsMax, txp);
         }
         prev_poll_ns = now_ns;
+        prev_busy_ns = w.last_busy_ns();
 
         for slot in 0..w.slots() {
-            match pending[slot] {
-                Some((p, was_reused, retried, started_ns)) => {
-                    let done = w.conn(slot).and_then(|c| c.outcome());
-                    if let Some(step) = done {
-                        let res = match step {
-                            crate::Step::Complete => {
-                                let c = w.conn(slot).expect("just observed");
-                                if c.sink_overflowed() {
-                                    Err(Error::BufferTooSmall)
-                                } else {
-                                    Ok(GetResult {
-                                        status: c.status(),
-                                        written: c.sink_written(),
-                                        content_length: c.head().content_length,
-                                        content_range: c.head().content_range,
-                                        etag: c.head().etag.clone(),
-                                        last_modified: c.head().last_modified.clone(),
-                                    })
-                                }
-                            }
-                            crate::Step::Failed(e) => Err(e),
-                            crate::Step::Pending => unreachable!("outcome() is terminal"),
-                        };
-                        // A reused socket the peer had already closed: re-dial
-                        // once. GET and HEAD are safe to repeat.
-                        if was_reused && !retried && matches!(step, crate::Step::Failed(_)) {
-                            let s = unsafe { &*p };
-                            let head =
-                                unsafe { core::slice::from_raw_parts(s.head, s.head_len) };
-                            let req = Request {
-                                head,
-                                discard_ciphertext: s.discard_ciphertext,
-                            };
-                            w.release(slot);
-                            if w.connect_next(slot, &req).is_ok() {
-                                stats::request_retried();
-                                let sink = unsafe { BufferSink::new(s.buf, s.buf_cap) };
-                                if let Some(c) = w.conn_mut(slot) {
-                                    c.set_sink(alloc::boxed::Box::new(sink));
-                                }
-                                pending[slot] = Some((p, false, true, started_ns));
-                                continue;
-                            }
-                        }
-                        let head_ns = w.conn(slot).and_then(|c| c.head_ns()).map(|h| h + epoch_ns);
-                        stats::request_finished(
-                            started_ns.saturating_sub(unsafe { (*p).submitted_ns }),
-                            now_ns.saturating_sub(started_ns),
-                            res.as_ref().map_or(0, |g| g.written),
-                            head_ns.map(|h| h.saturating_sub(started_ns)),
-                            head_ns.map(|h| now_ns.saturating_sub(h)),
-                        );
-                        unsafe { Slot::complete(p, res) };
-                        pending[slot] = None;
-                        if !w.idle_reusable(slot) {
-                            w.release(slot);
-                        }
+            let Some(pd) = pending[slot] else {
+                let Some(p) = queue.pop() else { continue };
+                let s = unsafe { &*p };
+                let req = request_of(s);
+                let reused = w.idle_reusable(slot);
+                let opened = if reused {
+                    w.reuse(slot, &req)
+                } else {
+                    // A kept socket the peer since closed sits in CloseWait;
+                    // connect() needs Closed.
+                    w.release(slot);
+                    w.connect_next(slot, &req)
+                };
+                match opened {
+                    Ok(()) => {
+                        attach_sink(&mut w, slot, s);
+                        pending[slot] = Some(Pending { slot: p, reused, retried: false, picked_ns: now_ns });
                     }
+                    Err(e) => unsafe { Slot::complete(p, Err(e)) },
                 }
-                None => {
-                    let p = match queue.pop() {
-                        Some(p) => p,
-                        None => continue,
-                    };
-                    let s = unsafe { &*p };
-                    let head = unsafe { core::slice::from_raw_parts(s.head, s.head_len) };
-                    let req = Request {
-                        head,
-                        discard_ciphertext: s.discard_ciphertext,
-                    };
-                    let reusing = w.idle_reusable(slot);
-                    let opened = if reusing {
-                        w.reuse(slot, &req)
-                    } else {
-                        // A kept socket the peer since closed sits in CloseWait;
-                        // connect() needs Closed.
-                        w.release(slot);
-                        w.connect_next(slot, &req)
-                    };
-                    match opened {
-                        Ok(()) => {
-                            let sink = unsafe { BufferSink::new(s.buf, s.buf_cap) };
-                            if let Some(c) = w.conn_mut(slot) {
-                                c.set_sink(alloc::boxed::Box::new(sink));
-                            }
-                            pending[slot] = Some((p, reusing, false, now_ns));
-                        }
-                        Err(e) => unsafe { Slot::complete(p, Err(e)) },
-                    }
+                continue;
+            };
+            let Some(step) = w.conn(slot).and_then(|c| c.outcome()) else { continue };
+            let res = match step {
+                crate::Step::Complete => result_of(w.conn_mut(slot).expect("just observed")),
+                crate::Step::Failed(e) => Err(e),
+                crate::Step::Pending => unreachable!("outcome() is terminal"),
+            };
+            // A reused socket the peer had already closed: re-dial once. GET
+            // and HEAD are safe to repeat.
+            if pd.reused && !pd.retried && matches!(step, crate::Step::Failed(_)) {
+                let s = unsafe { &*pd.slot };
+                w.release(slot);
+                if w.connect_next(slot, &request_of(s)).is_ok() {
+                    stats::request_retried();
+                    attach_sink(&mut w, slot, s);
+                    pending[slot] = Some(Pending { reused: false, retried: true, ..pd });
+                    continue;
                 }
+            }
+            let head_ns = w.conn(slot).and_then(|c| c.head_ns()).map(|h| h + epoch_ns);
+            stats::request_finished(
+                pd.picked_ns.saturating_sub(unsafe { (*pd.slot).submitted_ns }),
+                now_ns.saturating_sub(pd.picked_ns),
+                res.as_ref().map_or(0, |g| g.written),
+                head_ns.map(|h| h.saturating_sub(pd.picked_ns)),
+                head_ns.map(|h| now_ns.saturating_sub(h)),
+            );
+            unsafe { Slot::complete(pd.slot, res) };
+            pending[slot] = None;
+            if !w.idle_reusable(slot) {
+                w.release(slot);
             }
         }
     }

@@ -7,7 +7,7 @@ use core::ptr;
 use smoltcp::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
 
-use crate::ffi::{rte_pktmbuf_pool, shim_mbuf_alloc_tx, shim_mbuf_free, shim_mbuf_rx_burst_n, shim_mbuf_tx, PORT};
+use crate::ffi::{rte_pktmbuf_pool, shim_mbuf_alloc_tx, shim_mbuf_free, shim_mbuf_rx_burst_n, shim_mbuf_tx_burst, PORT};
 use crate::rss::OwnedPorts;
 use crate::stats;
 
@@ -15,6 +15,7 @@ pub(crate) const MTU: usize = 1514;
 
 /// RX drains up to this many mbufs per burst.
 pub(crate) const RX_BURST: usize = 32;
+const TX_BATCH: usize = 32;
 
 pub(crate) struct DpdkDevice {
     pub(crate) queue_id: u16,
@@ -29,6 +30,12 @@ pub(crate) struct DpdkDevice {
     rx_pref_lens: [u16; RX_BURST],
     rx_pref_pos: u16,
     rx_pref_len: u16,
+    rx_pkts: u64,
+    tx_pkts: u64,
+    /// Frames written but not yet handed to the NIC: one doorbell per flush, not per frame.
+    tx_handles: [*mut c_void; TX_BATCH],
+    tx_lens: [u16; TX_BATCH],
+    tx_len: usize,
 }
 
 impl DpdkDevice {
@@ -48,7 +55,35 @@ impl DpdkDevice {
             rx_pref_lens: [0; RX_BURST],
             rx_pref_pos: 0,
             rx_pref_len: 0,
+            rx_pkts: 0,
+            tx_pkts: 0,
+            tx_handles: [ptr::null_mut(); TX_BATCH],
+            tx_lens: [0; TX_BATCH],
+            tx_len: 0,
         }
+    }
+
+    /// Hand the batched frames to the NIC.
+    pub fn flush_tx(&mut self) {
+        if self.tx_len == 0 {
+            return;
+        }
+        let sent = unsafe {
+            shim_mbuf_tx_burst(PORT, self.queue_id, self.tx_handles.as_mut_ptr(), self.tx_lens.as_ptr(), self.tx_len as u16)
+        } as usize;
+        for _ in sent..self.tx_len {
+            stats::tx_burst_fail();
+        }
+        self.tx_pkts += self.tx_len as u64;
+        self.tx_len = 0;
+    }
+
+    /// Packets received and transmitted since the last call.
+    pub fn take_counts(&mut self) -> (u64, u64) {
+        let r = (self.rx_pkts, self.tx_pkts);
+        self.rx_pkts = 0;
+        self.tx_pkts = 0;
+        r
     }
 
     /// True if the frame should be passed up.
@@ -107,6 +142,12 @@ impl RxToken for DpdkRxToken {
     }
 }
 
+impl Drop for DpdkDevice {
+    fn drop(&mut self) {
+        self.flush_tx();
+    }
+}
+
 impl Drop for DpdkRxToken {
     fn drop(&mut self) {
         if let DpdkRxToken::Mbuf { handle, .. } = *self {
@@ -130,8 +171,11 @@ impl TxToken for DpdkTxToken<'_> {
         let n = core::cmp::min(len, cap as usize);
         let slice = unsafe { core::slice::from_raw_parts_mut(data, n) };
         let r = f(slice);
-        if unsafe { shim_mbuf_tx(PORT, self.dev.queue_id, handle, n as u16) } != 0 {
-            stats::tx_burst_fail();
+        self.dev.tx_handles[self.dev.tx_len] = handle;
+        self.dev.tx_lens[self.dev.tx_len] = n as u16;
+        self.dev.tx_len += 1;
+        if self.dev.tx_len == TX_BATCH {
+            self.dev.flush_tx();
         }
         r
     }
@@ -163,7 +207,9 @@ impl Device for DpdkDevice {
                         RX_BURST as u16,
                     )
                 };
+                self.rx_pkts += got as u64;
                 if got == 0 {
+                    self.flush_tx();
                     return None;
                 }
                 self.rx_pref_pos = 0;

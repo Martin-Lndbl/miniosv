@@ -34,6 +34,8 @@ void shim_macaddr_get(uint16_t port_id, uint8_t *addr_bytes);
 uint8_t *shim_mbuf_alloc_tx(void *pool, uint16_t queue_id, void **out_handle,
                              uint16_t *out_cap);
 
+uint16_t shim_mbuf_tx_burst(uint16_t port_id, uint16_t queue_id, void **handles,
+                            const uint16_t *lens, uint16_t n);
 int shim_mbuf_tx(uint16_t port_id, uint16_t queue_id, void *handle,
                   uint16_t len);
 void shim_mbuf_free(void *handle);

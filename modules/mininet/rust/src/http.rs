@@ -150,6 +150,10 @@ impl ResponseParser {
         &self.head
     }
 
+    pub(crate) fn head_mut(&mut self) -> &mut ResponseHead {
+        &mut self.head
+    }
+
     /// Body bytes only.
     pub(crate) fn body_bytes(&self) -> u64 {
         self.body_bytes

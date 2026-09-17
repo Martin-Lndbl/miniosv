@@ -69,8 +69,21 @@ int get(const char *head, size_t head_len, void *buf, size_t cap, response *out)
 //! Never null.
 const char *strerror(int rc);
 
-//! Cumulative since up(); stats.rs names the fields.
+//! One measured duration, in microseconds.
+struct dist {
+    uint64_t n, us_avg, us_p50, us_p90, us_max;
+};
+
+//! Cumulative since up(). Mirrors stats::Stats in rust/src/stats.rs field for
+//! field; that struct is the ABI.
 struct conn_stats {
+    uint64_t misrouted_drops;
+    uint64_t tx_alloc_fail;
+    uint64_t tx_burst_fail;
+    uint64_t conns_established;
+    uint64_t conns_failed;
+    dist setup;
+    dist dial;
     uint64_t requests_served;
     uint64_t requests_reused;
     uint64_t requests_retried;
@@ -91,19 +104,15 @@ struct conn_stats {
     uint64_t poll_work_ns;
     uint64_t poll_busy_ns_max;
     uint64_t poll_loop_ns_max;
+    uint64_t iface_ns_max;
+    uint64_t steps_ns_max;
+    uint64_t rx_pkts_max;
+    uint64_t tx_pkts_max;
     uint64_t wake_n;
     uint64_t wake_ns_total;
     uint64_t wake_ns_max;
     uint64_t get_calls;
     uint64_t get_ns_total;
-    uint64_t conns_established;
-    uint64_t conns_failed;
-    uint64_t setup_us_avg;
-    uint64_t setup_us_max;
-    uint64_t dial_us_avg;
-    uint64_t misrouted_drops;
-    uint64_t tx_alloc_fail;
-    uint64_t tx_burst_fail;
     uint64_t nic_ipackets;
     uint64_t nic_ibytes;
     uint64_t nic_imissed;
