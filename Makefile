@@ -403,6 +403,11 @@ $(out)/%.o: %.cc | generated-headers $(out)/.libcxx-built
 	$(makedir)
 	$(call quiet, $(CXX) $(CXXFLAGS) -c -o $@ $<, CXX $*.cc)
 
+# The kernel itself uses .cc throughout; .cpp is here for the applications
+$(out)/%.o: %.cpp | generated-headers $(out)/.libcxx-built
+	$(makedir)
+	$(call quiet, $(CXX) $(CXXFLAGS) -c -o $@ $<, CXX $*.cpp)
+
 $(out)/%.o: %.c | generated-headers
 	$(makedir)
 	$(call quiet, $(CC) $(CFLAGS) -c -o $@ $<, CC $*.c)
@@ -863,10 +868,22 @@ def_symbols = --defsym=OSV_KERNEL_BASE=$(kernel_base) \
               --defsym=OSV_KERNEL_VM_SHIFT=$(kernel_vm_shift)
 endif
 
+# The objects go to the linker through a response file, one per line: a large
+# application overflows the argument list.
+empty :=
+space := $(empty) $(empty)
+define newline
+
+
+endef
+link-inputs = $(patsubst %.ld,-T %.ld,$(filter-out $(app_mode_dep) $(app_init_late) $(llvm_libc_dep) $(libcxx_dep) $(compiler_rt_dep),$^))
+
 $(out)/loader.elf: $(stage1_targets) arch/$(arch)/loader.ld $(app_mode_dep) $(app_init_late) $(llvm_libc_dep) $(libcxx_dep) $(compiler_rt_dep)
+	$(call very-quiet, $(makedir))
+	$(file > $@.objects,$(subst $(space),$(newline),$(link-inputs)))
 	$(call quiet, $(LD) -o $@ $(def_symbols) \
 		-static --eh-frame-hdr -L$(out)/arch/$(arch) -L$(out) \
-            $(patsubst %.ld,-T %.ld,$(filter-out $(app_mode_dep) $(app_init_late) $(llvm_libc_dep) $(libcxx_dep) $(compiler_rt_dep),$^)) \
+	    @$@.objects \
 	    $(linker_archives_options) $(conf_linker_extra_options), \
 		LINK loader.elf)
 
