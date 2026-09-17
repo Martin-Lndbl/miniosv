@@ -1,13 +1,5 @@
-//! The C ABI behind `modules/mininet/mininet.hh`.
-//!
-//! Everything here is the mirror image of the shim: there, C++ exposes the NIC
-//! to Rust; here, Rust exposes the stack to C++. Only integers, pointers and
-//! NUL-terminated strings cross, so the header needs no Rust knowledge and the
-//! kernel links one archive.
-//!
-//! There is exactly one stack per image -- one NIC, one set of queues -- so
-//! this keeps it in a global rather than handing out an opaque handle nobody
-//! could have two of.
+//! The C ABI behind `modules/mininet/mininet.hh`. One stack per image, so it
+//! lives in a global.
 
 use alloc::boxed::Box;
 use core::ffi::{c_char, c_int, c_void, CStr};
@@ -19,9 +11,7 @@ use crate::error::Error;
 use crate::service::{Service, ServiceConfig};
 use crate::{Config, Stack};
 
-/// Error codes, mirrored in mininet.hh. Negative so a caller can test `< 0`
-/// the way it would an errno, without the values having to *be* errnos --
-/// none of these have a sensible POSIX spelling.
+/// Mirrored in mininet.hh.
 const OK: c_int = 0;
 const E_NO_DEVICE: c_int = -1;
 const E_NO_MEMORY: c_int = -2;
@@ -53,8 +43,6 @@ fn code(e: Error) -> c_int {
     }
 }
 
-/// Kept alive for the life of the program. `Stack` is here only because it
-/// owns the mempools every worker is using; nothing reads it again.
 struct Global {
     _stack: Stack,
     svc: Service,
@@ -110,8 +98,6 @@ unsafe fn cstr<'a>(p: *const c_char) -> Option<&'a str> {
     unsafe { CStr::from_ptr(p) }.to_str().ok()
 }
 
-/// Dotted quad, at run time. The benchmark's is a `const fn` because it parses
-/// a compile-time constant; this one parses whatever the caller passes.
 fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
     let mut out = [0u8; 4];
     let mut parts = 0;
@@ -185,15 +171,9 @@ pub extern "C" fn mininet_up(cfg: *const mininet_config) -> c_int {
         svc,
         host: host_z,
     }));
-    // Only one caller ever gets here -- up() is a boot-time call -- but losing
-    // the race would leak a whole NIC's worth of state, so it is a CAS.
     match GLOBAL.compare_exchange(ptr::null_mut(), global, Ordering::AcqRel, Ordering::Acquire) {
         Ok(_) => OK,
-        Err(_) => {
-            // Someone beat us. Leak rather than tear down a stack whose
-            // worker threads are already running against it.
-            OK
-        }
+        Err(_) => OK,
     }
 }
 
@@ -229,12 +209,7 @@ pub extern "C" fn mininet_get(
     }
     let g = unsafe { &*g };
 
-    // Everything below writes through (buf, cap) on the strength of the
-    // caller's word, and a cap that does not match the allocation behind it
-    // surfaces much later as a fault inside BufferSink::write. S3 answers a
-    // ranged GET and httpfs sizes its reads in MiB, so a gigabyte-plus figure
-    // is a misparsed Range header rather than a large read: refuse it here,
-    // where the argument is still attributable to its caller.
+    // A gigabyte-plus cap is a misparsed Range header, not a large read.
     const MAX_SANE_CAP: u64 = 1 << 30;
     if cap > MAX_SANE_CAP {
         println!("FAIL: mininet_get: implausible buffer cap {} bytes", cap);
@@ -242,10 +217,6 @@ pub extern "C" fn mininet_get(
     }
 
     let head = unsafe { core::slice::from_raw_parts(head as *const u8, head_len as usize) };
-    // `from_raw_parts_mut` requires a non-null, dereferenceable pointer even
-    // for an empty slice, and the HEAD path passes null with cap 0. Building
-    // that slice was undefined behaviour: nothing read it, but the compiler is
-    // entitled to assume it was valid.
     let body = if cap == 0 {
         &mut [][..]
     } else {
@@ -301,14 +272,83 @@ pub extern "C" fn mininet_get(
 pub struct mininet_conn_stats {
     pub requests_served: u64,
     pub requests_reused: u64,
+    pub requests_retried: u64,
+    pub requests_done: u64,
+    pub queue_ns_total: u64,
+    pub wire_ns_total: u64,
+    pub body_bytes: u64,
+    pub ttfb_ns_total: u64,
+    pub ttfb_n: u64,
+    pub xfer_ns_total: u64,
+    pub xfer_n: u64,
+    pub poll_iters: u64,
+    pub poll_gap_ns_total: u64,
+    pub poll_gap_ns_max: u64,
+    pub poll_gaps_over_1ms: u64,
+    pub poll_busy_ns: u64,
+    pub poll_active_iters: u64,
+    pub poll_work_ns: u64,
+    pub wake_n: u64,
+    pub wake_ns_total: u64,
+    pub wake_ns_max: u64,
+    pub get_calls: u64,
+    pub get_ns_total: u64,
+    pub conns_established: u64,
+    pub conns_failed: u64,
+    pub setup_us_avg: u64,
+    pub setup_us_max: u64,
+    pub dial_us_avg: u64,
+    pub misrouted_drops: u64,
+    pub tx_alloc_fail: u64,
+    pub tx_burst_fail: u64,
+    pub nic_ipackets: u64,
+    pub nic_ibytes: u64,
+    pub nic_imissed: u64,
+    pub nic_ierrors: u64,
+    pub nic_rx_nombuf: u64,
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn mininet_conn_stats() -> mininet_conn_stats {
     let s = crate::stats::snapshot();
+    let nic = crate::nic::eth_stats().unwrap_or_default();
     mininet_conn_stats {
         requests_served: s.requests_served,
         requests_reused: s.requests_reused,
+        requests_retried: s.requests_retried,
+        requests_done: s.requests_done,
+        queue_ns_total: s.queue_ns_total,
+        wire_ns_total: s.wire_ns_total,
+        body_bytes: s.body_bytes,
+        ttfb_ns_total: s.ttfb_ns_total,
+        ttfb_n: s.ttfb_n,
+        xfer_ns_total: s.xfer_ns_total,
+        xfer_n: s.xfer_n,
+        poll_iters: s.poll_iters,
+        poll_gap_ns_total: s.poll_gap_ns_total,
+        poll_gap_ns_max: s.poll_gap_ns_max,
+        poll_gaps_over_1ms: s.poll_gaps_over_1ms,
+        poll_busy_ns: s.poll_busy_ns,
+        poll_active_iters: s.poll_active_iters,
+        poll_work_ns: s.poll_work_ns,
+        wake_n: s.wake_n,
+        wake_ns_total: s.wake_ns_total,
+        wake_ns_max: s.wake_ns_max,
+        get_calls: s.get_calls,
+        get_ns_total: s.get_ns_total,
+        conns_established: s.conns_established,
+        conns_failed: s.conns_failed,
+        setup_us_avg: s.setup.us_avg,
+        setup_us_max: s.setup.us_max,
+        dial_us_avg: s.dial.us_avg,
+        misrouted_drops: s.misrouted_drops,
+        tx_alloc_fail: s.tx_alloc_fail,
+        tx_burst_fail: s.tx_burst_fail,
+        nic_ipackets: nic.ipackets,
+        nic_ibytes: nic.ibytes,
+        nic_imissed: nic.imissed,
+        nic_ierrors: nic.ierrors,
+        nic_rx_nombuf: nic.rx_nombuf,
     }
 }
 

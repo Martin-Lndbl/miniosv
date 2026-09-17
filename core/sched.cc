@@ -593,10 +593,8 @@ unsigned cpu::load()
 static std::atomic<unsigned> cpus_reserved;
 static cpu *placement_cpu();
 
-// `load()` counts the runqueue, so a cpu whose spinning owner is *running*
-// reports 0 and looks like the emptiest cpu on the machine. Both placement and
-// the balancer then send threads there to share half a core with a thread that
-// never yields. Naming the cpu is cheaper than teaching them to see it.
+// A spinning owner is running, not queued, so its cpu looks empty to
+// placement; name it instead.
 bool reserve_cpu(unsigned id)
 {
     if (id >= cpus.size()) {
@@ -605,21 +603,13 @@ bool reserve_cpu(unsigned id)
     if (cpus[id]->reserved.load(std::memory_order_relaxed)) {
         return true;
     }
-    // Somebody has to be left to run the application.
     if (cpus_reserved.load(std::memory_order_relaxed) + 1 >= cpus.size()) {
         return false;
     }
     cpus_reserved.fetch_add(1, std::memory_order_relaxed);
     cpus[id]->reserved.store(true, std::memory_order_release);
 
-    // Reserving says where new threads may go; it does not move the ones
-    // already here. The caller is one of them -- a worker is spawned from the
-    // application's own thread, which has been running since before this cpu
-    // had an owner -- and it is the one that matters, because every
-    // single-threaded phase of the program runs on it. Left behind it shares
-    // half a core with a poller that never yields: measured at exactly 2.00x
-    // on every single-threaded step of the cpu ladder. pin() migrates, unpin()
-    // gives the thread back to placement.
+    // The caller (the application's own thread) is already here; move it off.
     thread *t = thread::current();
     if (t->tcpu() == cpus[id] && !t->pinned()) {
         cpu *dst = placement_cpu();
@@ -634,13 +624,6 @@ bool reserve_cpu(unsigned id)
 static bool available(cpu *c)
 {
     return !c->reserved.load(std::memory_order_acquire);
-}
-
-unsigned cpus_available()
-{
-    unsigned n = cpus.size();
-    unsigned r = cpus_reserved.load(std::memory_order_acquire);
-    return r < n ? n - r : 1;
 }
 
 // Where an unpinned new thread goes.
@@ -895,10 +878,7 @@ void thread::unpin()
 
 void cpu::on_cpu_up()
 {
-    // fire the per-cpu "cpu up" notifiers 
-    // - clock per-CPU setup 
-    // This must run on the CPU being brought up, since the callbacks 
-    // iniitialize cpu::current()'s per-CPU state
+    // Must run on the cpu being brought up: the callbacks set up per-cpu state.
     notifier::fire();
 }
 cpu::notifier::notifier(std::function<void ()> cpu_up)

@@ -1,6 +1,4 @@
-//! A real monotonic clock. Fake-tick clocks drift smoltcp's retransmit timers
-//! at high throughput, which shows up as spurious retransmissions rather than
-//! as a wrong time.
+//! A real monotonic clock, so smoltcp's retransmit timers do not drift.
 
 use crate::ffi::shim_time_ns;
 
@@ -13,6 +11,10 @@ impl MonoClock {
         Self {
             epoch_ns: unsafe { shim_time_ns() },
         }
+    }
+
+    pub fn epoch_ns(&self) -> u64 {
+        self.epoch_ns
     }
 
     pub fn elapsed_ns(&self) -> u64 {
@@ -30,6 +32,5 @@ impl Default for MonoClock {
     }
 }
 
-/// Safety net against a hung setup phase spinning forever. Large because it
-/// counts poll iterations, not milliseconds.
+/// Poll-iteration budget for the setup phase.
 pub const ITER_BUDGET: u64 = 20_000_000_000;

@@ -1,17 +1,7 @@
 /*
- * mininet: a userspace network stack for miniOSv.
- *
- * No sockets, no file descriptors, no libc networking -- mininet polls the
- * NIC queues itself, the way modules/miniext drives NVMe itself. Implemented
- * in Rust (modules/mininet/rust): smoltcp for TCP/IP, rustls for TLS, over
- * minidpdk. This header is the whole C++ surface.
- *
- * One endpoint per image. A worker owns an RSS queue outright, and the source
- * ports it may use are a function of the *peer's* address -- that is what
- * lets it poll one queue with nothing shared and nothing locked. Serving a
- * second host would mean a second set of workers; not implemented.
- *
- * There is no resolver: up() takes the address the caller already knows.
+ * mininet: a userspace network stack for miniOSv (smoltcp + rustls over
+ * minidpdk, in modules/mininet/rust). One endpoint per image, no resolver.
+ * This header is the whole C++ surface.
  */
 
 #ifndef MININET_HH
@@ -22,9 +12,7 @@
 
 namespace mininet {
 
-// Return codes. Negative on failure, so `rc < 0` reads like an errno test --
-// though these are not errnos; none of them has a sensible POSIX spelling.
-// strerror() turns one into a string.
+// Return codes; strerror() names them.
 enum : int {
     OK                = 0,
     E_NO_DEVICE       = -1,   // no usable NIC: absent, or configure/start refused
@@ -43,48 +31,33 @@ enum : int {
 };
 
 struct config {
-    //! `Host:` header and TLS server name. Must be the name the certificate is
-    //! issued for, even though `address` is what gets dialled.
+    //! `Host:` header and TLS server name.
     const char *host;
-    //! Dotted quad, e.g. "3.5.216.240".
+    //! Dotted quad; what gets dialled.
     const char *address;
-    //! 0 dials plain HTTP on port 80, which isolates the network stack from
-    //! the record layer.
+    //! 0 dials plain HTTP on port 80.
     int tls;
-    //! RSS queues, and so worker threads, to ask for. Clamped to what the
-    //! device advertises -- ENA caps queue count per instance size.
-    //!
-    //! 0 means "size it to the machine": one worker per sixteen cpus, at
-    //! least one. A worker owns its cpu, so a fixed 2 cost a 2-vCPU instance
-    //! its whole machine.
+    //! Worker threads (RSS queues), clamped to the device; 0 sizes to the
+    //! machine, one per sixteen cpus.
     uint32_t workers;
-    //! Connection slots per worker. The concurrency ceiling is
-    //! `workers * conns_per_worker` requests in flight; past that, callers
-    //! queue.
+    //! `workers * conns_per_worker` is the in-flight ceiling.
     uint32_t conns_per_worker;
-    //! Per-socket receive buffer, or 0 for the default. This dominates the
-    //! stack's memory: workers * conns_per_worker * rx_buffer.
+    //! Per-socket receive buffer, or 0 for the default.
     uint64_t rx_buffer;
 };
 
-//! Header values are fixed arrays, not pointers, so a response crosses by
-//! value and there is nothing to free. An ETag longer than this is truncated;
-//! callers compare ETags for equality and a truncated one simply fails to
-//! match, which is the safe direction to be wrong in.
+//! Fixed arrays so a response crosses by value; a longer ETag is truncated.
 enum : size_t {
     ETAG_MAX = 128,
     DATE_MAX = 64,
 };
 
 struct response {
-    //! HTTP status, or 0 if no head was read.
+    //! 0 if no head was read.
     uint32_t status;
-    //! What the head said the body was; 0 when it said nothing.
     uint64_t content_length;
     //! Bytes written into the caller's buffer.
     uint64_t bytes;
-    //! Content-Range, when there was one. The three numbers mean nothing when
-    //! this is 0.
     uint32_t has_range;
     uint64_t range_first;
     uint64_t range_last;
@@ -95,43 +68,63 @@ struct response {
     char last_modified[DATE_MAX];
 };
 
-//! Configure and start the NIC, take a DHCP lease, resolve the gateway, and
-//! spawn one worker thread per queue pinned to its own CPU. Call once, at
-//! startup; calling again while up is a no-op.
-//!
-//! The workers poll without yielding, so they want CPUs to themselves: leave
-//! `workers` below the core count and tell the application about the rest.
+//! Start the NIC, take a DHCP lease, resolve the gateway, spawn one pinned
+//! worker per queue. Call once; a second call is a no-op.
 int up(const config &c);
 
 bool is_up();
 
 //! The host the stack was brought up for, or nullptr when it is not up.
-//!
-//! One endpoint per image, so a caller that wants a different host has to
-//! refuse rather than silently fetch from this one. See the note at the top.
 const char *host();
 
-//! Send `head` and write the response body into `buf`.
-//!
-//! `head` is the complete request head -- request line, headers, blank line --
-//! rendered by the caller; mininet carries HTTP, it does not build it.
-//!
-//! Blocks. The calling thread is parked, not spun, so it does not compete for
-//! the CPU a worker is using. Any thread may call this, and many may at once.
-//!
-//! A body larger than `cap` is E_BUFFER_TOO_SMALL: the excess is dropped
-//! rather than written past the end, so this is reported as the failure it
-//! is rather than as a short read.
+//! Send the caller-rendered request `head` and write the body into `buf`.
+//! Blocks (parked); any number of threads may call it at once. A body larger
+//! than `cap` is E_BUFFER_TOO_SMALL.
 int get(const char *head, size_t head_len, void *buf, size_t cap, response *out);
 
 //! Never null.
 const char *strerror(int rc);
 
+//! Cumulative since up(). Per request: queue (submit -> pick-up), wire
+//! (pick-up -> complete), ttfb/xfer (wire split at the first head byte),
+//! get (submitter wall), wake (publish -> submitter running).
 struct conn_stats {
-    //! Requests served, and how many of those reused a connection the peer
-    //! hadn't closed instead of paying for a fresh handshake.
     uint64_t requests_served;
     uint64_t requests_reused;
+    uint64_t requests_retried;
+    uint64_t requests_done;
+    uint64_t queue_ns_total;
+    uint64_t wire_ns_total;
+    uint64_t body_bytes;
+    uint64_t ttfb_ns_total;
+    uint64_t ttfb_n;
+    uint64_t xfer_ns_total;
+    uint64_t xfer_n;
+    uint64_t poll_iters;
+    uint64_t poll_gap_ns_total;
+    uint64_t poll_gap_ns_max;
+    uint64_t poll_gaps_over_1ms;
+    uint64_t poll_busy_ns;
+    uint64_t poll_active_iters;
+    uint64_t poll_work_ns;
+    uint64_t wake_n;
+    uint64_t wake_ns_total;
+    uint64_t wake_ns_max;
+    uint64_t get_calls;
+    uint64_t get_ns_total;
+    uint64_t conns_established;
+    uint64_t conns_failed;
+    uint64_t setup_us_avg;
+    uint64_t setup_us_max;
+    uint64_t dial_us_avg;
+    uint64_t misrouted_drops;
+    uint64_t tx_alloc_fail;
+    uint64_t tx_burst_fail;
+    uint64_t nic_ipackets;
+    uint64_t nic_ibytes;
+    uint64_t nic_imissed;
+    uint64_t nic_ierrors;
+    uint64_t nic_rx_nombuf;
 };
 
 conn_stats stats();

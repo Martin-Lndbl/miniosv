@@ -1,16 +1,6 @@
-//! Requests submitted from other threads, answered by the workers.
-//!
-//! [`Worker`] on its own is driven by whoever owns it: open connections, poll
-//! until they finish, read the results off. That suits a benchmark, which
-//! knows every request before it starts. It does not suit DuckDB, which
-//! discovers the range it wants inside `FileSystem::Read` on an arbitrary
-//! thread and cannot proceed until the bytes are there.
-//!
-//! So a [`Service`] puts each worker on its own thread, polling forever, and
-//! gives everyone else a blocking [`Service::get`]. `FileSystem` has no async
-//! read anywhere in its interface, so concurrency comes from DuckDB's own
-//! threads: N threads in a blocking read is the shape the engine already has,
-//! and the ceiling is `workers * conns_per_worker` requests in flight.
+//! Requests submitted from other threads, answered by the workers: one
+//! polling thread per worker, and a blocking [`Service::get`] for everyone
+//! else. The ceiling is `workers * conns_per_worker` requests in flight.
 
 use alloc::collections::VecDeque;
 use alloc::string::String;
@@ -18,21 +8,18 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::endpoint::{Endpoint, Request};
 use crate::error::Error;
-use crate::ffi::{shim_thread_current, shim_thread_park, shim_thread_unpark};
+use crate::ffi::{shim_thread_current, shim_thread_park, shim_thread_unpark, shim_time_ns};
 use crate::http::{BufferSink, ContentRange};
+use crate::stats;
 use crate::thread;
 use crate::worker::{Worker, WorkerConfig, WorkerHandle};
 use crate::Stack;
 
 /// What a completed request delivered.
-///
-/// Not `Copy`: the header values are owned strings. httpfs compares ETags to
-/// notice an object changing under an open handle, so they have to survive the
-/// connection they arrived on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GetResult {
     pub status: u16,
@@ -51,47 +38,30 @@ const PENDING: u32 = 0;
 const PUBLISHED: u32 = 1;
 const RELEASED: u32 = 2;
 
-/// One request in flight: what the worker needs, and where the answer goes.
-///
-/// It lives on the submitting thread's stack. [`Service::get`] blocks until
-/// the worker is finished with it, so it cannot go away underneath, and
-/// nothing here needs reference counting or an allocation per request.
-///
-/// The two-step handshake exists because of one narrow race. The worker has to
-/// wake the submitter, which means dereferencing a thread handle that the
-/// submitter published. If the worker's store of the result were the only
-/// signal, the submitter could wake, return, and let its thread exit before
-/// the worker's `unpark` ran -- waking a thread that no longer exists. So the
-/// worker marks `PUBLISHED`, wakes, and only then marks `RELEASED`, and the
-/// submitter does not return until it sees `RELEASED`. The wait for that is a
-/// handful of instructions on an already-woken thread.
+/// One request in flight, on the submitting thread's stack. The worker marks
+/// `PUBLISHED`, wakes the submitter, then marks `RELEASED`; the submitter
+/// returns only on `RELEASED`, so the worker never unparks a dead thread.
 struct Slot {
     head: *const u8,
     head_len: usize,
     buf: *mut u8,
     buf_cap: usize,
     discard_ciphertext: bool,
-    /// The submitter's thread, for the worker to wake.
+    submitted_ns: u64,
+    published_ns: AtomicU64,
     waiter: *mut c_void,
     state: AtomicU32,
-    /// Written by the worker before `state` leaves `PENDING`, read by the
-    /// submitter after. The `state` ordering is what makes that safe.
     outcome: UnsafeCell<Option<Result<GetResult, Error>>>,
 }
 
 impl Slot {
-    /// Publish `res` and hand the slot back to the submitter.
-    ///
     /// # Safety
-    ///
-    /// `p` must be a slot this worker took off the queue and has not yet
-    /// released.
+    /// `p` is a slot this worker popped and has not released.
     unsafe fn complete(p: *mut Slot, res: Result<GetResult, Error>) {
         let s = unsafe { &*p };
-        // Copy the handle out first: after the PUBLISHED store the submitter
-        // may already be running, and everything in the slot is racing.
         let waiter = s.waiter;
         unsafe { *s.outcome.get() = Some(res) };
+        s.published_ns.store(unsafe { shim_time_ns() }, Ordering::Relaxed);
         s.state.store(PUBLISHED, Ordering::Release);
         if !waiter.is_null() {
             unsafe { shim_thread_unpark(waiter) };
@@ -100,17 +70,12 @@ impl Slot {
     }
 }
 
-/// Multi-producer, single-consumer handoff to one worker.
-///
-/// A spinlock rather than something cleverer: a push happens once per request,
-/// not once per packet, so this is nowhere near the data path. The worker's
-/// `pop` is the only consumer.
+/// Multi-producer, single-consumer handoff to one worker; one push per request.
 struct Queue {
     lock: AtomicBool,
     items: UnsafeCell<VecDeque<*mut Slot>>,
 }
 
-// SAFETY: every access to `items` is under `lock`.
 unsafe impl Send for Queue {}
 unsafe impl Sync for Queue {}
 
@@ -174,21 +139,14 @@ pub struct Service {
     next: AtomicUsize,
 }
 
-/// Which cpu queue `q`'s worker takes. Counting down from the top, not up
-/// from zero: a worker never yields, so whatever shared its cpu runs at half
-/// speed, and cpu 0 is where the application's own thread starts. Queue index
-/// and cpu index are related only by this function -- the workers poll, so
-/// nothing steers a queue's interrupts anywhere.
+/// Workers take cpus from the top; cpu 0 is where the application starts.
 fn worker_cpu(q: u16) -> usize {
     let cpus = unsafe { crate::ffi::shim_cpu_count() } as usize;
     cpus.saturating_sub(1 + q as usize)
 }
 
 impl Service {
-    /// Spawn a worker per queue, each pinned to a CPU of its own.
-    ///
-    /// The threads are never joined: they poll for the life of the program,
-    /// the way `modules/miniext` never unmounts in practice.
+    /// Spawn a worker per queue, each pinned to a cpu of its own, never joined.
     pub fn start(stack: &Stack, cfg: &ServiceConfig) -> Result<Service, Error> {
         let mut queues = Vec::with_capacity(stack.queues() as usize);
         for q in 0..stack.queues() {
@@ -209,11 +167,7 @@ impl Service {
         })
     }
 
-    /// Send `head` and write the response body into `buf`. Blocks.
-    ///
-    /// `head` is the complete request head; see [`Request`]. The calling
-    /// thread parks rather than spins, so it does not compete with the worker
-    /// for the CPU while it waits.
+    /// Send `head` and write the response body into `buf`. Blocks, parked.
     pub fn get(&self, head: &[u8], buf: &mut [u8]) -> Result<GetResult, Error> {
         self.get_with(head, buf, false)
     }
@@ -228,20 +182,20 @@ impl Service {
         if self.queues.is_empty() {
             return Err(Error::NoDevice);
         }
+        let t0 = unsafe { shim_time_ns() };
         let slot = Slot {
             head: head.as_ptr(),
             head_len: head.len(),
             buf: buf.as_mut_ptr(),
             buf_cap: buf.len(),
             discard_ciphertext,
+            submitted_ns: t0,
+            published_ns: AtomicU64::new(0),
             waiter: unsafe { shim_thread_current() },
             state: AtomicU32::new(PENDING),
             outcome: UnsafeCell::new(None),
         };
 
-        // Round-robin: a worker owns its queue outright, so any of them can
-        // carry any request, and spreading them keeps one worker from being
-        // the whole service's depth.
         let i = self.next.fetch_add(1, Ordering::Relaxed) % self.queues.len();
         self.queues[i].push(&slot as *const Slot as *mut Slot);
 
@@ -249,15 +203,16 @@ impl Service {
         while slot.state.load(Ordering::Acquire) != RELEASED {
             core::hint::spin_loop();
         }
+        let t1 = unsafe { shim_time_ns() };
+        stats::get_finished(
+            t1.saturating_sub(t0),
+            t1.saturating_sub(slot.published_ns.load(Ordering::Relaxed)),
+        );
 
-        // SAFETY: the worker wrote this before the release store above, and is
-        // finished with the slot. `take` rather than a read: GetResult owns
-        // strings now, so the value has to be moved out, not copied.
         unsafe { (*slot.outcome.get()).take() }.unwrap_or(Err(Error::BadResponse))
     }
 }
 
-/// The worker thread body: poll, harvest, refill, forever.
 fn serve(
     handle: WorkerHandle,
     peer: Endpoint,
@@ -275,8 +230,6 @@ fn serve(
     let mut w = match Worker::new(handle, &cfg) {
         Ok(w) => w,
         Err(e) => {
-            // Nothing can be served from this queue. Fail every request that
-            // arrives rather than leaving submitters parked forever.
             println!("FAIL: q{}: {}", queue_id, e);
             loop {
                 if let Some(p) = queue.pop() {
@@ -287,17 +240,24 @@ fn serve(
         }
     };
 
-    // The slot, whether its attempt went out on a reused socket, and whether
-    // it has already been retried once.
-    let mut pending: Vec<Option<(*mut Slot, bool, bool)>> = Vec::new();
+    // (slot, was_reused, retried, picked_up_ns)
+    let mut pending: Vec<Option<(*mut Slot, bool, bool, u64)>> = Vec::new();
     pending.resize(w.slots(), None);
+    let epoch_ns = w.clock().epoch_ns();
+    let mut prev_poll_ns = 0u64;
+    let mut acc = stats::PollAcc::default();
 
     loop {
         w.poll();
+        let now_ns = w.last_poll_ns();
+        if prev_poll_ns != 0 {
+            acc.tick(now_ns.saturating_sub(prev_poll_ns), w.last_busy_ns(), w.last_active());
+        }
+        prev_poll_ns = now_ns;
 
         for slot in 0..w.slots() {
             match pending[slot] {
-                Some((p, was_reused, retried)) => {
+                Some((p, was_reused, retried, started_ns)) => {
                     let done = w.conn(slot).and_then(|c| c.outcome());
                     if let Some(step) = done {
                         let res = match step {
@@ -319,15 +279,8 @@ fn serve(
                             crate::Step::Failed(e) => Err(e),
                             crate::Step::Pending => unreachable!("outcome() is terminal"),
                         };
-                        // A keep-alive connection the peer closed while it was
-                        // idle stays Established until its FIN arrives, so a
-                        // request can go out on a socket that is already gone
-                        // and come back as a failure. That is a race, not an
-                        // answer: dial again and re-send. Once only, and only
-                        // for a socket we reused -- a fresh connection failing
-                        // this way is a real fault -- and only because every
-                        // request here is a GET or a HEAD, which are safe to
-                        // repeat.
+                        // A reused socket the peer had already closed: re-dial
+                        // once. GET and HEAD are safe to repeat.
                         if was_reused && !retried && matches!(step, crate::Step::Failed(_)) {
                             let s = unsafe { &*p };
                             let head =
@@ -338,22 +291,25 @@ fn serve(
                             };
                             w.release(slot);
                             if w.connect_next(slot, &req).is_ok() {
+                                stats::request_retried();
                                 let sink = unsafe { BufferSink::new(s.buf, s.buf_cap) };
                                 if let Some(c) = w.conn_mut(slot) {
                                     c.set_sink(alloc::boxed::Box::new(sink));
                                 }
-                                pending[slot] = Some((p, false, true));
+                                pending[slot] = Some((p, false, true, started_ns));
                                 continue;
                             }
-                            // Could not re-dial: report the original failure
-                            // rather than inventing one about the retry.
                         }
+                        let head_ns = w.conn(slot).and_then(|c| c.head_ns()).map(|h| h + epoch_ns);
+                        stats::request_finished(
+                            started_ns.saturating_sub(unsafe { (*p).submitted_ns }),
+                            now_ns.saturating_sub(started_ns),
+                            res.as_ref().map_or(0, |g| g.written),
+                            head_ns.map(|h| h.saturating_sub(started_ns)),
+                            head_ns.map(|h| now_ns.saturating_sub(h)),
+                        );
                         unsafe { Slot::complete(p, res) };
                         pending[slot] = None;
-                        // A connection the peer hasn't closed stays open for
-                        // the next request on this slot instead of paying for
-                        // a fresh handshake; one that failed, or that the peer
-                        // already closed, still frees its port.
                         if !w.idle_reusable(slot) {
                             w.release(slot);
                         }
@@ -364,8 +320,6 @@ fn serve(
                         Some(p) => p,
                         None => continue,
                     };
-                    // SAFETY: the submitter is parked and the slot is its
-                    // stack frame, which it cannot leave until we release it.
                     let s = unsafe { &*p };
                     let head = unsafe { core::slice::from_raw_parts(s.head, s.head_len) };
                     let req = Request {
@@ -376,12 +330,8 @@ fn serve(
                     let opened = if reusing {
                         w.reuse(slot, &req)
                     } else {
-                        // The socket can still be open here. It was reusable
-                        // when the last request finished, so it was kept
-                        // rather than released -- and the peer closed it in
-                        // the meantime, leaving it in CloseWait. connect()
-                        // refuses anything that is not Closed, so hand the
-                        // socket back before dialling on it again.
+                        // A kept socket the peer since closed sits in CloseWait;
+                        // connect() needs Closed.
                         w.release(slot);
                         w.connect_next(slot, &req)
                     };
@@ -391,7 +341,7 @@ fn serve(
                             if let Some(c) = w.conn_mut(slot) {
                                 c.set_sink(alloc::boxed::Box::new(sink));
                             }
-                            pending[slot] = Some((p, reusing, false));
+                            pending[slot] = Some((p, reusing, false, now_ns));
                         }
                         Err(e) => unsafe { Slot::complete(p, Err(e)) },
                     }
