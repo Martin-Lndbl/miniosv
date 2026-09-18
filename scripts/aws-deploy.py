@@ -177,34 +177,6 @@ def stream_console(ec2_client, instance_id, poll_interval=5):
         time.sleep(poll_interval)
 
 
-def launch(ec2_client, run_kwargs: dict, spot: bool) -> tuple[dict, str]:
-    """run_instances, on the market asked for. Spot is a one-time request at
-    the default max price (the on-demand rate), terminated if reclaimed; a
-    bench run is minutes and a c6in.16xlarge costs about a tenth that way.
-    There is no fallback: a run that asked for spot and got on-demand would
-    be billed at ten times what was expected, so it fails instead."""
-    if not spot:
-        return ec2_client.run_instances(**run_kwargs), "on-demand"
-    kwargs = dict(
-        run_kwargs,
-        InstanceMarketOptions={
-            "MarketType": "spot",
-            "SpotOptions": {
-                "SpotInstanceType": "one-time",
-                "InstanceInterruptionBehavior": "terminate",
-            },
-        },
-    )
-    try:
-        return ec2_client.run_instances(**kwargs), "spot"
-    except ClientError as e:
-        err = e.response.get("Error", {})
-        raise SystemExit(
-            f"spot requested but not provided: {err.get('Code')}: "
-            f"{err.get('Message')} (drop --spot to run on-demand)"
-        ) from e
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("src", nargs="?", default="build/last/loader.img",
@@ -215,8 +187,6 @@ def main():
     parser.add_argument("--subnet", help="VPC subnet ID to launch into (needed for buckets locked to a VPC endpoint)")
     parser.add_argument("--security-group", action="append", default=[],
                         help="Security group ID to attach; may be repeated. Required when --subnet is set unless the subnet's default SG is acceptable.")
-    parser.add_argument("--spot", action="store_true",
-                        help="Launch a one-time spot instance; fails if spot cannot be provided")
     args = parser.parse_args()
 
     aws_login()
@@ -357,15 +327,10 @@ def main():
         run_kwargs["SubnetId"] = args.subnet
     if args.security_group:
         run_kwargs["SecurityGroupIds"] = args.security_group
-    try:
-        run_response, market = launch(ec2_client, run_kwargs, args.spot)
-    except (SystemExit, ClientError):
-        # Nothing is running yet, but the AMI and snapshot already exist.
-        cleanup_aws_resources(ec2_client, ami_id=ami_id, snapshot_id=snapshot_id)
-        raise
+    run_response = ec2_client.run_instances(**run_kwargs)
 
     instance_id = run_response["Instances"][0]["InstanceId"]
-    print(f"Launched instance: {instance_id} ({market})")
+    print(f"Launched instance: {instance_id}")
 
     with open("aws/.instance-id", "w") as f:
         f.write(instance_id)
@@ -377,8 +342,7 @@ def main():
     inst = desc["Reservations"][0]["Instances"][0]
     public_dns = inst.get("PublicDnsName") or "(none)"
     public_ip = inst.get("PublicIpAddress") or "(none)"
-    # The bench drivers parse this line: the id, and the market it came from.
-    print(f"Instance running: {instance_id} ({instance}, {market})")
+    print(f"Instance running: {instance_id} ({instance})")
     print(f"  Public DNS: {public_dns}")
     print(f"  Public IP:  {public_ip}")
 
