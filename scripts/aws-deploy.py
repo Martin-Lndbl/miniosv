@@ -332,7 +332,9 @@ def main():
     print("Snapshot status is now 'completed'.")
 
     base_name = os.path.basename(src).rsplit('.', 1)[0]
-    ami_name = f"miniosv-{base_name}-{int(time.time())}"
+    # Milliseconds and the pid: two deploys from two checkouts in the same
+    # second collided on the name (InvalidAMIName.Duplicate, 2026-09-18).
+    ami_name = f"miniosv-{base_name}-{int(time.time() * 1000)}-{os.getpid()}"
 
     print(f"Registering AMI: {ami_name}...")
     ami_response = ec2_client.register_image(
