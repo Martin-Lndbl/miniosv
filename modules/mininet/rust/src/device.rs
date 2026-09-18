@@ -16,6 +16,9 @@ pub(crate) const MTU: usize = 1514;
 /// RX drains up to this many mbufs per burst.
 pub(crate) const RX_BURST: usize = 32;
 const TX_BATCH: usize = 32;
+/// Flush attempts before a frame is dropped because the ring never took the
+/// batch: each is a doorbell plus a completion sweep, so this is milliseconds.
+const TX_FULL_SPINS: u32 = 10_000;
 
 pub(crate) struct DpdkDevice {
     pub(crate) queue_id: u16,
@@ -63,7 +66,10 @@ impl DpdkDevice {
         }
     }
 
-    /// Hand the batched frames to the NIC.
+    /// Hand the batched frames to the NIC. What the ring will not take stays
+    /// at the front of the batch for the next flush: a poll that ACKs a few
+    /// thousand segments at once outruns a 1024-entry ring, and dropping the
+    /// rest cost the sender its ACKs.
     pub fn flush_tx(&mut self) {
         if self.tx_len == 0 {
             return;
@@ -71,11 +77,14 @@ impl DpdkDevice {
         let sent = unsafe {
             shim_mbuf_tx_burst(PORT, self.queue_id, self.tx_handles.as_mut_ptr(), self.tx_lens.as_ptr(), self.tx_len as u16)
         } as usize;
-        for _ in sent..self.tx_len {
-            stats::tx_burst_fail();
+        self.tx_pkts += sent as u64;
+        let held = self.tx_len - sent;
+        if held > 0 {
+            stats::tx_held(held as u64);
+            self.tx_handles.copy_within(sent..self.tx_len, 0);
+            self.tx_lens.copy_within(sent..self.tx_len, 0);
         }
-        self.tx_pkts += self.tx_len as u64;
-        self.tx_len = 0;
+        self.tx_len = held;
     }
 
     /// Packets received and transmitted since the last call.
@@ -158,6 +167,23 @@ impl Drop for DpdkRxToken {
 
 impl TxToken for DpdkTxToken<'_> {
     fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
+        // The token that comes with a received frame cannot be refused, so a
+        // full batch has to be pushed into the ring here. The ring drains by
+        // DMA at its own pace; wait on it briefly rather than lose the frame.
+        let mut spins = 0u32;
+        while self.dev.tx_len == TX_BATCH && spins < TX_FULL_SPINS {
+            self.dev.flush_tx();
+            spins += 1;
+            core::hint::spin_loop();
+        }
+        if self.dev.tx_len == TX_BATCH {
+            // Still full: the NIC is not taking anything. Count it as a drop
+            // with the no-mbuf ones; smoltcp still wants `f` called.
+            stats::tx_alloc_fail();
+            let mut scratch = [0u8; MTU];
+            let n = core::cmp::min(len, scratch.len());
+            return f(&mut scratch[..n]);
+        }
         let mut handle: *mut c_void = ptr::null_mut();
         let mut cap: u16 = 0;
         let data = unsafe { shim_mbuf_alloc_tx(self.dev.pool, self.dev.queue_id, &mut handle, &mut cap) };
@@ -229,7 +255,15 @@ impl Device for DpdkDevice {
         }
     }
 
+    /// `None` while the batch is full and the ring will not drain it: smoltcp
+    /// then keeps the frame for its next poll instead of losing it.
     fn transmit(&mut self, _t: Instant) -> Option<Self::TxToken<'_>> {
+        if self.tx_len == TX_BATCH {
+            self.flush_tx();
+            if self.tx_len == TX_BATCH {
+                return None;
+            }
+        }
         Some(DpdkTxToken { dev: self })
     }
 
