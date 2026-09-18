@@ -511,10 +511,38 @@ void cpu::idle()
     }
 
     while (true) {
+        idling.store(true, std::memory_order_relaxed);
         do_idle();
+        idling.store(false, std::memory_order_relaxed);
         // We have idle priority, so this runs the thread on the runqueue:
         schedule();
     }
+}
+
+// The next idle, unreserved cpu after `from`, or nullptr.
+static cpu *idle_cpu_after(unsigned from)
+{
+    unsigned n = cpus.size();
+    for (unsigned i = 1; i < n; i++) {
+        cpu *c = cpus[(from + i) % n];
+        if (c->idling.load(std::memory_order_relaxed) &&
+            !c->reserved.load(std::memory_order_relaxed)) {
+            return c;
+        }
+    }
+    return nullptr;
+}
+
+// Where a thread waking up here should run instead, if this cpu is busy
+// with another thread and one idles. Nullptr keeps it here.
+cpu *cpu::forward_to(thread &t)
+{
+    thread *cur = thread::current();
+    if (cur == idle_thread || cur->_detached_state->st.load(std::memory_order_relaxed) != thread::status::running ||
+        !t.migratable() || t.pinned()) {
+        return nullptr;
+    }
+    return idle_cpu_after(id);
 }
 
 void cpu::handle_incoming_wakeups()
@@ -540,6 +568,20 @@ void cpu::handle_incoming_wakeups()
                 } else if (t.tcpu() != this) {
                     // Thread was woken on the wrong cpu. Can be a side-effect
                     // of sched::thread::pin(thread*, cpu*). Do nothing.
+                } else if (cpu *alt = forward_to(t)) {
+                    // This cpu is busy and another idles: the thread would
+                    // wait out a slice here. The same steps the load balancer
+                    // used, on the cpu whose timer list holds the thread.
+                    trace_sched_migrate(&t, alt->id);
+                    t.stat_migrations.incr();
+                    t.suspend_timers();
+                    t._runtime.export_runtime();
+                    t._detached_state->_cpu = alt;
+                    t.remote_thread_local_var(::percpu_base) = alt->percpu_base;
+                    t.remote_thread_local_var(current_cpu) = alt;
+                    alt->incoming_wakeups[id].push_back(t);
+                    alt->incoming_wakeups_mask.set(id);
+                    alt->send_wakeup_ipi();
                 } else {
                     t._detached_state->st.store(thread::status::queued);
                     // Make sure the CPU-local runtime measure is suitably
