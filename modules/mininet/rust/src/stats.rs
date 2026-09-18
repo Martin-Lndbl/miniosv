@@ -139,8 +139,9 @@ pub(crate) fn dist_of(samples_ns: &[u64]) -> Dist {
 pub struct Stats {
     /// Nonzero means the RSS model no longer matches the hardware.
     pub misrouted_drops: u64,
-    /// Frames smoltcp believes it sent and the NIC never got.
+    /// Frames smoltcp believes it sent and the NIC never got (no mbuf).
     pub tx_alloc_fail: u64,
+    /// Frames the TX ring would not take at once; held and sent next poll.
     pub tx_burst_fail: u64,
     pub conns_established: u64,
     pub conns_failed: u64,
@@ -332,8 +333,10 @@ pub(crate) fn misrouted_drop() {
 pub(crate) fn tx_alloc_fail() {
     TX_ALLOC_FAIL.fetch_add(1, Ordering::Relaxed);
 }
-pub(crate) fn tx_burst_fail() {
-    TX_BURST_FAIL.fetch_add(1, Ordering::Relaxed);
+/// Frames the TX ring would not take in the poll that made them; they are
+/// retried next poll, so this counts delay, not loss.
+pub(crate) fn tx_held(n: u64) {
+    TX_BURST_FAIL.fetch_add(n, Ordering::Relaxed);
 }
 pub(crate) fn conn_established(setup_ns: u64) {
     CONNS_ESTABLISHED.fetch_add(1, Ordering::Relaxed);

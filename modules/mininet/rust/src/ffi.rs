@@ -62,7 +62,6 @@ extern "C" {
     pub fn shim_eth_stats(port_id: u16, out: *mut u64, n: u16) -> c_int;
 
     pub fn shim_thread_spawn(f: extern "C" fn(*mut c_void), arg: *mut c_void, cpu_id: c_int) -> *mut c_void;
-    #[cfg(feature = "selftest")]
     pub fn shim_thread_join(handle: *mut c_void);
     pub fn shim_thread_current() -> *mut c_void;
     pub fn shim_thread_park(flag: *const u32);

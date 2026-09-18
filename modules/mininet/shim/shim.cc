@@ -180,9 +180,10 @@ uint16_t shim_mbuf_tx_burst(uint16_t port_id, uint16_t queue_id, void **handles,
     ena_tx_offload_prepare(m, rte_pktmbuf_mtod(m, uint8_t *), lens[i]);
     ms[i] = m;
   }
-  uint16_t sent = rte_eth_tx_burst(port_id, queue_id, ms, n);
-  for (uint16_t i = sent; i < n; i++) rte_pktmbuf_free(ms[i]);
-  return sent;
+  // What the ring would not take stays with the caller, which retries it on
+  // its next flush; freeing it here dropped ACKs whenever one poll produced
+  // more frames than the TX ring holds (1024 on c6in.16xlarge).
+  return rte_eth_tx_burst(port_id, queue_id, ms, n);
 }
 
 void shim_mbuf_free(void *handle) {
