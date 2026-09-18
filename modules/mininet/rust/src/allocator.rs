@@ -2,52 +2,33 @@
 
 use core::alloc::{GlobalAlloc, Layout};
 
-use crate::ffi::{shim_free, shim_malloc, shim_realloc};
+use crate::ffi::{shim_aligned_alloc, shim_free, shim_malloc, shim_realloc};
 
 struct ShimAllocator;
 
-/// Over-aligned requests stash the raw pointer just before the aligned slot.
 unsafe impl GlobalAlloc for ShimAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if layout.align() <= 16 {
-            return unsafe { shim_malloc(layout.size() as u64) };
+            unsafe { shim_malloc(layout.size() as u64) }
+        } else {
+            unsafe { shim_aligned_alloc(layout.align() as u64, layout.size() as u64) }
         }
-        let extra = layout.align() + core::mem::size_of::<*mut u8>();
-        let raw = unsafe { shim_malloc((layout.size() + extra) as u64) };
-        if raw.is_null() {
-            return raw;
-        }
-        let raw_addr = raw as usize + core::mem::size_of::<*mut u8>();
-        let aligned = (raw_addr + layout.align() - 1) & !(layout.align() - 1);
-        unsafe {
-            *((aligned - core::mem::size_of::<*mut u8>()) as *mut *mut u8) = raw;
-        }
-        aligned as *mut u8
     }
 
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if layout.align() <= 16 {
-            unsafe { shim_free(ptr) };
-        } else {
-            unsafe {
-                let slot = (ptr as usize - core::mem::size_of::<*mut u8>()) as *mut *mut u8;
-                shim_free(*slot);
-            }
-        }
+    unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
+        unsafe { shim_free(ptr) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         if layout.align() <= 16 {
             return unsafe { shim_realloc(ptr, new_size as u64) };
         }
-        let new_layout = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
-        let new_ptr = unsafe { self.alloc(new_layout) };
-        if !new_ptr.is_null() {
-            let copy = core::cmp::min(layout.size(), new_size);
-            unsafe { core::ptr::copy_nonoverlapping(ptr, new_ptr, copy) };
-            unsafe { self.dealloc(ptr, layout) };
+        let new = unsafe { self.alloc(Layout::from_size_align_unchecked(new_size, layout.align())) };
+        if !new.is_null() {
+            unsafe { core::ptr::copy_nonoverlapping(ptr, new, layout.size().min(new_size)) };
+            unsafe { shim_free(ptr) };
         }
-        new_ptr
+        new
     }
 }
 

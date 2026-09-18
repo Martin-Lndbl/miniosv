@@ -11,10 +11,10 @@ use core::ffi::c_void;
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-use crate::endpoint::{Endpoint, Request};
+use crate::endpoint::Endpoint;
 use crate::error::Error;
 use crate::ffi::{shim_thread_current, shim_thread_park, shim_thread_unpark, shim_time_ns};
-use crate::http::{BufferSink, ContentRange};
+use crate::http::{BodySink, BufferSink, ContentRange};
 use crate::stats;
 use crate::thread;
 use crate::worker::{Worker, WorkerConfig, WorkerHandle};
@@ -47,7 +47,6 @@ struct Slot {
     head_len: usize,
     buf: *mut u8,
     buf_cap: usize,
-    discard_ciphertext: bool,
     submitted_ns: u64,
     published_ns: AtomicU64,
     waiter: *mut c_void,
@@ -63,7 +62,6 @@ impl Slot {
             head_len: 0,
             buf: ptr::null_mut(),
             buf_cap: 0,
-            discard_ciphertext: false,
             submitted_ns: 0,
             published_ns: AtomicU64::new(0),
             waiter: ptr::null_mut(),
@@ -203,16 +201,6 @@ impl Service {
 
     /// Send `head` and write the response body into `buf`. Blocks, parked.
     pub fn get(&self, head: &[u8], buf: &mut [u8]) -> Result<GetResult, Error> {
-        self.get_with(head, buf, false)
-    }
-
-    /// As [`Service::get`], with the record-layer diagnostic from [`Request`].
-    pub fn get_with(
-        &self,
-        head: &[u8],
-        buf: &mut [u8],
-        discard_ciphertext: bool,
-    ) -> Result<GetResult, Error> {
         if self.queues.is_empty() {
             return Err(Error::NoDevice);
         }
@@ -223,7 +211,6 @@ impl Service {
             head_len: head.len(),
             buf: buf.as_mut_ptr(),
             buf_cap: buf.len(),
-            discard_ciphertext,
             submitted_ns: t0,
             published_ns: AtomicU64::new(0),
             waiter: unsafe { shim_thread_current() },
@@ -252,6 +239,7 @@ impl Service {
 
 /// Producers on their own threads, one consumer here: every slot pushed comes
 /// out exactly once. Returns (received, duplicates, expected).
+#[cfg(feature = "selftest")]
 pub(crate) fn queue_selftest() -> (u64, u64, u64) {
     const PRODUCERS: usize = 4;
     const EACH: usize = 4000;
@@ -298,6 +286,31 @@ pub(crate) fn queue_selftest() -> (u64, u64, u64) {
     (got, dups, total)
 }
 
+/// One producer: pops come out in push order.
+#[cfg(feature = "selftest")]
+pub(crate) fn queue_fifo_selftest() -> bool {
+    let q = Queue::new();
+    let mut ordered = q.pop().is_none();
+    let slots: Vec<*mut Slot> = (1..=64usize)
+        .map(|i| {
+            let s = Box::into_raw(Box::new(Slot::stub()));
+            unsafe { (*s).head_len = i };
+            s
+        })
+        .collect();
+    for &s in &slots {
+        q.push(s);
+    }
+    for i in 1..=64usize {
+        ordered &= q.pop().map_or(false, |p| unsafe { (*p).head_len } == i);
+    }
+    ordered &= q.pop().is_none();
+    for s in slots {
+        drop(unsafe { Box::from_raw(s) });
+    }
+    ordered
+}
+
 #[derive(Clone, Copy)]
 struct Pending {
     slot: *mut Slot,
@@ -306,18 +319,12 @@ struct Pending {
     picked_ns: u64,
 }
 
-fn request_of(s: &Slot) -> Request<'_> {
-    Request {
-        head: unsafe { core::slice::from_raw_parts(s.head, s.head_len) },
-        discard_ciphertext: s.discard_ciphertext,
-    }
+fn head_of(s: &Slot) -> &[u8] {
+    unsafe { core::slice::from_raw_parts(s.head, s.head_len) }
 }
 
-fn attach_sink(w: &mut Worker, slot: usize, s: &Slot) {
-    let sink = unsafe { BufferSink::new(s.buf, s.buf_cap) };
-    if let Some(c) = w.conn_mut(slot) {
-        c.set_sink(Box::new(sink));
-    }
+fn sink_of(s: &Slot) -> Box<dyn BodySink> {
+    Box::new(unsafe { BufferSink::new(s.buf, s.buf_cap) })
 }
 
 fn result_of(c: &mut crate::Conn) -> Result<GetResult, Error> {
@@ -351,7 +358,7 @@ fn serve(
     let mut w = match Worker::new(handle, &cfg) {
         Ok(w) => w,
         Err(e) => {
-            println!("FAIL: q{}: {}", queue_id, e);
+            println!("FAIL: q{}: {:?}", queue_id, e);
             loop {
                 if let Some(p) = queue.pop() {
                     unsafe { Slot::complete(p, Err(e)) };
@@ -385,19 +392,17 @@ fn serve(
             let Some(pd) = pending[slot] else {
                 let Some(p) = queue.pop() else { continue };
                 let s = unsafe { &*p };
-                let req = request_of(s);
                 let reused = w.idle_reusable(slot);
                 let opened = if reused {
-                    w.reuse(slot, &req)
+                    w.reuse(slot, head_of(s), sink_of(s))
                 } else {
                     // A kept socket the peer since closed sits in CloseWait;
                     // connect() needs Closed.
                     w.release(slot);
-                    w.connect_next(slot, &req)
+                    w.connect_next(slot, head_of(s), sink_of(s))
                 };
                 match opened {
                     Ok(()) => {
-                        attach_sink(&mut w, slot, s);
                         pending[slot] = Some(Pending { slot: p, reused, retried: false, picked_ns: now_ns });
                     }
                     Err(e) => unsafe { Slot::complete(p, Err(e)) },
@@ -415,9 +420,8 @@ fn serve(
             if pd.reused && !pd.retried && matches!(step, crate::Step::Failed(_)) {
                 let s = unsafe { &*pd.slot };
                 w.release(slot);
-                if w.connect_next(slot, &request_of(s)).is_ok() {
+                if w.connect_next(slot, head_of(s), sink_of(s)).is_ok() {
                     stats::request_retried();
-                    attach_sink(&mut w, slot, s);
                     pending[slot] = Some(Pending { reused: false, retried: true, ..pd });
                     continue;
                 }

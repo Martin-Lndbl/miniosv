@@ -1,4 +1,5 @@
-//! Bringing port 0 up, and reading its counters back.
+//! Bringing port 0 up, and reading its counters back. Nothing here is undone:
+//! the port and its pools live as long as the image.
 
 use alloc::vec::Vec;
 use core::fmt::Write;
@@ -6,26 +7,18 @@ use core::fmt::Write;
 use crate::device::RX_BURST;
 use crate::error::Error;
 use crate::ffi::{
-    rte_pktmbuf_pool, shim_adjust_nb_rx_tx_desc, shim_dev_start, shim_dev_stop,
-    shim_eth_dev_configure, shim_eth_qstats, shim_eth_stats, shim_get_dev_info, shim_macaddr_get,
-    shim_mempool_free, shim_pktmbuf_pool_create, shim_rx_queue_setup, shim_tx_queue_setup, PORT,
+    rte_pktmbuf_pool, shim_adjust_nb_rx_tx_desc, shim_dev_start, shim_eth_dev_configure,
+    shim_eth_stats, shim_get_dev_info, shim_macaddr_get, shim_pktmbuf_pool_create,
+    shim_rx_queue_setup, shim_tx_queue_setup, PORT,
 };
 use crate::print::BufWriter;
 
-/// Owns one queue's mempool; freed with the [`crate::Stack`].
+/// One queue's mempool.
 pub(crate) struct PktPool(*mut rte_pktmbuf_pool);
 
 impl PktPool {
     pub(crate) fn as_ptr(&self) -> *mut rte_pktmbuf_pool {
         self.0
-    }
-}
-
-impl Drop for PktPool {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe { shim_mempool_free(self.0) };
-        }
     }
 }
 
@@ -98,10 +91,6 @@ pub(crate) fn probe_and_open(n_queues: u16) -> Result<(Vec<PktPool>, [u8; 6]), E
     Ok((pools, mac))
 }
 
-pub(crate) fn dev_stop() {
-    unsafe { shim_dev_stop(PORT) };
-}
-
 /// Device counters. A SYN-ACK dropped for want of a descriptor (imissed) is invisible above.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NicStats {
@@ -130,15 +119,4 @@ pub fn eth_stats() -> Option<NicStats> {
         oerrors: st[6],
         rx_nombuf: st[7],
     })
-}
-
-/// Per-queue inbound packet and error counts; returns how many the device reported.
-pub fn eth_qstats(ipkts: &mut [u64], errs: &mut [u64]) -> usize {
-    let n = core::cmp::min(ipkts.len(), errs.len());
-    let rc = unsafe { shim_eth_qstats(PORT, ipkts.as_mut_ptr(), errs.as_mut_ptr(), n as u16) };
-    if rc <= 0 {
-        0
-    } else {
-        core::cmp::min(rc as usize, n)
-    }
 }

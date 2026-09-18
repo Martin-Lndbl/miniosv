@@ -87,7 +87,7 @@ impl DpdkDevice {
     }
 
     /// True if the frame should be passed up.
-    fn accepts(&self, bytes: &[u8]) -> bool {
+    pub(crate) fn accepts(&self, bytes: &[u8]) -> bool {
         let owned = match &self.owned_ports {
             Some(o) => o,
             None => return true,

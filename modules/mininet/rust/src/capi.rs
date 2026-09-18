@@ -59,7 +59,6 @@ pub struct mininet_config {
     pub tls: c_int,
     pub workers: u32,
     pub conns_per_worker: u32,
-    pub rx_buffer: u64,
 }
 
 /// Mirrors `mininet::response`.
@@ -79,7 +78,7 @@ pub struct mininet_response {
     pub last_modified: [c_char; DATE_MAX],
 }
 
-fn set_cstr(dst: &mut [c_char], src: Option<&str>) {
+pub(crate) fn set_cstr(dst: &mut [c_char], src: Option<&str>) {
     dst.fill(0);
     let src = match src {
         Some(s) => s.as_bytes(),
@@ -98,7 +97,7 @@ unsafe fn cstr<'a>(p: *const c_char) -> Option<&'a str> {
     unsafe { CStr::from_ptr(p) }.to_str().ok()
 }
 
-fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
+pub(crate) fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
     let mut out = [0u8; 4];
     let mut parts = 0;
     for (i, field) in s.split('.').enumerate() {
@@ -146,7 +145,6 @@ pub extern "C" fn mininet_up(cfg: *const mininet_config) -> c_int {
     let peer = Endpoint::new(ip, host, cfg.tls != 0);
 
     let stack = match Stack::up(&Config {
-        // 0 means "pick for me"; see auto_workers().
         queues: cfg.workers.min(u16::MAX as u32) as u16,
     }) {
         Ok(s) => s,
@@ -155,9 +153,6 @@ pub extern "C" fn mininet_up(cfg: *const mininet_config) -> c_int {
 
     let mut scfg = ServiceConfig::new(peer);
     scfg.conns_per_worker = cfg.conns_per_worker.max(1) as usize;
-    if cfg.rx_buffer > 0 {
-        scfg.rx_buffer = cfg.rx_buffer as usize;
-    }
     let svc = match Service::start(&stack, &scfg) {
         Ok(s) => s,
         Err(e) => return code(e),
@@ -278,6 +273,7 @@ pub extern "C" fn mininet_conn_stats() -> crate::stats::Stats {
 /// Needs no NIC and no network: it is the parser, the body sink and the
 /// completion rule, exercised against buffers this function allocates itself.
 /// Driven by `test/os-mininet.cc` under `make app=test`.
+#[cfg(feature = "selftest")]
 #[unsafe(no_mangle)]
 pub extern "C" fn mininet_selftest(verbose: c_int) -> u32 {
     crate::selftest::run(verbose != 0)

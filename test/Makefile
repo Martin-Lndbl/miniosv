@@ -28,6 +28,7 @@ app-objects += test/os-memory.o
 app-objects += test/os-memory-primitives.o
 app-objects += test/os-stress.o
 
+mininet-features := selftest
 include modules/mininet/mininet.mk
 app-objects += test/os-mininet.o
 app-objects += $(mininet-lib-objects)

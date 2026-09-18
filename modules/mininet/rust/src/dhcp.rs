@@ -13,7 +13,7 @@ use crate::arp;
 use crate::clock::{MonoClock, ITER_BUDGET};
 use crate::device::DpdkDevice;
 use crate::error::Error;
-use crate::ffi::{rte_pktmbuf_pool, shim_mbuf_alloc_tx, shim_mbuf_free, shim_mbuf_rx_burst_n, shim_mbuf_tx};
+use crate::ffi::{rte_pktmbuf_pool, shim_mbuf_alloc_tx, shim_mbuf_free, shim_mbuf_rx_burst_n, shim_mbuf_tx_burst};
 
 fn acquire(
     iface: &mut Interface,
@@ -95,7 +95,7 @@ pub(crate) fn learn_network(
         }
         let n = core::cmp::min(req.len(), cap as usize);
         core::ptr::copy_nonoverlapping(req.as_ptr(), data, n);
-        let _ = shim_mbuf_tx(0, 0, handle, n as u16);
+        let _ = shim_mbuf_tx_burst(0, 0, &mut handle, &(n as u16), 1);
     }
 
     let mut iter: u64 = 0;
