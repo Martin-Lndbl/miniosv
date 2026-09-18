@@ -519,14 +519,16 @@ void cpu::idle()
     }
 }
 
-// The next idle, unreserved cpu after `from`, or nullptr.
+// The next idle, unreserved cpu after `from`, or nullptr. Claimed: the flag
+// is cleared here, so two wakeups in the same microsecond take two cpus.
 static cpu *idle_cpu_after(unsigned from)
 {
     unsigned n = cpus.size();
     for (unsigned i = 1; i < n; i++) {
         cpu *c = cpus[(from + i) % n];
-        if (c->idling.load(std::memory_order_relaxed) &&
-            !c->reserved.load(std::memory_order_relaxed)) {
+        bool idle = true;
+        if (!c->reserved.load(std::memory_order_relaxed) &&
+            c->idling.compare_exchange_strong(idle, false, std::memory_order_relaxed)) {
             return c;
         }
     }
