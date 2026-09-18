@@ -36,13 +36,14 @@ pub(crate) fn clamp_queues(requested: u16) -> u16 {
 }
 
 /// Configure and start port 0 with `n_queues` RX+TX queues and per-queue mempools.
-pub(crate) fn probe_and_open(n_queues: u16) -> Result<(Vec<PktPool>, [u8; 6]), Error> {
+pub(crate) fn probe_and_open(n_queues: u16, rx_desc: u16) -> Result<(Vec<PktPool>, [u8; 6]), Error> {
     const DATA_ROOM_SIZE: u16 = 1536;
     // 1024 descriptors dropped 3.3% of inbound frames (imissed) between polls.
     const DESC_NUM: u16 = 4096;
     const CACHE: u32 = 64;
+    let rx_want = if rx_desc == 0 { DESC_NUM } else { rx_desc };
     // Every simultaneous holder: RX ring, TX ring awaiting reclaim, cache, RX burst.
-    let per_queue_size: u32 = (DESC_NUM as u32) * 2 + CACHE + RX_BURST as u32 + 512;
+    let per_queue_size: u32 = (rx_want as u32) + (DESC_NUM as u32) + CACHE + RX_BURST as u32 + 512;
 
     let mut pools: Vec<PktPool> = Vec::with_capacity(n_queues as usize);
     for q in 0..n_queues {
@@ -60,13 +61,13 @@ pub(crate) fn probe_and_open(n_queues: u16) -> Result<(Vec<PktPool>, [u8; 6]), E
     if unsafe { shim_eth_dev_configure(PORT, n_queues, n_queues) } != 0 {
         return Err(Error::NoDevice);
     }
-    let (mut rx_desc, mut tx_desc) = (DESC_NUM, DESC_NUM);
+    let (mut rx_desc, mut tx_desc) = (rx_want, DESC_NUM);
     unsafe { shim_adjust_nb_rx_tx_desc(PORT, &mut rx_desc, &mut tx_desc) };
     // What was granted, not what was asked.
-    if rx_desc != DESC_NUM || tx_desc != DESC_NUM {
+    if rx_desc != rx_want || tx_desc != DESC_NUM {
         println!(
-            "descriptors: asked {}, got rx {} tx {} (device clamp)",
-            DESC_NUM, rx_desc, tx_desc
+            "descriptors: asked rx {} tx {}, got rx {} tx {} (device clamp)",
+            rx_want, DESC_NUM, rx_desc, tx_desc
         );
     } else {
         println!("descriptors: rx {} tx {} per queue", rx_desc, tx_desc);

@@ -192,6 +192,11 @@ impl Conn {
         self.outcome
     }
 
+    /// The handshake has completed: a SYN still unanswered reads false.
+    pub fn established(&self) -> bool {
+        self.settled
+    }
+
     fn finish(&mut self, step: Step) -> Step {
         self.outcome = Some(step);
         step
