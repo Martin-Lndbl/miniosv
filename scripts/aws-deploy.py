@@ -177,16 +177,35 @@ def stream_console(ec2_client, instance_id, poll_interval=5):
         time.sleep(poll_interval)
 
 
-def launch(ec2_client, run_kwargs: dict, market: str) -> tuple[dict, str]:
-    """run_instances, on the market asked for; returns the market used. Spot
-    is a one-time request at the default max price (the on-demand rate),
-    terminated if reclaimed; a bench run is minutes and a c6in.16xlarge costs
-    about a tenth that way. "spot" fails if refused: a run that asked for spot
-    and got on-demand would be billed at ten times what was expected.
-    "spot-or-on-demand" prints the refusal and retries on-demand."""
+def spot_subnets(ec2_client, subnet_id):
+    """The given subnet's zone first, then the other zones of its VPC through
+    their default subnets. Spot capacity is per zone, and an S3 gateway
+    endpoint on the VPC's main route table serves every subnet alike."""
+    if not subnet_id:
+        return [None]
+    desc = ec2_client.describe_subnets(SubnetIds=[subnet_id])["Subnets"][0]
+    others = ec2_client.describe_subnets(
+        Filters=[{"Name": "vpc-id", "Values": [desc["VpcId"]]},
+                 {"Name": "default-for-az", "Values": ["true"]}]
+    )["Subnets"]
+    rest = sorted((s for s in others if s["SubnetId"] != subnet_id),
+                  key=lambda s: s["AvailabilityZone"])
+    return [(subnet_id, desc["AvailabilityZone"])] + [(s["SubnetId"], s["AvailabilityZone"]) for s in rest]
+
+
+def launch(ec2_client, run_kwargs: dict, market: str) -> tuple[dict, str, str]:
+    """run_instances, on the market asked for; returns the response, the
+    market used and the zone. Spot is a one-time request at the default max
+    price (the on-demand rate), terminated if reclaimed; a bench run is
+    minutes and a c6in.16xlarge costs about a tenth that way. It is tried in
+    every zone of the subnet's VPC before the verdict. "spot" fails if none
+    provides one: a run that asked for spot and got on-demand would be billed
+    at ten times what was expected. "spot-or-on-demand" then retries
+    on-demand, in the subnet given."""
+    zone_of = lambda sn: (sn[1] if sn else "the default zone")
     if market == "on-demand":
-        return ec2_client.run_instances(**run_kwargs), "on-demand"
-    kwargs = dict(
+        return ec2_client.run_instances(**run_kwargs), "on-demand", zone_of(spot_subnets(ec2_client, run_kwargs.get("SubnetId"))[0])
+    spot = dict(
         run_kwargs,
         InstanceMarketOptions={
             "MarketType": "spot",
@@ -196,15 +215,20 @@ def launch(ec2_client, run_kwargs: dict, market: str) -> tuple[dict, str]:
             },
         },
     )
-    try:
-        return ec2_client.run_instances(**kwargs), "spot"
-    except ClientError as e:
-        err = e.response.get("Error", {})
-        if market != "spot-or-on-demand":
-            raise SystemExit(f"spot requested but not provided: {err.get('Code')}: "
-                             f"{err.get('Message')}") from e
-        print(f"Spot not provided ({err.get('Code')}); falling back to on-demand")
-        return ec2_client.run_instances(**run_kwargs), "on-demand"
+    last = None
+    for sn in spot_subnets(ec2_client, run_kwargs.get("SubnetId")):
+        if sn:
+            spot["SubnetId"] = sn[0]
+        try:
+            return ec2_client.run_instances(**spot), "spot", zone_of(sn)
+        except ClientError as e:
+            last = e.response.get("Error", {})
+            print(f"Spot not provided in {zone_of(sn)} ({last.get('Code')})", flush=True)
+    if market != "spot-or-on-demand":
+        raise SystemExit(f"spot requested but not provided: {last.get('Code')}: "
+                         f"{last.get('Message')}")
+    print("Falling back to on-demand")
+    return ec2_client.run_instances(**run_kwargs), "on-demand", zone_of(spot_subnets(ec2_client, run_kwargs.get("SubnetId"))[0])
 
 
 def main():
@@ -360,14 +384,14 @@ def main():
     if args.security_group:
         run_kwargs["SecurityGroupIds"] = args.security_group
     try:
-        run_response, market = launch(ec2_client, run_kwargs, args.market)
+        run_response, market, zone = launch(ec2_client, run_kwargs, args.market)
     except (SystemExit, ClientError):
         # Nothing is running yet, but the AMI and snapshot already exist.
         cleanup_aws_resources(ec2_client, ami_id=ami_id, snapshot_id=snapshot_id)
         raise
 
     instance_id = run_response["Instances"][0]["InstanceId"]
-    print(f"Launched instance: {instance_id} ({market})")
+    print(f"Launched instance: {instance_id} ({market}, {zone})")
 
     with open("aws/.instance-id", "w") as f:
         f.write(instance_id)
@@ -379,8 +403,9 @@ def main():
     inst = desc["Reservations"][0]["Instances"][0]
     public_dns = inst.get("PublicDnsName") or "(none)"
     public_ip = inst.get("PublicIpAddress") or "(none)"
-    # The bench drivers parse this line: the id, and the market it came from.
-    print(f"Instance running: {instance_id} ({instance}, {market})")
+    # The bench drivers parse this line: the id, the zone, and the market it
+    # came from, which under spot-or-on-demand is not always the one asked for.
+    print(f"Instance running: {instance_id} ({instance}, {zone}, {market})")
     print(f"  Public DNS: {public_dns}")
     print(f"  Public IP:  {public_ip}")
 
