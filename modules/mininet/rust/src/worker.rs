@@ -13,10 +13,11 @@ use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address};
 
 use crate::arp;
 use crate::clock::MonoClock;
-use crate::conn::{Conn, ConnBufs, Step};
+use crate::conn::{Conn, ConnBufs};
 use crate::device::DpdkDevice;
-use crate::endpoint::{Endpoint, Request};
+use crate::endpoint::Endpoint;
 use crate::error::Error;
+use crate::http::BodySink;
 use crate::ffi::rte_pktmbuf_pool;
 use crate::rss::{Rss, EPH_LEN};
 use crate::tls;
@@ -67,7 +68,6 @@ pub struct Worker {
     handles: Vec<SocketHandle>,
     conns: Vec<Option<Conn>>,
     bufs: Vec<Option<ConnBufs>>,
-    ports: Vec<u16>,
     rotation: Vec<u16>,
     next_port: usize,
     peer: Endpoint,
@@ -88,26 +88,21 @@ impl Worker {
         let owned = h
             .rss
             .owned_ports(cfg.peer.ip, cfg.peer.port, netif.ip, h.queue_id);
-        let ports = owned.spread(cfg.conns);
+        let slots = owned.spread(cfg.conns).len();
         let rotation = owned.spread(cfg.conns * PORT_ROTATION);
-        if ports.is_empty() {
+        if slots == 0 {
             println!("FAIL: q{}: no ephemeral port steers here", h.queue_id);
             return Err(Error::NoPorts);
         }
-        if ports.len() < cfg.conns {
-            println!(
-                "q{}: only {} usable ports for {} connections",
-                h.queue_id,
-                ports.len(),
-                cfg.conns
-            );
+        if slots < cfg.conns {
+            println!("q{}: only {} usable ports for {} connections", h.queue_id, slots, cfg.conns);
         }
         println!(
             "q{}: {} of {} ephemeral ports steer here; using {}",
             h.queue_id,
             owned.count(),
             EPH_LEN,
-            ports.len()
+            slots
         );
 
         let ip = Ipv4Address::from_octets(netif.ip);
@@ -124,7 +119,6 @@ impl Worker {
         });
         let _ = iface.routes_mut().add_default_ipv4_route(gw);
 
-        let slots = ports.len();
         let storage: &'static mut [SocketStorage<'static>] = Box::leak(
             (0..slots)
                 .map(|_| SocketStorage::EMPTY)
@@ -158,7 +152,6 @@ impl Worker {
             handles,
             conns,
             bufs,
-            ports,
             rotation,
             next_port: 0,
             peer: cfg.peer.clone(),
@@ -172,30 +165,12 @@ impl Worker {
         })
     }
 
-    pub fn queue_id(&self) -> u16 {
-        self.queue_id
-    }
-
     pub fn slots(&self) -> usize {
         self.handles.len()
     }
 
-    pub fn peer(&self) -> &Endpoint {
-        &self.peer
-    }
-
     pub fn clock(&self) -> &MonoClock {
         &self.clk
-    }
-
-    /// Open `slot` and queue `req` on it.
-    pub fn connect(&mut self, slot: usize, req: &Request<'_>) -> Result<(), Error> {
-        let src_port = *self.ports.get(slot).ok_or(Error::ConnectRejected)?;
-        self.connect_on(slot, src_port, req)
-    }
-
-    pub fn is_free(&self, slot: usize) -> bool {
-        self.conns.get(slot).map_or(false, |c| c.is_none())
     }
 
     /// Tear down `slot`. Aborts rather than closes, so no TIME_WAIT holds the port.
@@ -218,11 +193,11 @@ impl Worker {
     }
 
     /// Only after [`Worker::idle_reusable`] was just true.
-    pub(crate) fn reuse(&mut self, slot: usize, req: &Request<'_>) -> Result<(), Error> {
+    pub(crate) fn reuse(&mut self, slot: usize, head: &[u8], sink: Box<dyn BodySink>) -> Result<(), Error> {
         let now_ns = self.clk.elapsed_ns();
         match self.conns.get_mut(slot).and_then(|c| c.as_mut()) {
             Some(c) => {
-                c.reset_for(req, now_ns);
+                c.reset_for(head, sink, now_ns);
                 crate::stats::request_started(true);
                 Ok(())
             }
@@ -231,16 +206,13 @@ impl Worker {
     }
 
     /// Open `slot` on the next port in the rotation.
-    pub fn connect_next(&mut self, slot: usize, req: &Request<'_>) -> Result<(), Error> {
-        if self.rotation.is_empty() {
-            return Err(Error::NoPorts);
-        }
+    pub fn connect_next(&mut self, slot: usize, head: &[u8], sink: Box<dyn BodySink>) -> Result<(), Error> {
         let src_port = self.rotation[self.next_port % self.rotation.len()];
         self.next_port = self.next_port.wrapping_add(1);
-        self.connect_on(slot, src_port, req)
+        self.connect_on(slot, src_port, head, sink)
     }
 
-    fn connect_on(&mut self, slot: usize, src_port: u16, req: &Request<'_>) -> Result<(), Error> {
+    fn connect_on(&mut self, slot: usize, src_port: u16, head: &[u8], sink: Box<dyn BodySink>) -> Result<(), Error> {
         let handle = *self.handles.get(slot).ok_or(Error::ConnectRejected)?;
         let dst = (Ipv4Address::from_octets(self.peer.ip), self.peer.port);
         let dial_start_ns = self.clk.elapsed_ns();
@@ -267,7 +239,8 @@ impl Worker {
             self.queue_id,
             src_port,
             tls,
-            req,
+            head,
+            sink,
             bufs,
             now_ns,
         ));
@@ -275,8 +248,8 @@ impl Worker {
         Ok(())
     }
 
-    /// Advance the interface, then every open connection. True when none is in flight.
-    pub fn poll(&mut self) -> bool {
+    /// Advance the interface, then every open connection.
+    pub fn poll(&mut self) {
         let start_ns = self.clk.elapsed_ns();
         self.last_poll_ns = start_ns + self.clk.epoch_ns();
         let now_ms = (start_ns / 1_000_000) as i64;
@@ -289,14 +262,10 @@ impl Worker {
         self.last_iface_ns = now_ns.saturating_sub(start_ns);
         self.last_dev = self.dev.take_counts();
 
-        let mut all_done = true;
         for slot in self.conns.iter_mut().flatten() {
-            if slot.step(&mut self.sockets, now_ns) == Step::Pending {
-                all_done = false;
-            }
+            slot.step(&mut self.sockets, now_ns);
         }
         self.last_busy_ns = self.clk.elapsed_ns().saturating_sub(start_ns);
-        all_done
     }
 
     pub fn last_poll_ns(&self) -> u64 {
@@ -325,9 +294,5 @@ impl Worker {
 
     pub fn conn_mut(&mut self, slot: usize) -> Option<&mut Conn> {
         self.conns.get_mut(slot).and_then(|c| c.as_mut())
-    }
-
-    pub fn conns(&self) -> impl Iterator<Item = &Conn> {
-        self.conns.iter().flatten()
     }
 }

@@ -25,6 +25,7 @@ mod ffi;
 mod http;
 mod nic;
 mod rss;
+#[cfg(feature = "selftest")]
 mod selftest;
 mod service;
 pub mod stats;
@@ -34,10 +35,10 @@ mod worker;
 
 pub use clock::MonoClock;
 pub use conn::{Conn, Step};
-pub use endpoint::{Endpoint, Request};
+pub use endpoint::Endpoint;
 pub use error::Error;
-pub use http::{BodySink, BufferSink, ContentRange, NullSink, ResponseHead};
-pub use nic::{eth_qstats, eth_stats, NicStats};
+pub use http::{BodySink, BufferSink, ContentRange, ResponseHead};
+pub use nic::{eth_stats, NicStats};
 pub use service::{GetResult, Service, ServiceConfig};
 pub use worker::{Worker, WorkerConfig, WorkerHandle};
 
@@ -45,14 +46,8 @@ use alloc::vec::Vec;
 use core::panic::PanicInfo;
 
 pub struct Config {
-    /// RSS queues, and so workers; clamped to what the device advertises.
+    /// RSS queues, and so workers: at least one, at most what the device advertises.
     pub queues: u16,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self { queues: 1 }
-    }
 }
 
 /// Learned once on queue 0: DHCP and ARP replies are not steered by RSS.
@@ -73,23 +68,10 @@ pub struct Stack {
     queues: u16,
 }
 
-/// One worker per sixteen cpus, at least one; a worker owns its cpu for good.
-fn auto_workers() -> u16 {
-    let cpus = unsafe { crate::ffi::shim_cpu_count() };
-    let n = (cpus / 16).max(1);
-    let n = n.min(u16::MAX as u64) as u16;
-    println!("mininet: {} cpus -> {} worker(s) (auto)", cpus, n);
-    n
-}
-
 impl Stack {
     /// Start port 0, read the RSS model, take a lease, resolve the gateway.
     pub fn up(cfg: &Config) -> Result<Stack, Error> {
-        let want = if cfg.queues == 0 {
-            auto_workers()
-        } else {
-            cfg.queues
-        };
+        let want = cfg.queues.max(1);
         let queues = nic::clamp_queues(want);
         if queues != want {
             println!("clamping workers {} -> {} (device max)", want, queues);
@@ -117,10 +99,6 @@ impl Stack {
         self.queues
     }
 
-    pub fn netif(&self) -> Netif {
-        self.netif
-    }
-
     /// A `Send` ticket for one queue; `None` for one the device did not grant.
     pub fn handle(&self, queue_id: u16) -> Option<WorkerHandle> {
         if queue_id >= self.queues {
@@ -132,15 +110,6 @@ impl Stack {
             netif: self.netif,
             rss: self.rss,
         })
-    }
-
-    pub fn worker(&self, queue_id: u16, cfg: &WorkerConfig) -> Result<Worker, Error> {
-        let handle = self.handle(queue_id).ok_or(Error::NoDevice)?;
-        Worker::new(handle, cfg)
-    }
-
-    pub fn down(self) {
-        nic::dev_stop();
     }
 }
 

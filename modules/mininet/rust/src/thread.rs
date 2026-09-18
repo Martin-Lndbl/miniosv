@@ -3,8 +3,9 @@
 use alloc::boxed::Box;
 use core::ffi::{c_int, c_void};
 
-use crate::ffi::{shim_thread_join, shim_thread_spawn};
+use crate::ffi::shim_thread_spawn;
 
+#[cfg_attr(not(feature = "selftest"), allow(dead_code))]
 pub struct JoinHandle(*mut c_void);
 
 unsafe impl Send for JoinHandle {}
@@ -24,8 +25,9 @@ pub fn spawn<F: FnOnce() + Send + 'static>(f: F, cpu: Option<usize>) -> JoinHand
     JoinHandle(unsafe { shim_thread_spawn(trampoline, arg, cpu_id) })
 }
 
+#[cfg(feature = "selftest")]
 impl JoinHandle {
     pub fn join(self) {
-        unsafe { shim_thread_join(self.0) };
+        unsafe { crate::ffi::shim_thread_join(self.0) };
     }
 }

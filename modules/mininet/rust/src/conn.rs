@@ -11,9 +11,9 @@ use rustls::unbuffered::{ConnectionState, UnbufferedStatus};
 use smoltcp::iface::{SocketHandle, SocketSet};
 use smoltcp::socket::tcp;
 
-use crate::endpoint::{Endpoint, Request};
+use crate::endpoint::Endpoint;
 use crate::error::Error;
-use crate::http::{BodySink, NullSink, ResponseHead, ResponseParser};
+use crate::http::{BodySink, ResponseHead, ResponseParser};
 use crate::stats;
 use crate::tls::TLS_BUF_CAP;
 
@@ -53,7 +53,6 @@ pub struct Conn {
     head: Vec<u8>,
     request_queued: bool,
     handshake_done: bool,
-    discard_ciphertext: bool,
     parser: ResponseParser,
     sink: Box<dyn BodySink>,
 
@@ -102,11 +101,11 @@ impl Conn {
         queue_id: u16,
         src_port: u16,
         tls: Option<UnbufferedClientConnection>,
-        req: &Request<'_>,
+        head: &[u8],
+        sink: Box<dyn BodySink>,
         bufs: ConnBufs,
         now_ns: u64,
     ) -> Conn {
-        let discard_ciphertext = req.discard_ciphertext && tls.is_some();
         Conn {
             handle,
             tls,
@@ -115,14 +114,13 @@ impl Conn {
             head: {
                 let mut h = bufs.head;
                 h.clear();
-                h.extend_from_slice(req.head);
+                h.extend_from_slice(head);
                 h
             },
             request_queued: false,
             handshake_done: false,
-            discard_ciphertext,
             parser: ResponseParser::new(),
-            sink: Box::new(NullSink),
+            sink,
             outcome: None,
             connect_start_ns: now_ns,
             queue_id,
@@ -130,7 +128,7 @@ impl Conn {
             settled: false,
             syn_ns: None,
             head_ns: None,
-            is_head: is_head_request(req.head),
+            is_head: is_head_request(head),
         }
     }
 
@@ -156,22 +154,17 @@ impl Conn {
 
     /// Reuse the socket and TLS session for a new request. `incoming` is kept:
     /// it may hold a partial record of the same TLS stream.
-    pub(crate) fn reset_for(&mut self, req: &Request<'_>, now_ns: u64) {
+    pub(crate) fn reset_for(&mut self, head: &[u8], sink: Box<dyn BodySink>, now_ns: u64) {
         debug_assert!(self.outgoing.is_empty(), "reuse with unsent request bytes");
         self.head.clear();
-        self.head.extend_from_slice(req.head);
+        self.head.extend_from_slice(head);
         self.request_queued = false;
-        self.discard_ciphertext = req.discard_ciphertext && self.tls.is_some();
         self.parser = ResponseParser::new();
-        self.sink = Box::new(NullSink);
+        self.sink = sink;
         self.outcome = None;
         self.connect_start_ns = now_ns;
         self.head_ns = None;
         self.is_head = is_head_request(&self.head);
-    }
-
-    pub fn set_sink(&mut self, sink: Box<dyn BodySink>) {
-        self.sink = sink;
     }
 
     pub fn sink_written(&self) -> u64 {
@@ -187,10 +180,6 @@ impl Conn {
         self.parser.status()
     }
 
-    pub fn headers_parsed(&self) -> bool {
-        self.parser.headers_done()
-    }
-
     pub fn head(&self) -> &ResponseHead {
         self.parser.head()
     }
@@ -199,20 +188,8 @@ impl Conn {
         self.parser.head_mut()
     }
 
-    pub fn body_bytes(&self) -> u64 {
-        self.parser.body_bytes()
-    }
-
-    pub fn src_port(&self) -> u16 {
-        self.src_port
-    }
-
     pub fn outcome(&self) -> Option<Step> {
         self.outcome
-    }
-
-    pub fn is_complete(&self) -> bool {
-        self.outcome == Some(Step::Complete)
     }
 
     fn finish(&mut self, step: Step) -> Step {
@@ -280,11 +257,6 @@ impl Conn {
             }
         }
 
-        if self.discard_ciphertext && self.handshake_done && self.request_queued {
-            self.parser.count_opaque(self.incoming.len());
-            self.incoming.clear();
-        }
-
         if self.tls.is_none() && !self.incoming.is_empty() {
             let parsed = self.parser.feed(&self.incoming, self.sink.as_mut());
             self.incoming.clear();
@@ -324,7 +296,7 @@ impl Conn {
         );
         if self.handshake_done && self.request_queued && ended && self.outgoing.is_empty() && !s.can_recv() {
             // Closed before any head arrived is a failure, not an empty body.
-            if !self.discard_ciphertext && !self.parser.headers_done() {
+            if !self.parser.headers_done() {
                 println!(
                     "FAIL: q{} port {} closed before answering",
                     self.queue_id, self.src_port

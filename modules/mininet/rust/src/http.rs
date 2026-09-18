@@ -19,13 +19,6 @@ pub trait BodySink {
     }
 }
 
-/// Counts and discards. A ZST, so boxing one does not allocate.
-pub struct NullSink;
-
-impl BodySink for NullSink {
-    fn write(&mut self, _data: &[u8]) {}
-}
-
 /// Writes the body into a caller-owned buffer that outlives the request.
 pub struct BufferSink {
     buf: *mut u8,
@@ -46,15 +39,6 @@ impl BufferSink {
             written: 0,
             overflowed: false,
         }
-    }
-
-    pub fn written(&self) -> usize {
-        self.written
-    }
-
-    /// The peer sent more than the buffer holds; the excess was dropped.
-    pub fn overflowed(&self) -> bool {
-        self.overflowed
     }
 }
 
@@ -87,16 +71,6 @@ pub struct ContentRange {
     pub last: u64,
     /// `None` for the `*` form, where the server declines to say.
     pub total: Option<u64>,
-}
-
-impl ContentRange {
-    pub fn len(&self) -> u64 {
-        self.last.saturating_sub(self.first) + 1
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.last < self.first
-    }
 }
 
 /// The head fields something above this layer reads.
@@ -194,11 +168,6 @@ impl ResponseParser {
         }
         self.pending.extend_from_slice(data);
         Ok(())
-    }
-
-    /// Count bytes without parsing: the stubbed record layer has no head.
-    pub(crate) fn count_opaque(&mut self, n: usize) {
-        self.body_bytes += n as u64;
     }
 
     fn parse_head(&mut self) -> Result<(), ParseError> {

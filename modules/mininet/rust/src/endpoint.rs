@@ -19,14 +19,4 @@ impl Endpoint {
             tls,
         }
     }
-
-    pub fn is_configured(&self) -> bool {
-        self.ip != [0, 0, 0, 0]
-    }
-}
-
-/// One pre-rendered request head; the caller builds HTTP.
-pub struct Request<'a> {
-    pub head: &'a [u8],
-    pub discard_ciphertext: bool,
 }

@@ -75,6 +75,21 @@ impl Rss {
         Ok(rss)
     }
 
+    /// A model from a given key and table; an empty table means one queue.
+    #[cfg(feature = "selftest")]
+    pub(crate) fn synthetic(key: &[u8], reta: &[u16]) -> Rss {
+        let mut rss = Rss {
+            key: [0; MAX_KEY],
+            key_len: key.len(),
+            reta: [0; MAX_RETA],
+            reta_len: reta.len(),
+            single_queue: reta.is_empty(),
+        };
+        rss.key[..key.len()].copy_from_slice(key);
+        rss.reta[..reta.len()].copy_from_slice(reta);
+        rss
+    }
+
     /// Predicted RX queue for a 12-byte tuple in wire order; `u16::MAX` if unreadable.
     fn predict(&self, tuple: &[u8; 12]) -> u16 {
         if self.single_queue {
@@ -165,7 +180,7 @@ impl OwnedPorts {
     }
 }
 
-fn toeplitz(key: &[u8], data: &[u8]) -> u32 {
+pub(crate) fn toeplitz(key: &[u8], data: &[u8]) -> u32 {
     if key.len() < 4 {
         return 0;
     }

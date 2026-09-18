@@ -31,11 +31,10 @@ struct config {
     const char *address;
     //! 0 dials plain HTTP on port 80.
     int tls;
-    //! 0 sizes to the machine, one per sixteen cpus.
+    //! At least one, at most what the NIC grants.
     uint32_t workers;
     //! `workers * conns_per_worker` is the in-flight ceiling.
     uint32_t conns_per_worker;
-    uint64_t rx_buffer;
 };
 
 enum : size_t {
@@ -58,8 +57,6 @@ struct response {
 
 //! Call once; a second call is a no-op.
 int up(const config &c);
-
-bool is_up();
 
 const char *host();
 

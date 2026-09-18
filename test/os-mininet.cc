@@ -47,6 +47,28 @@ void test_get_argument_validation()
 	      "null buffer with nonzero cap on a down stack reports not-up");
 }
 
+// With no NIC, up() reports it and leaves the stack down.
+void test_up_without_nic()
+{
+	printf("-- up without a NIC\n");
+
+	mininet::config c {};
+	c.host = "bucket.example";
+	c.address = "10.0.0.1";
+	c.tls = 1;
+	c.workers = 2;
+	c.conns_per_worker = 4;
+	check(mininet::up(c) == mininet::E_NO_DEVICE, "up() without a NIC is E_NO_DEVICE");
+	check(mininet_is_up() == 0, "a failed up() leaves the stack down");
+	check(mininet::host() == nullptr, "no host is served");
+
+	c.host = "";
+	check(mininet::up(c) == mininet::E_BAD_ARGUMENT, "an empty host is E_BAD_ARGUMENT");
+	c.host = "bucket.example";
+	c.address = "300.1.1.1";
+	check(mininet::up(c) == mininet::E_BAD_ARGUMENT, "a bad address is E_BAD_ARGUMENT");
+}
+
 // Every error code maps to a distinct, non-empty string.
 void test_strerror()
 {
@@ -115,6 +137,7 @@ int os_mininet_main()
 	uint32_t rust_failures = mininet_selftest(0);
 
 	test_get_argument_validation();
+	test_up_without_nic();
 	test_strerror();
 	test_response_abi();
 	test_stats_zeroed();

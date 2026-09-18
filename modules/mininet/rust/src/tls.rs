@@ -21,9 +21,18 @@ impl TimeProvider for ShimTimeProvider {
     }
 }
 
+/// AES-GCM under TLS 1.3 with X25519 or P-256: what S3 picks from a full offer.
 #[cfg(not(feature = "rustcrypto"))]
 fn provider() -> rustls::crypto::CryptoProvider {
-    rustls::crypto::ring::default_provider()
+    use rustls::crypto::ring::{cipher_suite, default_provider, kx_group};
+    rustls::crypto::CryptoProvider {
+        cipher_suites: alloc::vec![
+            cipher_suite::TLS13_AES_128_GCM_SHA256,
+            cipher_suite::TLS13_AES_256_GCM_SHA384,
+        ],
+        kx_groups: alloc::vec![kx_group::X25519, kx_group::SECP256R1],
+        ..default_provider()
+    }
 }
 
 #[cfg(feature = "rustcrypto")]
@@ -39,8 +48,8 @@ pub(crate) fn client_config() -> Arc<ClientConfig> {
         Arc::new(provider()),
         Arc::new(ShimTimeProvider),
     )
-    .with_safe_default_protocol_versions()
-    .expect("rustls: default protocol versions")
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .expect("rustls: TLS 1.3")
     .with_root_certificates(roots)
     .with_no_client_auth();
     Arc::new(cfg)

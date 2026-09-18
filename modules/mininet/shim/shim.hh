@@ -4,15 +4,12 @@
 
 extern "C" {
 
-int shim_is_valid_port(uint16_t port_id);
-
 int shim_get_dev_info(uint16_t port_id, uint16_t *max_rx_queues,
                        uint16_t *max_tx_queues);
 
 void *shim_pktmbuf_pool_create(const char *name, uint32_t n,
                                 uint32_t cache_size, uint16_t priv_size,
                                 uint16_t data_room_size);
-void shim_mempool_free(void *pool);
 
 int shim_eth_dev_configure(uint16_t port_id, uint16_t nb_rx_q,
                             uint16_t nb_tx_q);
@@ -26,27 +23,19 @@ int shim_tx_queue_setup(uint16_t port_id, uint16_t queue_id,
                          uint16_t nb_desc);
 
 int shim_dev_start(uint16_t port_id);
-void shim_dev_stop(uint16_t port_id);
 
 void shim_macaddr_get(uint16_t port_id, uint8_t *addr_bytes);
 
-// Zero-copy TX: a writable data area; pass the handle to shim_mbuf_tx or shim_mbuf_free.
+// Zero-copy TX: a writable data area; the handle goes to shim_mbuf_tx_burst or shim_mbuf_free.
 uint8_t *shim_mbuf_alloc_tx(void *pool, uint16_t queue_id, void **out_handle,
                              uint16_t *out_cap);
 
 uint16_t shim_mbuf_tx_burst(uint16_t port_id, uint16_t queue_id, void **handles,
                             const uint16_t *lens, uint16_t n);
-int shim_mbuf_tx(uint16_t port_id, uint16_t queue_id, void *handle,
-                  uint16_t len);
 void shim_mbuf_free(void *handle);
-
-uint32_t shim_mbuf_rss_hash(void *handle);
-uint64_t shim_rx_offloads(void);
 
 // [ipackets, opackets, ibytes, obytes, imissed, ierrors, oerrors, rx_nombuf]
 int shim_eth_stats(uint16_t port_id, uint64_t *out, uint16_t n);
-int shim_eth_qstats(uint16_t port_id, uint64_t *ipkts, uint64_t *errs,
-                    uint16_t nq);
 
 int shim_rss_hash_key(uint16_t port_id, uint8_t *out_key, uint16_t out_len);
 int shim_rss_reta_size(uint16_t port_id);
@@ -72,5 +61,6 @@ uint64_t shim_cpu_count(void);
 void *shim_malloc(uint64_t size);
 void  shim_free(void *ptr);
 void *shim_realloc(void *ptr, uint64_t size);
+void *shim_aligned_alloc(uint64_t align, uint64_t size);
 
 }  // extern "C"

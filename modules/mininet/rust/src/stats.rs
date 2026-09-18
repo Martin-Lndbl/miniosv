@@ -122,6 +122,17 @@ fn dist(hist: &[AtomicU64; BUCKETS], total: &AtomicU64, max: &AtomicU64) -> Dist
     }
 }
 
+/// The distribution of the given samples, through the same histogram.
+#[cfg(feature = "selftest")]
+pub(crate) fn dist_of(samples_ns: &[u64]) -> Dist {
+    let hist: [AtomicU64; BUCKETS] = [const { AtomicU64::new(0) }; BUCKETS];
+    let (total, max) = (AtomicU64::new(0), AtomicU64::new(0));
+    for &ns in samples_ns {
+        record(&hist, &total, &max, ns);
+    }
+    dist(&hist, &total, &max)
+}
+
 /// The C ABI too: `mininet::conn_stats` in mininet.hh mirrors this layout.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]

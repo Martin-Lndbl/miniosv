@@ -39,10 +39,6 @@ rte_eth_dev *lookup_dev(uint16_t port_id) {
 
 extern "C" {
 
-int shim_is_valid_port(uint16_t port_id) {
-  return lookup_dev(port_id) != nullptr ? 1 : 0;
-}
-
 int shim_get_dev_info(uint16_t port_id, uint16_t *max_rx_queues,
                        uint16_t *max_tx_queues) {
   rte_eth_dev *dev = lookup_dev(port_id);
@@ -61,10 +57,6 @@ void *shim_pktmbuf_pool_create(const char *name, uint32_t n,
   return static_cast<void *>(
       rte_pktmbuf_pool_create(name, n, cache_size, priv_size, data_room_size,
                               SOCKET_ID_ANY));
-}
-
-void shim_mempool_free(void *pool) {
-  if (pool) rte_mempool_free(static_cast<rte_mempool *>(pool));
 }
 
 int shim_eth_dev_configure(uint16_t port_id, uint16_t nb_rx_q,
@@ -114,11 +106,6 @@ int shim_tx_queue_setup(uint16_t port_id, uint16_t queue_id,
 }
 
 int shim_dev_start(uint16_t port_id) { return rte_eth_dev_start(port_id); }
-
-void shim_dev_stop(uint16_t port_id) {
-  rte_eth_dev *dev = lookup_dev(port_id);
-  if (dev) dev->stop();
-}
 
 void shim_macaddr_get(uint16_t port_id, uint8_t *addr_bytes) {
   rte_ether_addr addr;
@@ -179,21 +166,6 @@ uint8_t *shim_mbuf_alloc_tx(void *pool, uint16_t queue_id, void **out_handle,
   return rte_pktmbuf_mtod(m, uint8_t *);
 }
 
-int shim_mbuf_tx(uint16_t port_id, uint16_t queue_id, void *handle,
-                  uint16_t len) {
-  auto *m = static_cast<rte_mbuf *>(handle);
-  m->data_len = len;
-  m->pkt_len = len;
-  m->nb_segs = 1;
-  m->next = nullptr;
-  ena_tx_offload_prepare(m, rte_pktmbuf_mtod(m, uint8_t *), len);
-  if (rte_eth_tx_burst(port_id, queue_id, &m, 1) == 0) {
-    rte_pktmbuf_free(m);
-    return -1;
-  }
-  return 0;
-}
-
 // One doorbell for up to 64 frames; what the ring refuses is freed.
 uint16_t shim_mbuf_tx_burst(uint16_t port_id, uint16_t queue_id, void **handles,
                             const uint16_t *lens, uint16_t n) {
@@ -217,16 +189,6 @@ void shim_mbuf_free(void *handle) {
   if (handle) rte_pktmbuf_free(static_cast<rte_mbuf *>(handle));
 }
 
-// The NIC's RSS hash for this packet, or 0 if untagged.
-uint32_t shim_mbuf_rss_hash(void *handle) {
-  auto *m = static_cast<rte_mbuf *>(handle);
-  if (m == nullptr || !(m->ol_flags & RTE_MBUF_F_RX_RSS_HASH)) return 0;
-  return m->hash.rss;
-}
-
-// What the device actually accepted, after masking against rx_offload_capa.
-uint64_t shim_rx_offloads(void) { return g_rx_offloads; }
-
 // out: [ipackets, opackets, ibytes, obytes, imissed, ierrors, oerrors, rx_nombuf]
 int shim_eth_stats(uint16_t port_id, uint64_t *out, uint16_t n) {
   rte_eth_dev *dev = lookup_dev(port_id);
@@ -243,22 +205,6 @@ int shim_eth_stats(uint16_t port_id, uint64_t *out, uint16_t n) {
   out[6] = st.oerrors.load();
   out[7] = st.rx_nombuf.load();
   return 0;
-}
-
-// Per-queue receive counters.
-int shim_eth_qstats(uint16_t port_id, uint64_t *ipkts, uint64_t *errs,
-                    uint16_t nq) {
-  rte_eth_dev *dev = lookup_dev(port_id);
-  if (dev == nullptr || ipkts == nullptr || errs == nullptr) return -1;
-  rte_eth_stats st;
-  std::memset(&st, 0, sizeof(st));
-  dev->get_stats(&st);
-  uint16_t n = nq < RTE_ETHDEV_QUEUE_STAT_CNTRS ? nq : RTE_ETHDEV_QUEUE_STAT_CNTRS;
-  for (uint16_t i = 0; i < n; i++) {
-    ipkts[i] = st.q_ipackets[i];
-    errs[i] = st.q_errors[i];
-  }
-  return n;
 }
 
 // RSS introspection: the key and the indirection table, read off the device.
@@ -399,6 +345,10 @@ void shim_free(void *ptr) { std::free(ptr); }
 
 void *shim_realloc(void *ptr, uint64_t size) {
   return std::realloc(ptr, static_cast<size_t>(size));
+}
+
+void *shim_aligned_alloc(uint64_t align, uint64_t size) {
+  return std::aligned_alloc(align, (size + align - 1) / align * align);
 }
 
 // OSv has no syscall table; SYS_getrandom is answered from RDRAND, anything else ENOSYS.
