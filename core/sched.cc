@@ -577,6 +577,14 @@ void cpu::handle_incoming_wakeups()
                     trace_sched_migrate(&t, alt->id);
                     t.stat_migrations.incr();
                     t.suspend_timers();
+                    // The thread may have slept across this cpu's
+                    // renormalization: bring its local runtime up to date
+                    // first, as the enqueue branch below does. The balancer
+                    // never needed this -- it moved queued threads, which
+                    // renormalize() walks -- and exporting a stale value
+                    // overflowed the destination's rescale to infinity, which
+                    // ties with the idle thread and trips n!=p at reschedule.
+                    t._runtime.update_after_sleep();
                     t._runtime.export_runtime();
                     t._detached_state->_cpu = alt;
                     t.remote_thread_local_var(::percpu_base) = alt->percpu_base;
