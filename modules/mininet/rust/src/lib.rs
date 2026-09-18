@@ -34,6 +34,11 @@ mod tls;
 mod worker;
 
 pub use clock::MonoClock;
+
+/// Cpus the kernel runs on; workers are pinned from 0 upwards.
+pub fn cpu_count() -> usize {
+    unsafe { ffi::shim_cpu_count() as usize }
+}
 pub use conn::{Conn, Step};
 pub use endpoint::Endpoint;
 pub use error::Error;
@@ -48,6 +53,9 @@ use core::panic::PanicInfo;
 pub struct Config {
     /// RSS queues, and so workers: at least one, at most what the device advertises.
     pub queues: u16,
+    /// RX descriptors per queue to ask for; 0 is the default of 4096, and the
+    /// device clamps what it cannot give.
+    pub rx_desc: u16,
 }
 
 /// Learned once on queue 0: DHCP and ARP replies are not steered by RSS.
@@ -77,7 +85,7 @@ impl Stack {
             println!("clamping workers {} -> {} (device max)", want, queues);
         }
 
-        let (pools, mac) = nic::probe_and_open(queues)?;
+        let (pools, mac) = nic::probe_and_open(queues, cfg.rx_desc)?;
         let rss = rss::Rss::load(queues)?;
         let (ip, prefix_len, gateway_ip, gateway_mac) = dhcp::learn_network(pools[0].as_ptr(), mac)?;
 
