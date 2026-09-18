@@ -241,9 +241,13 @@ def main():
     parser.add_argument("--subnet", help="VPC subnet ID to launch into (needed for buckets locked to a VPC endpoint)")
     parser.add_argument("--security-group", action="append", default=[],
                         help="Security group ID to attach; may be repeated. Required when --subnet is set unless the subnet's default SG is acceptable.")
+    parser.add_argument("--profile", default=None, metavar="NAME",
+                        help="AWS credentials profile (default: $AWS_PROFILE)")
     parser.add_argument("--market", choices=("on-demand", "spot", "spot-or-on-demand"), default="on-demand",
                         help="Launch market; 'spot' fails if spot cannot be provided, 'spot-or-on-demand' falls back")
     args = parser.parse_args()
+    if args.profile:
+        os.environ["AWS_PROFILE"] = args.profile  # before any client is made
 
     aws_login()
 
