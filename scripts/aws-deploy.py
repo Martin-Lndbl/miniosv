@@ -409,6 +409,12 @@ def main():
     print(f"  Public DNS: {public_dns}")
     print(f"  Public IP:  {public_ip}")
 
+    # The image and its snapshot were only ever needed to launch; the root
+    # volume is the instance's own now. Letting go of them here, rather than
+    # in the teardown, means a deploy that dies later leaks nothing.
+    cleanup_aws_resources(ec2_client, ami_id=ami_id, snapshot_id=snapshot_id)
+    ami_id = snapshot_id = None
+
     if args.attach:
         print("\nStreaming system log "
               "(Ctrl+C to terminate instance and delete AMI/snapshot)...")
