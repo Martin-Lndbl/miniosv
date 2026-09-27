@@ -18,8 +18,16 @@ use crate::stats;
 use crate::tls::TLS_BUF_CAP;
 
 const SYN_TIMEOUT_NS: u64 = 5_000_000_000;
+/// A TLS record at most: header, 2^14 of payload, the AEAD's expansion.
+const RECORD_MAX: usize = 5 + 16384 + 256;
 
-/// The two record buffers, owned by the slot rather than allocated per dial.
+/// A TLS record's length from its 5-byte header, once that much is there.
+fn record_len(hdr: &[u8]) -> Option<usize> {
+    (hdr.len() >= 5).then(|| 5 + usize::from(u16::from_be_bytes([hdr[3], hdr[4]])))
+}
+
+/// The slot's buffers, owned by it rather than allocated per dial. `incoming`
+/// only ever holds one TLS record the ring's wrap cut in two.
 pub(crate) struct ConnBufs {
     incoming: Vec<u8>,
     outgoing: Vec<u8>,
@@ -29,7 +37,7 @@ pub(crate) struct ConnBufs {
 impl ConnBufs {
     pub(crate) fn new() -> Self {
         Self {
-            incoming: Vec::with_capacity(TLS_BUF_CAP),
+            incoming: Vec::with_capacity(RECORD_MAX),
             outgoing: Vec::with_capacity(TLS_BUF_CAP),
             head: Vec::with_capacity(512),
         }
@@ -153,7 +161,7 @@ impl Conn {
     }
 
     /// Reuse the socket and TLS session for a new request. `incoming` is kept:
-    /// it may hold a partial record of the same TLS stream.
+    /// it may hold the start of a record the ring's wrap cut.
     pub(crate) fn reset_for(&mut self, head: &[u8], sink: Box<dyn BodySink>, now_ns: u64) {
         debug_assert!(self.outgoing.is_empty(), "reuse with unsent request bytes");
         self.head.clear();
@@ -252,27 +260,24 @@ impl Conn {
                 }
             }
         }
-        // recv() returns one contiguous slice of the ring, so loop.
+        // Parsed, or decrypted, where the bytes lie: recv() hands out the
+        // ring's largest contiguous run and dequeues what the closure used.
+        // Nothing is consumed from a run that ends mid-record (the rest is
+        // still in flight), except at the ring's wrap, where take() stages it.
         while s.can_recv() {
-            match s.recv(|buf| {
-                self.incoming.extend_from_slice(buf);
-                (buf.len(), buf.len())
+            let queued = s.recv_queue();
+            match s.recv(|buf| match self.take(buf, buf.len() < queued) {
+                Ok(n) => (n, Ok(n)),
+                Err(step) => (0, Err(step)),
             }) {
-                Ok(n) if n > 0 => continue,
+                Ok(Ok(n)) if n > 0 => {}
+                Ok(Err(step)) => return self.finish(step),
                 _ => break,
             }
         }
-
-        if self.tls.is_none() && !self.incoming.is_empty() {
-            let parsed = self.parser.feed(&self.incoming, self.sink.as_mut());
-            self.incoming.clear();
-            if let Err(e) = parsed {
-                println!("FAIL: q{} port {} http: {:?}", self.queue_id, self.src_port, e);
-                return self.finish(Step::Failed(Error::BadResponse));
-            }
-        }
-
-        if let Some(step) = self.pump_tls() {
+        // With nothing new: the handshake's own records, the request once the
+        // session can carry it.
+        if let Err(step) = self.pump(&mut []) {
             return self.finish(step);
         }
         if self.head_ns.is_none() && self.parser.headers_done() {
@@ -315,20 +320,55 @@ impl Conn {
         Step::Pending
     }
 
-    /// Advance the record layer until it stops making progress; `Some` is failure.
-    fn pump_tls(&mut self) -> Option<Step> {
+    /// Consume what a run of the socket's ring holds: plain HTTP to the
+    /// parser whole, TLS records decrypted where they lie. Returns how many
+    /// leading bytes are done with. `cut` says the run ends at the ring's
+    /// wrap, so a record it cannot complete is staged in `incoming` and
+    /// finished from the next run, rather than waited for.
+    fn take(&mut self, buf: &mut [u8], cut: bool) -> Result<usize, Step> {
+        if self.tls.is_none() {
+            if let Err(e) = self.parser.feed(buf, self.sink.as_mut()) {
+                println!("FAIL: q{} port {} http: {:?}", self.queue_id, self.src_port, e);
+                return Err(Step::Failed(Error::BadResponse));
+            }
+            return Ok(buf.len());
+        }
+        if !self.incoming.is_empty() {
+            let need = record_len(&self.incoming).unwrap_or(5).saturating_sub(self.incoming.len()).min(buf.len());
+            self.incoming.extend_from_slice(&buf[..need]);
+            if record_len(&self.incoming).map_or(true, |n| self.incoming.len() < n) {
+                return Ok(need);
+            }
+            let mut staged = core::mem::take(&mut self.incoming);
+            let r = self.pump(&mut staged);
+            staged.clear();
+            self.incoming = staged;
+            return r.map(|_| need);
+        }
+        let used = self.pump(buf)?;
+        if used == 0 && cut {
+            self.incoming.extend_from_slice(buf);
+            return Ok(buf.len());
+        }
+        Ok(used)
+    }
+
+    /// Advance the record layer over `buf` until it stops making progress;
+    /// returns how many of `buf`'s leading bytes it consumed.
+    fn pump(&mut self, buf: &mut [u8]) -> Result<usize, Step> {
+        let mut used = 0;
         let mut progress = self.tls.is_some();
         while progress {
             progress = false;
             let UnbufferedStatus { discard, state } = match self.tls.as_mut() {
-                Some(tls) => tls.process_tls_records(&mut self.incoming),
+                Some(tls) => tls.process_tls_records(&mut buf[used..]),
                 None => break,
             };
             let st = match state {
                 Ok(st) => st,
                 Err(e) => {
                     println!("FAIL: tls: {:?}", e);
-                    return Some(Step::Failed(Error::Tls));
+                    return Err(Step::Failed(Error::Tls));
                 }
             };
             match st {
@@ -338,12 +378,12 @@ impl Conn {
                             Ok(rec) => {
                                 if let Err(e) = self.parser.feed(rec.payload, self.sink.as_mut()) {
                                     println!("FAIL: http: {:?}", e);
-                                    return Some(Step::Failed(Error::BadResponse));
+                                    return Err(Step::Failed(Error::BadResponse));
                                 }
                             }
                             Err(e) => {
                                 println!("FAIL: tls record: {:?}", e);
-                                return Some(Step::Failed(Error::Tls));
+                                return Err(Step::Failed(Error::Tls));
                             }
                         }
                     }
@@ -359,7 +399,7 @@ impl Conn {
                         }
                         Err(e) => {
                             println!("FAIL: tls encode: {:?}", e);
-                            return Some(Step::Failed(Error::Tls));
+                            return Err(Step::Failed(Error::Tls));
                         }
                     }
                 }
@@ -380,15 +420,15 @@ impl Conn {
                             }
                             Err(e) => {
                                 println!("FAIL: tls encrypt: {:?}", e);
-                                return Some(Step::Failed(Error::Tls));
+                                return Err(Step::Failed(Error::Tls));
                             }
                         }
                     }
                 }
                 _ => {}
             }
-            self.incoming.drain(..discard);
+            used += discard;
         }
-        None
+        Ok(used)
     }
 }
