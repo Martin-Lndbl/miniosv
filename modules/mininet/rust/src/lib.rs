@@ -56,6 +56,9 @@ pub struct Config {
     /// RX descriptors per queue to ask for; 0 is the default of 4096, and the
     /// device clamps what it cannot give.
     pub rx_desc: u16,
+    /// The one host dialled, if known: on the local subnet it is resolved on
+    /// queue 0 in the gateway's place, since ARP replies steer nowhere else.
+    pub peer: Option<[u8; 4]>,
 }
 
 /// Learned once on queue 0: DHCP and ARP replies are not steered by RSS.
@@ -77,7 +80,7 @@ pub struct Stack {
 }
 
 impl Stack {
-    /// Start port 0, read the RSS model, take a lease, resolve the gateway.
+    /// Start port 0, read the RSS model, take a lease, resolve the next hop.
     pub fn up(cfg: &Config) -> Result<Stack, Error> {
         let want = cfg.queues.max(1);
         let queues = nic::clamp_queues(want);
@@ -87,7 +90,7 @@ impl Stack {
 
         let (pools, mac) = nic::probe_and_open(queues, cfg.rx_desc)?;
         let rss = rss::Rss::load(queues)?;
-        let (ip, prefix_len, gateway_ip, gateway_mac) = dhcp::learn_network(pools[0].as_ptr(), mac)?;
+        let (ip, prefix_len, gateway_ip, gateway_mac) = dhcp::learn_network(pools[0].as_ptr(), mac, cfg.peer)?;
 
         Ok(Stack {
             pools,
