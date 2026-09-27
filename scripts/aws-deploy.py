@@ -193,7 +193,7 @@ def spot_subnets(ec2_client, subnet_id):
     return [(subnet_id, desc["AvailabilityZone"])] + [(s["SubnetId"], s["AvailabilityZone"]) for s in rest]
 
 
-def launch(ec2_client, run_kwargs: dict, market: str) -> tuple[dict, str, str]:
+def launch(ec2_client, run_kwargs: dict, market: str, zone=None) -> tuple[dict, str, str]:
     """run_instances, on the market asked for; returns the response, the
     market used and the zone. Spot is a one-time request at the default max
     price (the on-demand rate), terminated if reclaimed; a bench run is
@@ -201,10 +201,15 @@ def launch(ec2_client, run_kwargs: dict, market: str) -> tuple[dict, str, str]:
     every zone of the subnet's VPC before the verdict. "spot" fails if none
     provides one: a run that asked for spot and got on-demand would be billed
     at ten times what was expected. "spot-or-on-demand" then retries
-    on-demand, in the subnet given."""
+    on-demand, in the subnet given. `zone` pins the launch to one zone -- a
+    bench client beside the server it dials -- and a refusal there is the verdict."""
     zone_of = lambda sn: (sn[1] if sn else "the default zone")
+    sns = spot_subnets(ec2_client, run_kwargs.get("SubnetId"))
+    if zone:
+        sns = [sn for sn in sns if sn[1] == zone]
+        run_kwargs = dict(run_kwargs, SubnetId=sns[0][0])
     if market == "on-demand":
-        return ec2_client.run_instances(**run_kwargs), "on-demand", zone_of(spot_subnets(ec2_client, run_kwargs.get("SubnetId"))[0])
+        return ec2_client.run_instances(**run_kwargs), "on-demand", zone_of(sns[0])
     spot = dict(
         run_kwargs,
         InstanceMarketOptions={
@@ -216,7 +221,7 @@ def launch(ec2_client, run_kwargs: dict, market: str) -> tuple[dict, str, str]:
         },
     )
     last = None
-    for sn in spot_subnets(ec2_client, run_kwargs.get("SubnetId")):
+    for sn in sns:
         if sn:
             spot["SubnetId"] = sn[0]
         try:
@@ -228,7 +233,7 @@ def launch(ec2_client, run_kwargs: dict, market: str) -> tuple[dict, str, str]:
         raise SystemExit(f"spot requested but not provided: {last.get('Code')}: "
                          f"{last.get('Message')}")
     print("Falling back to on-demand")
-    return ec2_client.run_instances(**run_kwargs), "on-demand", zone_of(spot_subnets(ec2_client, run_kwargs.get("SubnetId"))[0])
+    return ec2_client.run_instances(**run_kwargs), "on-demand", zone_of(sns[0])
 
 
 def main():
@@ -239,6 +244,7 @@ def main():
     parser.add_argument("instance", help="EC2 instance type to launch (e.g. t3.micro)")
     parser.add_argument("--attach", action="store_true", help="Stream system log and terminate instance on Ctrl+C")
     parser.add_argument("--subnet", help="VPC subnet ID to launch into (needed for buckets locked to a VPC endpoint)")
+    parser.add_argument("--zone", help="Launch only in this availability zone (a bench client beside the server it dials)")
     parser.add_argument("--security-group", action="append", default=[],
                         help="Security group ID to attach; may be repeated. Required when --subnet is set unless the subnet's default SG is acceptable.")
     parser.add_argument("--aws-profile", default=None, metavar="NAME",
@@ -390,7 +396,7 @@ def main():
     if args.security_group:
         run_kwargs["SecurityGroupIds"] = args.security_group
     try:
-        run_response, market, zone = launch(ec2_client, run_kwargs, args.market)
+        run_response, market, zone = launch(ec2_client, run_kwargs, args.market, args.zone)
     except (SystemExit, ClientError):
         # Nothing is running yet, but the AMI and snapshot already exist.
         cleanup_aws_resources(ec2_client, ami_id=ami_id, snapshot_id=snapshot_id)
