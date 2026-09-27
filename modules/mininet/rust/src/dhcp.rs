@@ -62,10 +62,11 @@ fn acquire(
     }
 }
 
-/// DHCP plus gateway ARP on queue 0.
+/// DHCP plus one ARP on queue 0: the gateway's, or an on-link peer's.
 pub(crate) fn learn_network(
     pool: *mut rte_pktmbuf_pool,
     mac: [u8; 6],
+    peer: Option<[u8; 4]>,
 ) -> Result<([u8; 4], u8, [u8; 4], [u8; 6]), Error> {
     let clk = MonoClock::new();
 
@@ -80,7 +81,11 @@ pub(crate) fn learn_network(
         let mut sockets = SocketSet::new(&mut storage[..]);
         let handle = sockets.add(dhcpv4::Socket::new());
         let (cidr, gw) = acquire(&mut iface, &mut dev, &mut sockets, handle, &clk)?;
-        (cidr.address(), cidr.prefix_len(), gw)
+        let hop = match peer.map(Ipv4Address::from_octets) {
+            Some(p) if cidr.contains_addr(&p) => p,
+            _ => gw,
+        };
+        (cidr.address(), cidr.prefix_len(), hop)
     };
 
     // Raw ARP, bypassing smoltcp, so the one reply can seed every worker.

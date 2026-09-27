@@ -147,6 +147,7 @@ pub extern "C" fn mininet_up(cfg: *const mininet_config) -> c_int {
     let stack = match Stack::up(&Config {
         queues: cfg.workers.min(u16::MAX as u32) as u16,
         rx_desc: 0,
+        peer: Some(ip),
     }) {
         Ok(s) => s,
         Err(e) => return code(e),
