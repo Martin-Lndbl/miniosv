@@ -25,6 +25,8 @@ use crate::tls;
 use crate::Netif;
 
 const PORT_ROTATION: usize = 8;
+/// smoltcp forgets a neighbour after 60 s, and only queue 0 hears ARP replies.
+const RESEED_MS: i64 = 30_000;
 
 pub struct WorkerConfig {
     pub peer: Endpoint,
@@ -77,6 +79,8 @@ pub struct Worker {
     rotation: Vec<u16>,
     next_port: usize,
     peer: Endpoint,
+    synth: Vec<u8>,
+    next_seed_ms: i64,
     tls_config: Arc<ClientConfig>,
     clk: MonoClock,
     last_poll_ns: u64,
@@ -123,7 +127,7 @@ impl Worker {
 
         // ARP replies would not steer to this queue; seed the cache instead.
         let synth = arp::synthetic_reply(netif.gateway_mac, netif.gateway_ip, netif.mac, netif.ip);
-        let mut dev = DpdkDevice::new(h.port, h.queue_id, h.pool, Some(owned), Some(synth));
+        let mut dev = DpdkDevice::new(h.port, h.queue_id, h.pool, Some(owned), Some(synth.clone()));
 
         let config = Config::new(EthernetAddress(netif.mac).into());
         let mut iface = Interface::new(config, &mut dev, Instant::from_millis(clk.elapsed_ms()));
@@ -170,6 +174,8 @@ impl Worker {
             next_port: 0,
             peer,
             tls_config: tls::client_config(),
+            synth,
+            next_seed_ms: clk.elapsed_ms() + RESEED_MS,
             clk,
             last_poll_ns: 0,
             last_busy_ns: 0,
@@ -272,6 +278,10 @@ impl Worker {
         let start_ns = self.clk.elapsed_ns();
         self.last_poll_ns = start_ns + self.clk.epoch_ns();
         let now_ms = (start_ns / 1_000_000) as i64;
+        if now_ms >= self.next_seed_ms {
+            self.dev.pending_synth = Some(self.synth.clone());
+            self.next_seed_ms = now_ms + RESEED_MS;
+        }
         let res = self
             .iface
             .poll(Instant::from_millis(now_ms), &mut self.dev, &mut self.sockets);
