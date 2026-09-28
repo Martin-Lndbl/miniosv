@@ -75,17 +75,8 @@ pub struct Netif {
     pub prefix_len: u8,
     pub gateway_ip: [u8; 4],
     pub gateway_mac: [u8; 6],
-    /// What `Config::resolve` found, for the workers to share out.
-    pub peers: [[u8; 4]; MAX_PEERS],
-    pub n_peers: u8,
-}
-
-pub const MAX_PEERS: usize = 16;
-
-impl Netif {
-    pub fn peer_for(&self, i: u16) -> Option<[u8; 4]> {
-        (self.n_peers > 0).then(|| self.peers[i as usize % self.n_peers as usize])
-    }
+    /// DHCP's resolver, for the worker that refreshes the name.
+    pub dns: [u8; 4],
 }
 
 /// One started port: its queues' mempools, its steering model and its lease.

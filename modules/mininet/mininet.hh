@@ -36,7 +36,7 @@ struct config {
     uint32_t workers;
     //! `workers * conns_per_worker` is the in-flight ceiling.
     uint32_t conns_per_worker;
-    //! 1: `host` is resolved at boot and its addresses shared out over the workers.
+    //! 1: `host` is resolved at boot and every minute after, its addresses shared out over the workers.
     int resolve;
 };
 
