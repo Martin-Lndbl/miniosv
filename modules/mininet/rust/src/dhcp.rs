@@ -62,8 +62,10 @@ fn acquire(
     }
 }
 
-/// DHCP plus one ARP on queue 0: the gateway's, or an on-link peer's.
+/// DHCP plus one ARP on this port's queue 0: the gateway's, or an on-link
+/// peer's. Every port has its own lease -- on EC2 every ENI has its own IP.
 pub(crate) fn learn_network(
+    port: u16,
     pool: *mut rte_pktmbuf_pool,
     mac: [u8; 6],
     peer: Option<[u8; 4]>,
@@ -73,7 +75,7 @@ pub(crate) fn learn_network(
     // Scoped so the device's &mut is released before the raw ARP below.
     let (ip, prefix, gw) = {
         // The DHCP and ARP path accepts every packet: nothing here is steered.
-        let mut dev = DpdkDevice::new(0, pool, None, None);
+        let mut dev = DpdkDevice::new(port, 0, pool, None, None);
         let config = Config::new(EthernetAddress(mac).into());
         let mut iface = Interface::new(config, &mut dev, Instant::from_millis(clk.elapsed_ms()));
 
@@ -100,7 +102,7 @@ pub(crate) fn learn_network(
         }
         let n = core::cmp::min(req.len(), cap as usize);
         core::ptr::copy_nonoverlapping(req.as_ptr(), data, n);
-        let _ = shim_mbuf_tx_burst(0, 0, &mut handle, &(n as u16), 1);
+        let _ = shim_mbuf_tx_burst(port, 0, &mut handle, &(n as u16), 1);
     }
 
     let mut iter: u64 = 0;
@@ -109,7 +111,7 @@ pub(crate) fn learn_network(
         let mut data = [ptr::null::<u8>(); 1];
         let mut len = [0u16; 1];
         let got = unsafe {
-            shim_mbuf_rx_burst_n(0, 0, handle.as_mut_ptr(), data.as_mut_ptr(), len.as_mut_ptr(), 1)
+            shim_mbuf_rx_burst_n(port, 0, handle.as_mut_ptr(), data.as_mut_ptr(), len.as_mut_ptr(), 1)
         };
         if got == 1 {
             let slice = unsafe { core::slice::from_raw_parts(data[0], len[0] as usize) };

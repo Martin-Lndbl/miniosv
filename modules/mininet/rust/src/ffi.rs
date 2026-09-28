@@ -20,6 +20,7 @@ extern "C" {
     pub fn shim_cpu_count() -> u64;
     pub fn write(fd: c_int, buf: *const u8, count: usize) -> isize;
 
+    pub fn shim_eth_dev_count() -> u16;
     pub fn shim_get_dev_info(port_id: u16, max_rx_queues: *mut u16, max_tx_queues: *mut u16) -> c_int;
     pub fn shim_pktmbuf_pool_create(
         name: *const u8,
@@ -68,5 +69,3 @@ extern "C" {
     pub fn shim_thread_unpark(handle: *mut c_void);
 }
 
-/// AWS gives a guest exactly one ENA interface, so the port is never in doubt.
-pub const PORT: u16 = 0;

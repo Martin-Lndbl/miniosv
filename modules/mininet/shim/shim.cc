@@ -39,6 +39,10 @@ rte_eth_dev *lookup_dev(uint16_t port_id) {
 
 extern "C" {
 
+uint16_t shim_eth_dev_count(void) {
+  return static_cast<uint16_t>(eth_os::instance.ifs.size());
+}
+
 int shim_get_dev_info(uint16_t port_id, uint16_t *max_rx_queues,
                        uint16_t *max_tx_queues) {
   rte_eth_dev *dev = lookup_dev(port_id);

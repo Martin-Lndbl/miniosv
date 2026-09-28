@@ -1,4 +1,4 @@
-//! The RSS steering model: queue = reta[toeplitz(key, 4-tuple) & (len-1)],
+//! One port's RSS steering model: queue = reta[toeplitz(key, 4-tuple) & (len-1)],
 //! key and table read off the device; validated against 200k live packets.
 //! Because we choose the source port it inverts: pick ports whose return
 //! traffic lands on the queue we poll, so a worker owns its queue outright.
@@ -7,7 +7,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::error::Error;
-use crate::ffi::{shim_rss_hash_key, shim_rss_reta, PORT};
+use crate::ffi::{shim_rss_hash_key, shim_rss_reta};
 
 pub(crate) const EPH_BASE: u16 = 49152;
 pub(crate) const EPH_LEN: usize = 16384;
@@ -28,7 +28,7 @@ pub(crate) struct Rss {
 }
 
 impl Rss {
-    pub(crate) fn load(n_queues: u16) -> Result<Rss, Error> {
+    pub(crate) fn load(port: u16, n_queues: u16) -> Result<Rss, Error> {
         let mut rss = Rss {
             key: [0; MAX_KEY],
             key_len: 0,
@@ -39,13 +39,12 @@ impl Rss {
 
         if n_queues == 1 {
             rss.single_queue = true;
-            // Same shape as the line below: the harness reads worker count off it.
-            println!("rss: {} queues, steering is trivial", n_queues);
+            println!("rss p{}: {} queues, steering is trivial", port, n_queues);
             return Ok(rss);
         }
 
         let mut key = [0u8; MAX_KEY];
-        let klen = unsafe { shim_rss_hash_key(PORT, key.as_mut_ptr(), key.len() as u16) };
+        let klen = unsafe { shim_rss_hash_key(port, key.as_mut_ptr(), key.len() as u16) };
         if klen <= 0 {
             println!("FAIL: RSS hash key unavailable (rc={})", klen);
             return Err(Error::RssUnavailable);
@@ -55,7 +54,7 @@ impl Rss {
         rss.key_len = klen;
 
         let mut reta = [0u16; MAX_RETA];
-        let n = unsafe { shim_rss_reta(PORT, reta.as_mut_ptr(), reta.len() as u16) };
+        let n = unsafe { shim_rss_reta(port, reta.as_mut_ptr(), reta.len() as u16) };
         if n <= 0 {
             println!("FAIL: RSS indirection table unavailable (rc={})", n);
             return Err(Error::RssUnavailable);
@@ -69,8 +68,8 @@ impl Rss {
         rss.reta_len = n;
 
         println!(
-            "rss: {} queues, {}-entry table, {}-byte key",
-            n_queues, n, klen
+            "rss p{}: {} queues, {}-entry table, {}-byte key",
+            port, n_queues, n, klen
         );
         Ok(rss)
     }

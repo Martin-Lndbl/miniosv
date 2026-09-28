@@ -66,6 +66,7 @@ pub struct Conn {
 
     outcome: Option<Step>,
     connect_start_ns: u64,
+    port: u16,
     queue_id: u16,
     src_port: u16,
     settled: bool,
@@ -106,6 +107,7 @@ impl Conn {
 
     pub(crate) fn new(
         handle: SocketHandle,
+        port: u16,
         queue_id: u16,
         src_port: u16,
         tls: Option<UnbufferedClientConnection>,
@@ -131,6 +133,7 @@ impl Conn {
             sink,
             outcome: None,
             connect_start_ns: now_ns,
+            port,
             queue_id,
             src_port,
             settled: false,
@@ -236,7 +239,8 @@ impl Conn {
             s.abort();
             #[cfg(not(feature = "selftest"))]
             println!(
-                "FAIL: q{} SYN timeout on port {} after {} ms — no SYN-ACK",
+                "FAIL: p{}q{} SYN timeout on port {} after {} ms — no SYN-ACK",
+                self.port,
                 self.queue_id,
                 self.src_port,
                 SYN_TIMEOUT_NS / 1_000_000
@@ -310,8 +314,8 @@ impl Conn {
             if !self.parser.headers_done() {
                 #[cfg(not(feature = "selftest"))]
                 println!(
-                    "FAIL: q{} port {} closed before answering",
-                    self.queue_id, self.src_port
+                    "FAIL: p{}q{} port {} closed before answering",
+                    self.port, self.queue_id, self.src_port
                 );
                 return self.finish(Step::Failed(Error::BadResponse));
             }
@@ -328,7 +332,7 @@ impl Conn {
     fn take(&mut self, buf: &mut [u8], cut: bool) -> Result<usize, Step> {
         if self.tls.is_none() {
             if let Err(e) = self.parser.feed(buf, self.sink.as_mut()) {
-                println!("FAIL: q{} port {} http: {:?}", self.queue_id, self.src_port, e);
+                println!("FAIL: p{}q{} port {} http: {:?}", self.port, self.queue_id, self.src_port, e);
                 return Err(Step::Failed(Error::BadResponse));
             }
             return Ok(buf.len());
