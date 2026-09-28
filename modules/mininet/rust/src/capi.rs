@@ -61,7 +61,6 @@ pub struct mininet_config {
     pub tls: c_int,
     pub workers: u32,
     pub conns_per_worker: u32,
-    pub resolve: c_int,
 }
 
 /// Mirrors `mininet::response`.
@@ -141,17 +140,20 @@ pub extern "C" fn mininet_up(cfg: *const mininet_config) -> c_int {
         Some(h) if !h.is_empty() => h,
         _ => return E_BAD_ARGUMENT,
     };
-    let ip = match unsafe { cstr(cfg.address) }.and_then(parse_ipv4) {
-        Some(ip) => ip,
-        None => return E_BAD_ARGUMENT,
+    // An address pins the peer; none means the name is resolved.
+    let address = unsafe { cstr(cfg.address) }.filter(|a| !a.is_empty());
+    let ip = match address.map(parse_ipv4) {
+        Some(Some(ip)) => Some(ip),
+        Some(None) => return E_BAD_ARGUMENT,
+        None => None,
     };
-    let peer = Endpoint::new(ip, host, cfg.tls != 0);
+    let peer = Endpoint::new(ip.unwrap_or([0; 4]), host, cfg.tls != 0);
 
     let stack = match Stack::up(&Config {
         queues: cfg.workers.min(u16::MAX as u32) as u16,
         rx_desc: 0,
-        peer: Some(ip),
-        resolve: (cfg.resolve != 0).then_some(host),
+        peer: ip,
+        resolve: ip.is_none().then_some(host),
     }) {
         Ok(s) => s,
         Err(e) => return code(e),
@@ -159,7 +161,7 @@ pub extern "C" fn mininet_up(cfg: *const mininet_config) -> c_int {
 
     let mut scfg = ServiceConfig::new(peer);
     scfg.conns_per_worker = cfg.conns_per_worker.max(1) as usize;
-    scfg.resolve = cfg.resolve != 0;
+    scfg.resolve = ip.is_none();
     let svc = match Service::start(&stack, &scfg) {
         Ok(s) => s,
         Err(e) => return code(e),
@@ -304,7 +306,7 @@ pub extern "C" fn mininet_strerror(rc: c_int) -> *const c_char {
         E_BUFFER_TOO_SMALL => "response body exceeded the buffer\0",
         E_NOT_UP => "mininet is not up\0",
         E_BAD_ARGUMENT => "bad argument\0",
-        E_DNS => "DNS: no resolver from DHCP, no port steering its reply here, or no answer\0",
+        E_DNS => "DNS: no resolver from DHCP, or no answer\0",
         _ => "unknown error\0",
     };
     s.as_ptr() as *const c_char
