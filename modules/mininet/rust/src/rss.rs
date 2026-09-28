@@ -143,6 +143,13 @@ impl OwnedPorts {
         self.count
     }
 
+    pub(crate) fn merge(&mut self, other: &OwnedPorts) {
+        for (a, b) in self.bitmap.iter_mut().zip(&other.bitmap) {
+            *a |= b;
+        }
+        self.count = self.bitmap.iter().map(|b| b.count_ones()).sum();
+    }
+
     #[inline]
     pub(crate) fn contains(&self, port: u16) -> bool {
         if port < EPH_BASE {

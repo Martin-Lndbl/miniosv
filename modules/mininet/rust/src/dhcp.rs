@@ -16,7 +16,7 @@ use crate::dns;
 use crate::error::Error;
 use crate::ffi::{shim_mbuf_alloc_tx, shim_mbuf_free, shim_mbuf_rx_burst_n, shim_mbuf_tx_burst};
 use crate::nic::PktPool;
-use crate::{Netif, MAX_PEERS};
+use crate::Netif;
 
 fn acquire(
     iface: &mut Interface,
@@ -84,8 +84,7 @@ pub(crate) fn learn_network(
         prefix_len: 0,
         gateway_ip: [0; 4],
         gateway_mac: [0; 6],
-        peers: [[0; 4]; MAX_PEERS],
-        n_peers: 0,
+        dns: [0; 4],
     };
 
     // Scoped so the devices' &mut are released before the raw ARP below.
@@ -106,11 +105,9 @@ pub(crate) fn learn_network(
                 println!("FAIL: DHCP offered no resolver to ask for {}", host);
                 return Err(Error::Dns);
             }
-            let found = dns::resolve(&mut iface, &mut devs, resolver, host, pools.len(), &clk)?;
-            let n = found.len().min(MAX_PEERS);
-            netif.peers[..n].copy_from_slice(&found[..n]);
-            netif.n_peers = n as u8;
+            dns::resolve(&mut iface, &mut devs, resolver, host, pools.len(), &clk)?;
         }
+        netif.dns = resolver;
         let hop = match peer.map(Ipv4Address::from_octets) {
             Some(p) if cidr.contains_addr(&p) => p,
             _ => gw,

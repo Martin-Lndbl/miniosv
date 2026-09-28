@@ -16,6 +16,7 @@ use crate::arp;
 use crate::clock::MonoClock;
 use crate::conn::{Conn, ConnBufs};
 use crate::device::DpdkDevice;
+use crate::dns;
 use crate::endpoint::Endpoint;
 use crate::error::Error;
 use crate::http::BodySink;
@@ -79,6 +80,12 @@ pub struct Worker {
     rotation: Vec<u16>,
     next_port: usize,
     peer: Endpoint,
+    resolve: bool,
+    shift: usize,
+    want_conns: usize,
+    netif: Netif,
+    rss: Rss,
+    refresher: Option<dns::Refresher>,
     synth: Vec<u8>,
     next_seed_ms: i64,
     tls_config: Arc<ClientConfig>,
@@ -96,7 +103,7 @@ impl Worker {
         let netif = h.netif;
         let mut peer = cfg.peer.clone();
         if cfg.resolve {
-            peer.ip = netif.peer_for(h.queue_id).ok_or(Error::Dns)?;
+            peer.ip = dns::peer_for(h.queue_id as usize).ok_or(Error::Dns)?;
             let a = peer.ip;
             println!("p{}q{}: {} -> {}.{}.{}.{}", h.port, h.queue_id, peer.host, a[0], a[1], a[2], a[3]);
         }
@@ -137,7 +144,7 @@ impl Worker {
         let _ = iface.routes_mut().add_default_ipv4_route(gw);
 
         let storage: &'static mut [SocketStorage<'static>] = Box::leak(
-            (0..slots)
+            (0..slots + 1)
                 .map(|_| SocketStorage::EMPTY)
                 .collect::<Vec<SocketStorage<'static>>>()
                 .into_boxed_slice(),
@@ -154,6 +161,9 @@ impl Worker {
             sock.set_ack_delay(None);
             handles.push(sockets.add(sock));
         }
+        let refresher = (cfg.resolve && h.port == 0 && h.queue_id == 0)
+            .then(|| dns::Refresher::new(&mut sockets, netif.dns, &peer.host, clk.elapsed_ms()))
+            .flatten();
 
         let mut conns = Vec::with_capacity(slots);
         conns.resize_with(slots, || None);
@@ -173,6 +183,12 @@ impl Worker {
             rotation,
             next_port: 0,
             peer,
+            resolve: cfg.resolve,
+            shift: 0,
+            want_conns: cfg.conns,
+            netif,
+            rss: h.rss,
+            refresher,
             tls_config: tls::client_config(),
             synth,
             next_seed_ms: clk.elapsed_ms() + RESEED_MS,
@@ -191,6 +207,33 @@ impl Worker {
 
     pub fn peer_ip(&self) -> [u8; 4] {
         self.peer.ip
+    }
+
+    /// The table's address for this queue; a new one gets its own port set.
+    fn adopt(&mut self) {
+        let Some(ip) = dns::peer_for(self.queue_id as usize + self.shift) else { return };
+        if ip == self.peer.ip {
+            return;
+        }
+        let owned = self.rss.owned_ports(ip, self.peer.port, self.netif.ip, self.queue_id);
+        let rotation = owned.spread(self.want_conns * PORT_ROTATION);
+        if rotation.is_empty() {
+            return;
+        }
+        println!("p{}q{}: {} -> {}.{}.{}.{}", self.port, self.queue_id, self.peer.host, ip[0], ip[1], ip[2], ip[3]);
+        self.peer.ip = ip;
+        self.rotation = rotation;
+        // Open connections still use the old ports: admit both.
+        let mut all = owned;
+        if let Some(old) = self.dev.owned_ports.take() {
+            all.merge(&old);
+        }
+        self.dev.owned_ports = Some(all);
+    }
+
+    /// A dial that failed: the answer's next address from the next dial on.
+    pub fn dial_failed(&mut self) {
+        self.shift += 1;
     }
 
     pub fn clock(&self) -> &MonoClock {
@@ -231,6 +274,9 @@ impl Worker {
 
     /// Open `slot` on the next port in the rotation.
     pub fn connect_next(&mut self, slot: usize, head: &[u8], sink: Box<dyn BodySink>) -> Result<(), Error> {
+        if self.resolve {
+            self.adopt(); // before the port: the rotation is the address's
+        }
         let src_port = self.rotation[self.next_port % self.rotation.len()];
         self.next_port = self.next_port.wrapping_add(1);
         self.connect_on(slot, src_port, head, sink)
@@ -287,6 +333,9 @@ impl Worker {
             .poll(Instant::from_millis(now_ms), &mut self.dev, &mut self.sockets);
         self.last_active = matches!(res, PollResult::SocketStateChanged);
         self.dev.flush_tx();
+        if let Some(r) = self.refresher.as_mut() {
+            r.step(&mut self.sockets, now_ms);
+        }
         let now_ns = self.clk.elapsed_ns();
         self.last_iface_ns = now_ns.saturating_sub(start_ns);
         self.last_dev = self.dev.take_counts();

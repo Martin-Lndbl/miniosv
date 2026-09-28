@@ -420,6 +420,9 @@ fn serve(
                 crate::Step::Failed(e) => Err(e),
                 crate::Step::Pending => unreachable!("outcome() is terminal"),
             };
+            if matches!(step, crate::Step::Failed(Error::SynTimeout)) {
+                w.dial_failed();
+            }
             // A reused socket the peer had already closed: re-dial once. GET
             // and HEAD are safe to repeat.
             if pd.reused && !pd.retried && matches!(step, crate::Step::Failed(_)) {

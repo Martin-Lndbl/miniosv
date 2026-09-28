@@ -753,6 +753,12 @@ fn test_dns(r: &mut Report) {
     let mut qr = rep.clone();
     qr[2] = 0x01;
     r.check(!parse(0xbeef, &qr, &mut out), "our own query echoed is not an answer");
+
+    use crate::dns::{peer_for, publish};
+    publish(&[[1, 1, 1, 1], [2, 2, 2, 2], [3, 3, 3, 3]]);
+    r.check(peer_for(0) == Some([1, 1, 1, 1]) && peer_for(4) == Some([2, 2, 2, 2]), "workers share the addresses out round robin");
+    publish(&[[9, 9, 9, 9]]);
+    r.check(peer_for(7) == Some([9, 9, 9, 9]), "a shorter answer replaces the table");
 }
 
 /// Runs every check. Returns the number that failed.

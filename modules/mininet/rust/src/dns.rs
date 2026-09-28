@@ -1,10 +1,15 @@
 //! One A query at boot, answered for every worker at once: the ENA does not
 //! steer UDP by port (replies land on queue 0), so boot polls every queue and
-//! the workers share out the addresses. A records and in-reply CNAMEs only.
+//! the workers share out the addresses. Afterwards the queue-0 worker asks
+//! again every minute, as curl's resolver cache would, and a worker adopts a
+//! new address at its next dial. A records and in-reply CNAMEs only.
 
+use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
-use smoltcp::iface::{Interface, SocketSet, SocketStorage};
+use smoltcp::iface::{Interface, SocketHandle, SocketSet, SocketStorage};
 use smoltcp::socket::udp;
 use smoltcp::time::Instant;
 use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address};
@@ -19,6 +24,32 @@ const TIMEOUT_MS: i64 = 15_000;
 const RETRY_MS: i64 = 1000;
 const MAX_QUERIES: usize = 3;
 const PORT: u16 = 40053;
+pub(crate) const MAX_PEERS: usize = 16;
+/// curl's DNS cache lifetime.
+const REFRESH_MS: i64 = 60_000;
+
+/// The addresses resolved, shared by every worker and read at each dial.
+const NO_PEER: AtomicU32 = AtomicU32::new(0);
+static PEERS: [AtomicU32; MAX_PEERS] = [NO_PEER; MAX_PEERS];
+static N_PEERS: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn publish(found: &[[u8; 4]]) {
+    for (slot, a) in PEERS.iter().zip(found) {
+        slot.store(u32::from_be_bytes(*a), Ordering::Relaxed);
+    }
+    N_PEERS.store(found.len().min(MAX_PEERS), Ordering::Release);
+}
+
+/// The address worker `i` dials; `None` before anything was resolved.
+pub(crate) fn peer_for(i: usize) -> Option<[u8; 4]> {
+    let n = N_PEERS.load(Ordering::Acquire);
+    (n > 0).then(|| PEERS[i % n].load(Ordering::Relaxed).to_be_bytes())
+}
+
+fn snapshot() -> Vec<[u8; 4]> {
+    let n = N_PEERS.load(Ordering::Acquire);
+    (0..n).map(|i| PEERS[i].load(Ordering::Relaxed).to_be_bytes()).collect()
+}
 
 /// A recursive A query for `host`; the length written.
 pub(crate) fn query(id: u16, host: &str, out: &mut [u8]) -> Option<usize> {
@@ -82,7 +113,7 @@ fn skip_name(pkt: &[u8], mut p: usize) -> Option<usize> {
     }
 }
 
-/// Every address `host` has, up to `want`, with all queues polled.
+/// Every address `host` has, up to `want`, with all queues polled; published.
 pub(crate) fn resolve(
     iface: &mut Interface,
     devs: &mut [DpdkDevice],
@@ -152,5 +183,72 @@ pub(crate) fn resolve(
     for a in &found {
         println!("DNS: {} -> {}.{}.{}.{}", host, a[0], a[1], a[2], a[3]);
     }
+    publish(&found);
     Ok(found)
+}
+
+/// The queue-0 worker's periodic query: a UDP socket in its set, a datagram a
+/// minute, the table replaced when the answer changed.
+pub(crate) struct Refresher {
+    handle: SocketHandle,
+    to: IpEndpoint,
+    host: String,
+    next_ms: i64,
+    pending: Option<(u16, i64)>,
+    found: Vec<[u8; 4]>,
+    last: Vec<[u8; 4]>,
+}
+
+impl Refresher {
+    pub(crate) fn new(sockets: &mut SocketSet<'static>, resolver: [u8; 4], host: &str, now_ms: i64) -> Option<Self> {
+        let buf = || {
+            udp::PacketBuffer::new(
+                Box::leak(alloc::vec![udp::PacketMetadata::EMPTY; 1].into_boxed_slice()),
+                Box::leak(alloc::vec![0u8; MAX_PACKET].into_boxed_slice()),
+            )
+        };
+        let mut sock = udp::Socket::new(buf(), buf());
+        sock.bind(PORT).ok()?;
+        Some(Self {
+            handle: sockets.add(sock),
+            to: IpEndpoint::new(IpAddress::Ipv4(Ipv4Address::from_octets(resolver)), 53),
+            host: host.into(),
+            next_ms: now_ms + REFRESH_MS,
+            pending: None,
+            found: Vec::new(),
+            last: snapshot(),
+        })
+    }
+
+    pub(crate) fn step(&mut self, sockets: &mut SocketSet<'_>, now_ms: i64) {
+        let s = sockets.get_mut::<udp::Socket>(self.handle);
+        match self.pending {
+            Some((id, deadline)) => {
+                if let Ok((data, _)) = s.recv() {
+                    if parse(id, data, &mut self.found) && !self.found.is_empty() {
+                        let changed = self.found != self.last;
+                        if changed {
+                            publish(&self.found);
+                            self.last = core::mem::take(&mut self.found);
+                        }
+                        println!("DNS: refreshed {}: {} address(es){}", self.host, self.last.len(), if changed { ", changed" } else { "" });
+                        self.pending = None;
+                    }
+                } else if now_ms >= deadline {
+                    self.pending = None; // the old answer stands
+                }
+            }
+            None if now_ms >= self.next_ms => {
+                let id = now_ms as u16 ^ 0x2468;
+                let mut msg = [0u8; MAX_PACKET];
+                if let Some(n) = query(id, &self.host, &mut msg) {
+                    let _ = s.send_slice(&msg[..n], self.to);
+                }
+                self.found.clear();
+                self.pending = Some((id, now_ms + 3000));
+                self.next_ms = now_ms + REFRESH_MS;
+            }
+            None => {}
+        }
+    }
 }
