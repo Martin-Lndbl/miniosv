@@ -1,4 +1,5 @@
-//! A smoltcp `Device` over one minidpdk queue. Nothing is copied on either path.
+//! A smoltcp `Device` over one minidpdk queue of one port. Nothing is copied
+//! on either path.
 
 use alloc::vec::Vec;
 use core::ffi::c_void;
@@ -7,7 +8,7 @@ use core::ptr;
 use smoltcp::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
 
-use crate::ffi::{rte_pktmbuf_pool, shim_mbuf_alloc_tx, shim_mbuf_free, shim_mbuf_rx_burst_n, shim_mbuf_tx_burst, PORT};
+use crate::ffi::{rte_pktmbuf_pool, shim_mbuf_alloc_tx, shim_mbuf_free, shim_mbuf_rx_burst_n, shim_mbuf_tx_burst};
 use crate::rss::OwnedPorts;
 use crate::stats;
 
@@ -21,6 +22,8 @@ const TX_BATCH: usize = 32;
 const TX_FULL_SPINS: u32 = 10_000;
 
 pub(crate) struct DpdkDevice {
+    /// The NIC this queue belongs to; one per ENI on EC2.
+    pub(crate) port: u16,
     pub(crate) queue_id: u16,
     pub(crate) pool: *mut rte_pktmbuf_pool,
     /// One fabricated frame, seeding the neighbour cache with the gateway's MAC.
@@ -43,12 +46,14 @@ pub(crate) struct DpdkDevice {
 
 impl DpdkDevice {
     pub(crate) fn new(
+        port: u16,
         queue_id: u16,
         pool: *mut rte_pktmbuf_pool,
         owned_ports: Option<OwnedPorts>,
         pending_synth: Option<Vec<u8>>,
     ) -> Self {
         Self {
+            port,
             queue_id,
             pool,
             pending_synth,
@@ -75,7 +80,7 @@ impl DpdkDevice {
             return;
         }
         let sent = unsafe {
-            shim_mbuf_tx_burst(PORT, self.queue_id, self.tx_handles.as_mut_ptr(), self.tx_lens.as_ptr(), self.tx_len as u16)
+            shim_mbuf_tx_burst(self.port, self.queue_id, self.tx_handles.as_mut_ptr(), self.tx_lens.as_ptr(), self.tx_len as u16)
         } as usize;
         self.tx_pkts += sent as u64;
         let held = self.tx_len - sent;
@@ -225,7 +230,7 @@ impl Device for DpdkDevice {
             if self.rx_pref_pos == self.rx_pref_len {
                 let got = unsafe {
                     shim_mbuf_rx_burst_n(
-                        PORT,
+                        self.port,
                         self.queue_id,
                         self.rx_pref_handles.as_mut_ptr(),
                         self.rx_pref_data.as_mut_ptr(),

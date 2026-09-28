@@ -4,6 +4,9 @@
 
 extern "C" {
 
+// Ports the drivers registered: one per NIC (on EC2, one per ENI attached).
+uint16_t shim_eth_dev_count(void);
+
 int shim_get_dev_info(uint16_t port_id, uint16_t *max_rx_queues,
                        uint16_t *max_tx_queues);
 

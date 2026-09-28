@@ -1,5 +1,6 @@
-//! One worker: one RSS queue, one interface, one set of connections, and the
-//! source ports whose return traffic steers to that queue. Shared-nothing.
+//! One worker: one RSS queue of one port, one interface, one set of
+//! connections, and the source ports whose return traffic steers to that
+//! queue. Shared-nothing, across ports as well as queues.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -46,6 +47,7 @@ impl WorkerConfig {
 /// A `Send` ticket for one queue; the worker itself is built on its own thread.
 #[derive(Clone, Copy)]
 pub struct WorkerHandle {
+    pub(crate) port: u16,
     pub(crate) queue_id: u16,
     pub(crate) pool: *mut rte_pktmbuf_pool,
     pub(crate) netif: Netif,
@@ -61,6 +63,7 @@ impl WorkerHandle {
 }
 
 pub struct Worker {
+    port: u16,
     queue_id: u16,
     iface: Interface,
     dev: DpdkDevice,
@@ -91,14 +94,15 @@ impl Worker {
         let slots = owned.spread(cfg.conns).len();
         let rotation = owned.spread(cfg.conns * PORT_ROTATION);
         if slots == 0 {
-            println!("FAIL: q{}: no ephemeral port steers here", h.queue_id);
+            println!("FAIL: p{}q{}: no ephemeral port steers here", h.port, h.queue_id);
             return Err(Error::NoPorts);
         }
         if slots < cfg.conns {
-            println!("q{}: only {} usable ports for {} connections", h.queue_id, slots, cfg.conns);
+            println!("p{}q{}: only {} usable ports for {} connections", h.port, h.queue_id, slots, cfg.conns);
         }
         println!(
-            "q{}: {} of {} ephemeral ports steer here; using {}",
+            "p{}q{}: {} of {} ephemeral ports steer here; using {}",
+            h.port,
             h.queue_id,
             owned.count(),
             EPH_LEN,
@@ -110,7 +114,7 @@ impl Worker {
 
         // ARP replies would not steer to this queue; seed the cache instead.
         let synth = arp::synthetic_reply(netif.gateway_mac, netif.gateway_ip, netif.mac, netif.ip);
-        let mut dev = DpdkDevice::new(h.queue_id, h.pool, Some(owned), Some(synth));
+        let mut dev = DpdkDevice::new(h.port, h.queue_id, h.pool, Some(owned), Some(synth));
 
         let config = Config::new(EthernetAddress(netif.mac).into());
         let mut iface = Interface::new(config, &mut dev, Instant::from_millis(clk.elapsed_ms()));
@@ -145,6 +149,7 @@ impl Worker {
         bufs.resize_with(slots, || Some(ConnBufs::new()));
 
         Ok(Worker {
+            port: h.port,
             queue_id: h.queue_id,
             iface,
             dev,
@@ -222,7 +227,7 @@ impl Worker {
         {
             let s = self.sockets.get_mut::<tcp::Socket>(handle);
             if s.connect(self.iface.context(), dst, src_port).is_err() {
-                println!("q{}[{}] connect() rejected", self.queue_id, slot);
+                println!("p{}q{}[{}] connect() rejected", self.port, self.queue_id, slot);
                 return Err(Error::ConnectRejected);
             }
         }
@@ -236,6 +241,7 @@ impl Worker {
         let now_ns = self.clk.elapsed_ns();
         self.conns[slot] = Some(Conn::new(
             handle,
+            self.port,
             self.queue_id,
             src_port,
             tls,

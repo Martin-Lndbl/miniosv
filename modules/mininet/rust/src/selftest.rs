@@ -473,7 +473,7 @@ fn test_port_filter(r: &mut Report) {
     let owned = rss.owned_ports(PEER, 443, US, 1);
     let mine = owned.spread(1)[0];
     let other = (EPH_BASE..u16::MAX).find(|&p| !owned.contains(p)).unwrap_or(EPH_BASE);
-    let dev = DpdkDevice::new(1, core::ptr::null_mut(), Some(owned), None);
+    let dev = DpdkDevice::new(0, 1, core::ptr::null_mut(), Some(owned), None);
     let frame = |proto: u8, dst_port: u16| -> [u8; 54] {
         let mut f = [0u8; 54];
         f[12..14].copy_from_slice(&[0x08, 0x00]);
@@ -495,7 +495,7 @@ fn test_port_filter(r: &mut Report) {
     arp[12..14].copy_from_slice(&[0x08, 0x06]);
     r.check(dev.accepts(&arp), "non-IPv4 is not filtered");
     r.check(dev.accepts(&frame(6, other)[..40]), "a runt frame is left to the stack");
-    let setup = DpdkDevice::new(0, core::ptr::null_mut(), None, None);
+    let setup = DpdkDevice::new(0, 0, core::ptr::null_mut(), None, None);
     r.check(setup.accepts(&frame(6, other)), "queue 0 in the setup phase accepts everything");
 }
 
@@ -561,7 +561,7 @@ mod loopback {
         pub(super) fn connect(&mut self, head: &[u8], sink: Box<dyn BodySink>) -> Conn {
             let dst = (Ipv4Address::new(127, 0, 0, 1), 80);
             let _ = self.sockets.get_mut::<tcp::Socket>(self.client).connect(self.iface.context(), dst, 49152);
-            Conn::new(self.client, 0, 49152, None, head, sink, ConnBufs::new(), self.now_ns())
+            Conn::new(self.client, 0, 0, 49152, None, head, sink, ConnBufs::new(), self.now_ns())
         }
 
         pub(super) fn now_ns(&self) -> u64 {
