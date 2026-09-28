@@ -24,6 +24,7 @@ enum : int {
     E_BUFFER_TOO_SMALL = -11, // body larger than the buffer; nothing overran
     E_NOT_UP          = -12,
     E_BAD_ARGUMENT    = -13,
+    E_DNS             = -14,  // resolve: no resolver from DHCP, or no answer
 };
 
 struct config {
@@ -35,6 +36,8 @@ struct config {
     uint32_t workers;
     //! `workers * conns_per_worker` is the in-flight ceiling.
     uint32_t conns_per_worker;
+    //! 1: `host` is resolved at boot and its addresses shared out over the workers.
+    int resolve;
 };
 
 enum : size_t {

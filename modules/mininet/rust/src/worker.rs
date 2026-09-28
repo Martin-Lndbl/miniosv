@@ -31,6 +31,8 @@ pub struct WorkerConfig {
     pub conns: usize,
     pub rx_buffer: usize,
     pub tx_buffer: usize,
+    /// Dial the boot-resolved address for this queue, not `peer.ip`.
+    pub resolve: bool,
 }
 
 impl WorkerConfig {
@@ -40,6 +42,7 @@ impl WorkerConfig {
             conns: 1,
             rx_buffer: 4 * 1024 * 1024,
             tx_buffer: 32 * 1024,
+            resolve: false,
         }
     }
 }
@@ -87,10 +90,16 @@ impl Worker {
     pub fn new(h: WorkerHandle, cfg: &WorkerConfig) -> Result<Worker, Error> {
         let clk = MonoClock::new();
         let netif = h.netif;
+        let mut peer = cfg.peer.clone();
+        if cfg.resolve {
+            peer.ip = netif.peer_for(h.queue_id).ok_or(Error::Dns)?;
+            let a = peer.ip;
+            println!("p{}q{}: {} -> {}.{}.{}.{}", h.port, h.queue_id, peer.host, a[0], a[1], a[2], a[3]);
+        }
 
         let owned = h
             .rss
-            .owned_ports(cfg.peer.ip, cfg.peer.port, netif.ip, h.queue_id);
+            .owned_ports(peer.ip, peer.port, netif.ip, h.queue_id);
         let slots = owned.spread(cfg.conns).len();
         let rotation = owned.spread(cfg.conns * PORT_ROTATION);
         if slots == 0 {
@@ -159,7 +168,7 @@ impl Worker {
             bufs,
             rotation,
             next_port: 0,
-            peer: cfg.peer.clone(),
+            peer,
             tls_config: tls::client_config(),
             clk,
             last_poll_ns: 0,
@@ -172,6 +181,10 @@ impl Worker {
 
     pub fn slots(&self) -> usize {
         self.handles.len()
+    }
+
+    pub fn peer_ip(&self) -> [u8; 4] {
+        self.peer.ip
     }
 
     pub fn clock(&self) -> &MonoClock {

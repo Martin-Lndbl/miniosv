@@ -152,6 +152,8 @@ pub struct ServiceConfig {
     pub conns_per_worker: usize,
     pub rx_buffer: usize,
     pub tx_buffer: usize,
+    /// Dial the boot-resolved addresses, not `peer.ip`.
+    pub resolve: bool,
 }
 
 impl ServiceConfig {
@@ -161,6 +163,7 @@ impl ServiceConfig {
             conns_per_worker: 8,
             rx_buffer: 4 * 1024 * 1024,
             tx_buffer: 32 * 1024,
+            resolve: false,
         }
     }
 }
@@ -186,9 +189,9 @@ impl Service {
             let queue = Arc::new(Queue::new());
             let mine = queue.clone();
             let peer = cfg.peer.clone();
-            let (conns, rx, tx) = (cfg.conns_per_worker, cfg.rx_buffer, cfg.tx_buffer);
+            let (conns, rx, tx, resolve) = (cfg.conns_per_worker, cfg.rx_buffer, cfg.tx_buffer, cfg.resolve);
             thread::spawn(
-                move || serve(handle, peer, conns, rx, tx, mine),
+                move || serve(handle, peer, conns, rx, tx, resolve, mine),
                 Some(worker_cpu(q)),
             );
             queues.push(queue);
@@ -347,6 +350,7 @@ fn serve(
     conns: usize,
     rx_buffer: usize,
     tx_buffer: usize,
+    resolve: bool,
     queue: Arc<Queue>,
 ) {
     let queue_id = handle.queue_id();
@@ -354,6 +358,7 @@ fn serve(
     cfg.conns = conns;
     cfg.rx_buffer = rx_buffer;
     cfg.tx_buffer = tx_buffer;
+    cfg.resolve = resolve;
 
     let mut w = match Worker::new(handle, &cfg) {
         Ok(w) => w,

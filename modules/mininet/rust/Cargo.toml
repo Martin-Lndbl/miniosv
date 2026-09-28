@@ -20,6 +20,7 @@ features = [
     "medium-ethernet",
     "proto-ipv4",
     "proto-dhcpv4",
+    "socket-udp",
     "socket-tcp",
     "socket-dhcpv4",
 ]
