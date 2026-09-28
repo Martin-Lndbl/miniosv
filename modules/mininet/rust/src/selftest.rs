@@ -725,6 +725,36 @@ fn test_loopback_http(r: &mut Report) {
     }
 }
 
+fn test_dns(r: &mut Report) {
+    println!("-- dns query and answer");
+    use crate::dns::{parse, query};
+    let mut q = [0u8; 512];
+    let n = query(0xbeef, "s3.eu-north-1.amazonaws.com.", &mut q).unwrap_or(0);
+    r.eq_u64(n as u64, 45, "query: header, four labels, root, type, class");
+    r.check(q[..2] == [0xbe, 0xef] && q[2..4] == [1, 0] && q[4..6] == [0, 1], "query id, recursion desired, one question");
+    r.check(&q[12..15] == b"\x02s3" && q[n - 5..n] == [0, 0, 1, 0, 1], "labels, then root, A, IN");
+    r.check(query(1, "", &mut q).is_none(), "an empty name is refused");
+    r.check(query(1, "a", &mut q[..16]).is_none(), "a buffer too small is refused");
+
+    // A bucket host's reply: question, CNAME, then the A record, names compressed.
+    let mut rep = Vec::new();
+    rep.extend_from_slice(&[0xbe, 0xef, 0x81, 0x80, 0, 1, 0, 2, 0, 0, 0, 0]);
+    rep.extend_from_slice(b"\x01b\x02s3\x00\x00\x01\x00\x01"); // b.s3 A IN, name at 12
+    rep.extend_from_slice(&[0xc0, 12, 0, 5, 0, 1, 0, 0, 0, 5, 0, 5, 2, b'r', b'3', 0xc0, 14]); // CNAME r3.s3
+    rep.extend_from_slice(&[0xc0, 34, 0, 1, 0, 1, 0, 0, 0, 5, 0, 4, 52, 95, 170, 8]); // A for it
+    let mut out = Vec::new();
+    r.check(parse(0xbeef, &rep, &mut out) && out == [[52, 95, 170, 8]], "the A record behind a CNAME is found through the pointers");
+    r.check(parse(0xbeef, &rep, &mut out) && out.len() == 1, "the same reply again adds nothing");
+    r.check(!parse(0xbeee, &rep, &mut out), "a reply to another id is ignored");
+    r.check(!parse(0xbeef, &rep[..50], &mut out), "a truncated reply is not an answer");
+    let mut nx = rep.clone();
+    nx[3] = 0x83;
+    r.check(!parse(0xbeef, &nx, &mut out), "NXDOMAIN is not an answer");
+    let mut qr = rep.clone();
+    qr[2] = 0x01;
+    r.check(!parse(0xbeef, &qr, &mut out), "our own query echoed is not an answer");
+}
+
 /// Runs every check. Returns the number that failed.
 pub fn run(verbose: bool) -> u32 {
     let mut r = Report::new(verbose);
@@ -737,6 +767,7 @@ pub fn run(verbose: bool) -> u32 {
     test_abi_helpers(&mut r);
     test_histogram(&mut r);
     test_port_filter(&mut r);
+    test_dns(&mut r);
     test_loopback_http(&mut r);
     test_queue(&mut r);
     println!(

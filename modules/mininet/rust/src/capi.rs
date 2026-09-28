@@ -26,6 +26,7 @@ const E_BAD_RESPONSE: c_int = -10;
 const E_BUFFER_TOO_SMALL: c_int = -11;
 const E_NOT_UP: c_int = -12;
 const E_BAD_ARGUMENT: c_int = -13;
+const E_DNS: c_int = -14;
 
 fn code(e: Error) -> c_int {
     match e {
@@ -40,6 +41,7 @@ fn code(e: Error) -> c_int {
         Error::Tls => E_TLS,
         Error::BadResponse => E_BAD_RESPONSE,
         Error::BufferTooSmall => E_BUFFER_TOO_SMALL,
+        Error::Dns => E_DNS,
     }
 }
 
@@ -59,6 +61,7 @@ pub struct mininet_config {
     pub tls: c_int,
     pub workers: u32,
     pub conns_per_worker: u32,
+    pub resolve: c_int,
 }
 
 /// Mirrors `mininet::response`.
@@ -148,6 +151,7 @@ pub extern "C" fn mininet_up(cfg: *const mininet_config) -> c_int {
         queues: cfg.workers.min(u16::MAX as u32) as u16,
         rx_desc: 0,
         peer: Some(ip),
+        resolve: (cfg.resolve != 0).then_some(host),
     }) {
         Ok(s) => s,
         Err(e) => return code(e),
@@ -155,6 +159,7 @@ pub extern "C" fn mininet_up(cfg: *const mininet_config) -> c_int {
 
     let mut scfg = ServiceConfig::new(peer);
     scfg.conns_per_worker = cfg.conns_per_worker.max(1) as usize;
+    scfg.resolve = cfg.resolve != 0;
     let svc = match Service::start(&stack, &scfg) {
         Ok(s) => s,
         Err(e) => return code(e),
@@ -299,6 +304,7 @@ pub extern "C" fn mininet_strerror(rc: c_int) -> *const c_char {
         E_BUFFER_TOO_SMALL => "response body exceeded the buffer\0",
         E_NOT_UP => "mininet is not up\0",
         E_BAD_ARGUMENT => "bad argument\0",
+        E_DNS => "DNS: no resolver from DHCP, no port steering its reply here, or no answer\0",
         _ => "unknown error\0",
     };
     s.as_ptr() as *const c_char

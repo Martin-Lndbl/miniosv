@@ -1,5 +1,5 @@
-//! Learning the interface configuration: DHCP for the address and route, then
-//! ARP for the gateway's MAC. Both run on queue 0 before any worker exists.
+//! Learning the interface configuration: DHCP for the address and route, DNS
+//! for the peer if asked, then ARP for the gateway's MAC; before any worker exists.
 
 use core::ffi::c_void;
 use core::ptr;
@@ -12,8 +12,11 @@ use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address};
 use crate::arp;
 use crate::clock::{MonoClock, ITER_BUDGET};
 use crate::device::DpdkDevice;
+use crate::dns;
 use crate::error::Error;
-use crate::ffi::{rte_pktmbuf_pool, shim_mbuf_alloc_tx, shim_mbuf_free, shim_mbuf_rx_burst_n, shim_mbuf_tx_burst};
+use crate::ffi::{shim_mbuf_alloc_tx, shim_mbuf_free, shim_mbuf_rx_burst_n, shim_mbuf_tx_burst};
+use crate::nic::PktPool;
+use crate::{Netif, MAX_PEERS};
 
 fn acquire(
     iface: &mut Interface,
@@ -21,7 +24,7 @@ fn acquire(
     sockets: &mut SocketSet<'_>,
     handle: smoltcp::iface::SocketHandle,
     clk: &MonoClock,
-) -> Result<(smoltcp::wire::Ipv4Cidr, Ipv4Address), Error> {
+) -> Result<(smoltcp::wire::Ipv4Cidr, Ipv4Address, [u8; 4]), Error> {
     println!("DHCP: requesting lease...");
     let mut iter: u64 = 0;
     loop {
@@ -49,7 +52,9 @@ fn acquire(
                 if let Some(gw) = cfg.router {
                     let _ = iface.routes_mut().add_default_ipv4_route(gw);
                 }
-                return Ok((a, router));
+                let dns = cfg.dns_servers.first().map(|d| d.octets()).unwrap_or([0; 4]);
+                println!("DHCP: resolver {}.{}.{}.{}", dns[0], dns[1], dns[2], dns[3]);
+                return Ok((a, router, dns));
             }
             Some(dhcpv4::Event::Deconfigured) => println!("DHCP: deconfigured"),
             None => {}
@@ -62,36 +67,61 @@ fn acquire(
     }
 }
 
-/// DHCP plus one ARP on this port's queue 0: the gateway's, or an on-link
-/// peer's. Every port has its own lease -- on EC2 every ENI has its own IP.
+/// DHCP, DNS if asked, then one raw ARP for the next hop: the gateway, or an
+/// on-link peer in its place. Every port has its own lease -- one IP per ENI.
 pub(crate) fn learn_network(
     port: u16,
-    pool: *mut rte_pktmbuf_pool,
+    pools: &[PktPool],
     mac: [u8; 6],
     peer: Option<[u8; 4]>,
-) -> Result<([u8; 4], u8, [u8; 4], [u8; 6]), Error> {
+    resolve: Option<&str>,
+) -> Result<Netif, Error> {
     let clk = MonoClock::new();
+    let pool = pools[0].as_ptr();
+    let mut netif = Netif {
+        mac,
+        ip: [0; 4],
+        prefix_len: 0,
+        gateway_ip: [0; 4],
+        gateway_mac: [0; 6],
+        peers: [[0; 4]; MAX_PEERS],
+        n_peers: 0,
+    };
 
-    // Scoped so the device's &mut is released before the raw ARP below.
-    let (ip, prefix, gw) = {
-        // The DHCP and ARP path accepts every packet: nothing here is steered.
-        let mut dev = DpdkDevice::new(port, 0, pool, None, None);
+    // Scoped so the devices' &mut are released before the raw ARP below.
+    {
+        // Nothing here is steered: accept everything.
+        let mut devs: alloc::vec::Vec<DpdkDevice> = (0..pools.len() as u16)
+            .map(|q| DpdkDevice::new(port, q, pools[q as usize].as_ptr(), None, None))
+            .collect();
         let config = Config::new(EthernetAddress(mac).into());
-        let mut iface = Interface::new(config, &mut dev, Instant::from_millis(clk.elapsed_ms()));
+        let mut iface = Interface::new(config, &mut devs[0], Instant::from_millis(clk.elapsed_ms()));
 
         let mut storage = [SocketStorage::EMPTY; 1];
         let mut sockets = SocketSet::new(&mut storage[..]);
         let handle = sockets.add(dhcpv4::Socket::new());
-        let (cidr, gw) = acquire(&mut iface, &mut dev, &mut sockets, handle, &clk)?;
+        let (cidr, gw, resolver) = acquire(&mut iface, &mut devs[0], &mut sockets, handle, &clk)?;
+        if let Some(host) = resolve {
+            if resolver == [0; 4] {
+                println!("FAIL: DHCP offered no resolver to ask for {}", host);
+                return Err(Error::Dns);
+            }
+            let found = dns::resolve(&mut iface, &mut devs, resolver, host, pools.len(), &clk)?;
+            let n = found.len().min(MAX_PEERS);
+            netif.peers[..n].copy_from_slice(&found[..n]);
+            netif.n_peers = n as u8;
+        }
         let hop = match peer.map(Ipv4Address::from_octets) {
             Some(p) if cidr.contains_addr(&p) => p,
             _ => gw,
         };
-        (cidr.address(), cidr.prefix_len(), hop)
-    };
+        netif.ip = cidr.address().octets();
+        netif.prefix_len = cidr.prefix_len();
+        netif.gateway_ip = hop.octets();
+    }
 
     // Raw ARP, bypassing smoltcp, so the one reply can seed every worker.
-    let req = arp::request(mac, ip.octets(), gw.octets());
+    let req = arp::request(mac, netif.ip, netif.gateway_ip);
     unsafe {
         let mut handle: *mut c_void = ptr::null_mut();
         let mut cap: u16 = 0;
@@ -115,14 +145,15 @@ pub(crate) fn learn_network(
         };
         if got == 1 {
             let slice = unsafe { core::slice::from_raw_parts(data[0], len[0] as usize) };
-            let hw = arp::parse_reply_from(slice, gw.octets());
+            let hw = arp::parse_reply_from(slice, netif.gateway_ip);
             unsafe { shim_mbuf_free(handle[0]) };
             if let Some(hw) = hw {
                 println!(
                     "gateway MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
                     hw[0], hw[1], hw[2], hw[3], hw[4], hw[5]
                 );
-                return Ok((ip.octets(), prefix, gw.octets(), hw));
+                netif.gateway_mac = hw;
+                return Ok(netif);
             }
         }
         iter = iter.wrapping_add(1);

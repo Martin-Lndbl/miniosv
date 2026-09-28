@@ -21,6 +21,7 @@ mod clock;
 mod conn;
 mod device;
 mod dhcp;
+mod dns;
 mod endpoint;
 mod error;
 mod ffi;
@@ -52,7 +53,7 @@ pub use worker::{Worker, WorkerConfig, WorkerHandle};
 use alloc::vec::Vec;
 use core::panic::PanicInfo;
 
-pub struct Config {
+pub struct Config<'a> {
     /// RSS queues, and so workers: at least one, at most every queue of every
     /// port. 0 asks for all of them.
     pub queues: u16,
@@ -62,6 +63,8 @@ pub struct Config {
     /// The one host dialled, if known: on the local subnet it is resolved on
     /// queue 0 in the gateway's place, since ARP replies steer nowhere else.
     pub peer: Option<[u8; 4]>,
+    /// A name to resolve at boot; each worker then dials one of its addresses.
+    pub resolve: Option<&'a str>,
 }
 
 /// Learned once on queue 0: DHCP and ARP replies are not steered by RSS.
@@ -72,6 +75,17 @@ pub struct Netif {
     pub prefix_len: u8,
     pub gateway_ip: [u8; 4],
     pub gateway_mac: [u8; 6],
+    /// What `Config::resolve` found, for the workers to share out.
+    pub peers: [[u8; 4]; MAX_PEERS],
+    pub n_peers: u8,
+}
+
+pub const MAX_PEERS: usize = 16;
+
+impl Netif {
+    pub fn peer_for(&self, i: u16) -> Option<[u8; 4]> {
+        (self.n_peers > 0).then(|| self.peers[i as usize % self.n_peers as usize])
+    }
 }
 
 /// One started port: its queues' mempools, its steering model and its lease.
@@ -96,7 +110,7 @@ impl Stack {
     /// their own, each port with its own RSS model, lease and next hop. Ports
     /// are filled in order, so asking for no more than the first port's queues
     /// brings up only that one and behaves exactly as a single-NIC image did.
-    pub fn up(cfg: &Config) -> Result<Stack, Error> {
+    pub fn up(cfg: &Config<'_>) -> Result<Stack, Error> {
         let n_ports = nic::count();
         let available: u16 = (0..n_ports).map(|p| nic::clamp_queues(p, u16::MAX)).sum();
         // 0 asks for everything the hardware has.
@@ -124,15 +138,8 @@ impl Stack {
             }
             let (pools, mac) = nic::probe_and_open(id, n, cfg.rx_desc)?;
             let rss = rss::Rss::load(id, n)?;
-            let (ip, prefix_len, gateway_ip, gateway_mac) =
-                dhcp::learn_network(id, pools[0].as_ptr(), mac, cfg.peer)?;
-            ports.push(Port {
-                id,
-                pools,
-                rss,
-                netif: Netif { mac, ip, prefix_len, gateway_ip, gateway_mac },
-                queues: n,
-            });
+            let netif = dhcp::learn_network(id, &pools, mac, cfg.peer, cfg.resolve)?;
+            ports.push(Port { id, pools, rss, netif, queues: n });
             left -= n;
         }
         if ports.is_empty() {

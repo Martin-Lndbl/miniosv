@@ -16,4 +16,6 @@ pub enum Error {
     /// Includes chunked transfer-encoding, which is not implemented.
     BadResponse,
     BufferTooSmall,
+    /// No resolver from DHCP, or no answer.
+    Dns,
 }
