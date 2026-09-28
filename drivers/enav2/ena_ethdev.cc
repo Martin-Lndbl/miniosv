@@ -2650,11 +2650,29 @@ static void ena_rx_queue_intr_set(ena_ring *rx_ring, bool unmask,
   ena_com_unmask_intr(rx_ring->ena_com_io_cq, &intr_reg);
 }
 
+/* Admin completions and AENQ events, on a thread of their own: both signal
+ * waiters through a sleeping mutex, which an interrupt context may not take.
+ */
+static void ena_mgmnt_work(ena_adapter *adapter) {
+  while (true) {
+    sched::thread::current()->wait_for([adapter] {
+      return adapter->mgmnt_pending.load(std::memory_order_acquire) ||
+             adapter->mgmnt_stop.load(std::memory_order_acquire);
+    });
+    if (adapter->mgmnt_stop.load(std::memory_order_acquire))
+      return;
+    adapter->mgmnt_pending.store(false, std::memory_order_release);
+    ena_com_admin_q_comp_intr_handler(&adapter->ena_dev);
+    if (likely(adapter->state == ENA_ADAPTER_STATE_RUNNING))
+      ena_com_aenq_intr_handler(&adapter->ena_dev, adapter);
+  }
+}
+
 static void ena_intr_msix_mgmnt(void *arg) {
   struct ena_adapter *adapter = static_cast<ena_adapter *>(arg);
-  ena_com_admin_q_comp_intr_handler(&adapter->ena_dev);
-  if (likely(adapter->state == ENA_ADAPTER_STATE_RUNNING))
-    ena_com_aenq_intr_handler(&adapter->ena_dev, arg);
+  adapter->mgmnt_pending.store(true, std::memory_order_release);
+  if (adapter->mgmnt_thread)
+    adapter->mgmnt_thread->wake();
 }
 
 static int ena_enable_msix(ena_adapter *adapter) {
@@ -2769,6 +2787,10 @@ static int ena_request_mgmnt_irq(ena_adapter *adapter) {
   }
 
   auto vec = assigned[0];
+  adapter->mgmnt_stop.store(false, std::memory_order_release);
+  adapter->mgmnt_pending.store(false, std::memory_order_release);
+  adapter->mgmnt_thread = sched::thread::make([adapter]() { ena_mgmnt_work(adapter); });
+  adapter->mgmnt_thread->start();
   // should be pinned
   if (!msi.assign_isr(vec, [adapter]() { ena_intr_msix_mgmnt(adapter); })) {
     msi.free_vectors(assigned);
@@ -2805,6 +2827,13 @@ static void ena_disable_msix(struct ena_adapter *adapter) {
 static void ena_free_irqs(ena_adapter *adapter) {
   if (adapter->irq_tbl[ENA_MGMNT_IRQ_IDX].mvec)
     delete adapter->irq_tbl[ENA_MGMNT_IRQ_IDX].mvec;
+  if (sched::thread *t = adapter->mgmnt_thread) {
+    adapter->mgmnt_stop.store(true, std::memory_order_release);
+    t->wake();
+    t->join();
+    sched::thread::dispose(t);
+    adapter->mgmnt_thread = nullptr;
+  }
   ena_disable_msix(adapter);
 }
 
