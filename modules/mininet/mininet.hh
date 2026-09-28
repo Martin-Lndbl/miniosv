@@ -24,11 +24,13 @@ enum : int {
     E_BUFFER_TOO_SMALL = -11, // body larger than the buffer; nothing overran
     E_NOT_UP          = -12,
     E_BAD_ARGUMENT    = -13,
-    E_DNS             = -14,  // resolve: no resolver from DHCP, or no answer
+    E_DNS             = -14,  // no resolver from DHCP, or no answer
 };
 
 struct config {
     const char *host;
+    //! An address to dial instead of resolving `host`; NULL or empty resolves
+    //! it at boot and every minute after, its addresses shared out over the workers.
     const char *address;
     //! 0 dials plain HTTP on port 80.
     int tls;
@@ -36,8 +38,6 @@ struct config {
     uint32_t workers;
     //! `workers * conns_per_worker` is the in-flight ceiling.
     uint32_t conns_per_worker;
-    //! 1: `host` is resolved at boot and every minute after, its addresses shared out over the workers.
-    int resolve;
 };
 
 enum : size_t {
