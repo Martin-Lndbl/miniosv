@@ -11,6 +11,7 @@ const char *mininet_host(void);
 int mininet_get(const char *head, uint64_t head_len, void *buf, uint64_t cap, mininet::response *out);
 const char *mininet_strerror(int rc);
 mininet::conn_stats mininet_conn_stats(void);
+void mininet_clear_stats(void);
 }
 
 namespace mininet {
@@ -38,6 +39,11 @@ const char *strerror(int rc)
 conn_stats stats()
 {
 	return mininet_conn_stats();
+}
+
+void clear_stats()
+{
+	mininet_clear_stats();
 }
 
 } // namespace mininet

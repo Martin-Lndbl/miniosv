@@ -277,6 +277,15 @@ pub extern "C" fn mininet_conn_stats() -> crate::stats::Stats {
     crate::stats::snapshot()
 }
 
+/// Zero the counters, so what follows is measured on its own. For a caller
+/// that runs several pieces of work in one boot: the sums can be recovered by
+/// differencing two snapshots, but the maxima and the setup/dial averages
+/// cannot. Requests already in flight keep their accounting.
+#[unsafe(no_mangle)]
+pub extern "C" fn mininet_clear_stats() {
+    crate::stats::reset(unsafe { crate::ffi::shim_time_ns() });
+}
+
 /// Run the stack's pure-logic unit tests and return how many checks failed.
 ///
 /// Needs no NIC and no network: it is the parser, the body sink and the

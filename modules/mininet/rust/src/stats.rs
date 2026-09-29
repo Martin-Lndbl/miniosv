@@ -198,6 +198,42 @@ fn poll(k: Poll) -> u64 {
     POLL[k as usize].load(Ordering::Relaxed)
 }
 
+/// Zero the counters so the next stretch is measured on its own. Several
+/// TPC-H queries share one boot, and the maxima and the setup/dial histogram
+/// averages cannot be recovered by differencing two snapshots the way the
+/// sums can -- this is what makes them per-query.
+///
+/// `IN_FLIGHT` survives: it is a live gauge, not a count, and zeroing it under
+/// an outstanding request would make the next `fetch_sub` wrap. `ACTIVE_SINCE`
+/// is re-stamped when something is still in flight, so the active span starts
+/// here instead of before the reset. The NIC's own counters are the device's
+/// and are not ours to clear; they stay cumulative and are differenced.
+pub fn reset(now_ns: u64) {
+    for c in [
+        &MISROUTED_DROPS, &TX_ALLOC_FAIL, &TX_BURST_FAIL,
+        &CONNS_ESTABLISHED, &CONNS_FAILED,
+        &REQUESTS_SERVED, &REQUESTS_REUSED, &REQUESTS_RETRIED, &REQUESTS_DONE,
+        &QUEUE_NS_TOTAL, &WIRE_NS_TOTAL, &BODY_BYTES,
+        &TTFB_NS_TOTAL, &TTFB_N, &XFER_NS_TOTAL, &XFER_N,
+        &WAKE_N, &WAKE_NS_TOTAL, &WAKE_NS_MAX,
+        &GET_CALLS, &GET_NS_TOTAL, &ACTIVE_NS_TOTAL,
+        &SETUP_NS_TOTAL, &SETUP_NS_MAX, &DIAL_NS_TOTAL, &DIAL_NS_MAX,
+    ] {
+        c.store(0, Ordering::Relaxed);
+    }
+    for h in [&SETUP_HIST, &DIAL_HIST] {
+        for b in h.iter() {
+            b.store(0, Ordering::Relaxed);
+        }
+    }
+    for p in POLL.iter() {
+        p.store(0, Ordering::Relaxed);
+    }
+    if IN_FLIGHT.load(Ordering::Acquire) > 0 {
+        ACTIVE_SINCE_NS.store(now_ns, Ordering::Relaxed);
+    }
+}
+
 pub fn snapshot() -> Stats {
     let nic = crate::nic::eth_stats().unwrap_or_default();
     Stats {
