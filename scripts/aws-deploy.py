@@ -124,6 +124,27 @@ def cleanup_aws_resources(ec2_client, instance_id=None, ami_id=None,
             print(f"WARN: terminate {instance_id} failed: {e}",
                   file=sys.stderr, flush=True)
 
+        # Terminating is not enough. A one-time spot request stays `active`
+        # after its instance dies, and an active request counts against the
+        # account's spot limit just as a running instance does -- so the next
+        # launch is refused with MaxSpotInstanceCountExceeded, which reads in
+        # the logs as ordinary scarcity. Cancel after terminating, never
+        # before: cancelling does not stop a running instance.
+        try:
+            reqs = ec2_client.describe_spot_instance_requests(
+                Filters=[{"Name": "instance-id", "Values": [instance_id]}])
+            sirs = [r["SpotInstanceRequestId"]
+                    for r in reqs.get("SpotInstanceRequests", [])
+                    if r.get("State") in ("open", "active")]
+            if sirs:
+                print(f"Cancelling spot request(s) {', '.join(sirs)}...",
+                      flush=True)
+                ec2_client.cancel_spot_instance_requests(
+                    SpotInstanceRequestIds=sirs)
+        except (BotoCoreError, ClientError) as e:
+            print(f"WARN: cancel spot request for {instance_id} failed: {e}",
+                  file=sys.stderr, flush=True)
+
     if ami_id:
         try:
             print(f"Deregistering AMI {ami_id}...", flush=True)
