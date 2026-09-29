@@ -434,6 +434,16 @@ fn serve(
                     continue;
                 }
             }
+            // Past the retry, so this one is a real failure: either a fresh
+            // connection died, or the re-dial did not save it.
+            if let crate::Step::Failed(e) = step {
+                println!(
+                    "FAIL: q{} request failed{}: {:?}",
+                    queue_id,
+                    if pd.retried { " after re-dial" } else { "" },
+                    e
+                );
+            }
             let head_ns = w.conn(slot).and_then(|c| c.head_ns()).map(|h| h + epoch_ns);
             stats::request_finished(
                 pd.picked_ns.saturating_sub(unsafe { (*pd.slot).submitted_ns }),

@@ -311,12 +311,13 @@ impl Conn {
         );
         if self.handshake_done && self.request_queued && ended && self.outgoing.is_empty() && !s.can_recv() {
             // Closed before any head arrived is a failure, not an empty body.
+            // Not reported here: a peer that closed a connection we reused is
+            // the ordinary end of a keep-alive, and service.rs re-dials once.
+            // It happened ~1150 times a boot on the sf=100 suite and was
+            // recovered every time, so a line here is 1150 lines of noise
+            // hiding the failures that matter. service.rs reports the ones
+            // that are still failures after the retry.
             if !self.parser.headers_done() {
-                #[cfg(not(feature = "selftest"))]
-                println!(
-                    "FAIL: p{}q{} port {} closed before answering",
-                    self.port, self.queue_id, self.src_port
-                );
                 return self.finish(Step::Failed(Error::BadResponse));
             }
             return self.finish(Step::Complete);
