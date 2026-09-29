@@ -123,6 +123,12 @@ struct conn_stats {
 
 conn_stats stats();
 
+//! Zero the counters so the next stretch is measured on its own. The sums
+//! could be recovered by differencing two stats() calls; the maxima and the
+//! setup/dial averages could not, which is why this exists. The NIC's own
+//! counters are the device's and keep counting.
+void clear_stats();
+
 } // namespace mininet
 
 #endif /* MININET_HH */
