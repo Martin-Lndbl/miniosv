@@ -86,6 +86,21 @@ int shim_eth_dev_configure(uint16_t port_id, uint16_t nb_rx_q,
   return rte_eth_dev_configure(port_id, nb_rx_q, nb_tx_q, &conf);
 }
 
+uint16_t shim_eth_max_mtu(uint16_t port_id) {
+  auto *dev = lookup_dev(port_id);
+  if (!dev) return 0;
+  rte_eth_dev_info info;
+  std::memset(&info, 0, sizeof(info));
+  dev->get_dev_info(&info);
+  return info.max_mtu;
+}
+
+int shim_eth_set_mtu(uint16_t port_id, uint16_t mtu) {
+  auto *dev = lookup_dev(port_id);
+  if (!dev) return -1;
+  return dev->mtu_set(mtu);
+}
+
 void shim_adjust_nb_rx_tx_desc(uint16_t port_id, uint16_t *nb_rx_desc,
                                 uint16_t *nb_tx_desc) {
   rte_eth_dev_adjust_nb_rx_tx_desc(port_id, nb_rx_desc, nb_tx_desc);

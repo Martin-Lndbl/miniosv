@@ -9,7 +9,8 @@ use crate::device::RX_BURST;
 use crate::error::Error;
 use crate::ffi::{
     rte_pktmbuf_pool, shim_adjust_nb_rx_tx_desc, shim_dev_start, shim_eth_dev_configure,
-    shim_eth_stats, shim_get_dev_info, shim_macaddr_get, shim_pktmbuf_pool_create,
+    shim_eth_max_mtu, shim_eth_set_mtu, shim_eth_stats, shim_get_dev_info, shim_macaddr_get,
+    shim_pktmbuf_pool_create,
     shim_eth_dev_count, shim_rx_queue_setup, shim_tx_queue_setup,
 };
 use crate::print::BufWriter;
@@ -52,7 +53,7 @@ pub(crate) fn probe_and_open(
     n_queues: u16,
     rx_desc: u16,
 ) -> Result<(Vec<PktPool>, [u8; 6]), Error> {
-    const DATA_ROOM_SIZE: u16 = 1536;
+    const DATA_ROOM_SIZE: u16 = 9216;
     // 1024 descriptors dropped 3.3% of inbound frames (imissed) between polls.
     const DESC_NUM: u16 = 4096;
     const CACHE: u32 = 64;
@@ -75,6 +76,18 @@ pub(crate) fn probe_and_open(
 
     if unsafe { shim_eth_dev_configure(port, n_queues, n_queues) } != 0 {
         return Err(Error::NoDevice);
+    }
+    // ENA powers up at 1500 and drops anything larger, so the frame size the
+    // pool and smoltcp are sized for has to be programmed into the device too.
+    let want_mtu = crate::device::IP_MTU as u16;
+    let dev_max = unsafe { shim_eth_max_mtu(port) };
+    let mtu_rc = unsafe { shim_eth_set_mtu(port, want_mtu) };
+    println!(
+        "mtu: asked {}, device max {}, rc {}",
+        want_mtu, dev_max, mtu_rc
+    );
+    if mtu_rc != 0 {
+        println!("mtu: NOT programmed -- frames over 1500 will be dropped by the NIC");
     }
     let (mut rx_desc, mut tx_desc) = (rx_want, DESC_NUM);
     unsafe { shim_adjust_nb_rx_tx_desc(port, &mut rx_desc, &mut tx_desc) };

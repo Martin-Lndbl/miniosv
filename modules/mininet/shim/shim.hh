@@ -17,6 +17,12 @@ void *shim_pktmbuf_pool_create(const char *name, uint32_t n,
 int shim_eth_dev_configure(uint16_t port_id, uint16_t nb_rx_q,
                             uint16_t nb_tx_q);
 
+// Frame size. ENA powers up at 1500 and silently drops anything larger, so
+// jumbo needs the MTU programmed explicitly; max_mtu is what the device
+// advertises as its ceiling.
+uint16_t shim_eth_max_mtu(uint16_t port_id);
+int shim_eth_set_mtu(uint16_t port_id, uint16_t mtu);
+
 void shim_adjust_nb_rx_tx_desc(uint16_t port_id, uint16_t *nb_rx_desc,
                                 uint16_t *nb_tx_desc);
 

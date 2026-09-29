@@ -28,6 +28,10 @@ static IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_SINCE_NS: AtomicU64 = AtomicU64::new(0);
 static ACTIVE_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
+static RX_JUMBO_PKTS: AtomicU64 = AtomicU64::new(0);
+static RX_JUMBO_BYTES: AtomicU64 = AtomicU64::new(0);
+static RX_LEN_MAX: AtomicU64 = AtomicU64::new(0);
+
 static SETUP_NS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SETUP_NS_MAX: AtomicU64 = AtomicU64::new(0);
 static SETUP_HIST: [AtomicU64; BUCKETS] = [const { AtomicU64::new(0) }; BUCKETS];
@@ -187,11 +191,28 @@ pub struct Stats {
     /// Wall time during which at least one request was outstanding.
     pub active_ns_total: u64,
     /// Off the device; a frame it dropped never reached any queue.
+    /// Frames the stack saw over 1514 bytes, with their bytes, and the largest
+    /// single frame. Together with the NIC's totals these separate the two
+    /// populations instead of averaging them into one number.
+    pub rx_jumbo_pkts: u64,
+    pub rx_jumbo_bytes: u64,
+    pub rx_len_max: u64,
     pub nic_ipackets: u64,
     pub nic_ibytes: u64,
     pub nic_imissed: u64,
     pub nic_ierrors: u64,
     pub nic_rx_nombuf: u64,
+}
+
+/// Received frames, batched by the caller. "Jumbo" is any frame over the
+/// 1514 bytes a 1500-byte MTU allows, so a non-zero count is proof that jumbo
+/// frames arrived rather than an inference from an average.
+pub(crate) fn rx_frames(jumbo_pkts: u64, jumbo_bytes: u64, len_max: u16) {
+    if jumbo_pkts > 0 {
+        RX_JUMBO_PKTS.fetch_add(jumbo_pkts, Ordering::Relaxed);
+        RX_JUMBO_BYTES.fetch_add(jumbo_bytes, Ordering::Relaxed);
+    }
+    RX_LEN_MAX.fetch_max(len_max as u64, Ordering::Relaxed);
 }
 
 fn poll(k: Poll) -> u64 {
@@ -218,6 +239,7 @@ pub fn reset(now_ns: u64) {
         &WAKE_N, &WAKE_NS_TOTAL, &WAKE_NS_MAX,
         &GET_CALLS, &GET_NS_TOTAL, &ACTIVE_NS_TOTAL,
         &SETUP_NS_TOTAL, &SETUP_NS_MAX, &DIAL_NS_TOTAL, &DIAL_NS_MAX,
+        &RX_JUMBO_PKTS, &RX_JUMBO_BYTES, &RX_LEN_MAX,
     ] {
         c.store(0, Ordering::Relaxed);
     }
@@ -274,6 +296,9 @@ pub fn snapshot() -> Stats {
         get_calls: GET_CALLS.load(Ordering::Relaxed),
         get_ns_total: GET_NS_TOTAL.load(Ordering::Relaxed),
         active_ns_total: ACTIVE_NS_TOTAL.load(Ordering::Relaxed),
+        rx_jumbo_pkts: RX_JUMBO_PKTS.load(Ordering::Relaxed),
+        rx_jumbo_bytes: RX_JUMBO_BYTES.load(Ordering::Relaxed),
+        rx_len_max: RX_LEN_MAX.load(Ordering::Relaxed),
         nic_ipackets: nic.ipackets,
         nic_ibytes: nic.ibytes,
         nic_imissed: nic.imissed,
