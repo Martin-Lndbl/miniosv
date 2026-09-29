@@ -12,7 +12,11 @@ use crate::ffi::{rte_pktmbuf_pool, shim_mbuf_alloc_tx, shim_mbuf_free, shim_mbuf
 use crate::rss::OwnedPorts;
 use crate::stats;
 
-pub(crate) const MTU: usize = 1514;
+/// Ethernet frame size, header included: smoltcp derives ip_mtu (and from it
+/// the MSS it advertises) by subtracting the 14-byte header. 9015 = 9001 + 14.
+pub(crate) const MTU: usize = 9015;
+/// What the NIC and smoltcp both call the MTU: the frame minus its header.
+pub(crate) const IP_MTU: usize = MTU - 14;
 
 /// RX drains up to this many mbufs per burst.
 pub(crate) const RX_BURST: usize = 32;
@@ -38,6 +42,12 @@ pub(crate) struct DpdkDevice {
     rx_pref_len: u16,
     rx_pkts: u64,
     tx_pkts: u64,
+    /// Frame sizes, batched into stats every `kFrameFlush` frames so the
+    /// counters never touch a shared line per frame.
+    rx_jumbo_pkts: u64,
+    rx_jumbo_bytes: u64,
+    rx_len_max: u16,
+    rx_seen: u32,
     /// Frames written but not yet handed to the NIC: one doorbell per flush, not per frame.
     tx_handles: [*mut c_void; TX_BATCH],
     tx_lens: [u16; TX_BATCH],
@@ -65,6 +75,10 @@ impl DpdkDevice {
             rx_pref_len: 0,
             rx_pkts: 0,
             tx_pkts: 0,
+            rx_jumbo_pkts: 0,
+            rx_jumbo_bytes: 0,
+            rx_len_max: 0,
+            rx_seen: 0,
             tx_handles: [ptr::null_mut(); TX_BATCH],
             tx_lens: [0; TX_BATCH],
             tx_len: 0,
@@ -212,6 +226,17 @@ impl TxToken for DpdkTxToken<'_> {
     }
 }
 
+impl DpdkDevice {
+    /// Push the batched frame-size counters into stats. At most 1023 frames a
+    /// queue are still local when a run ends, out of hundreds of thousands.
+    fn flush_frame_stats(&mut self) {
+        stats::rx_frames(self.rx_jumbo_pkts, self.rx_jumbo_bytes, self.rx_len_max);
+        self.rx_jumbo_pkts = 0;
+        self.rx_jumbo_bytes = 0;
+        self.rx_seen = 0;
+    }
+}
+
 impl Device for DpdkDevice {
     type RxToken<'a>
         = DpdkRxToken
@@ -251,6 +276,17 @@ impl Device for DpdkDevice {
             let handle = self.rx_pref_handles[i];
             let data = self.rx_pref_data[i];
             let len = self.rx_pref_lens[i] as usize;
+            // Frame size, counted before `accepts` so this matches what the
+            // NIC delivered. Over 1514 is impossible at a 1500-byte MTU.
+            if len > 1514 {
+                self.rx_jumbo_pkts += 1;
+                self.rx_jumbo_bytes += len as u64;
+            }
+            self.rx_len_max = self.rx_len_max.max(len as u16);
+            self.rx_seen += 1;
+            if self.rx_seen >= 1024 {
+                self.flush_frame_stats();
+            }
 
             let ok = self.accepts(unsafe { core::slice::from_raw_parts(data, len) });
             if ok {

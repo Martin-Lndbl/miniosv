@@ -30,6 +30,8 @@ extern "C" {
         data_room_size: u16,
     ) -> *mut rte_pktmbuf_pool;
     pub fn shim_eth_dev_configure(port_id: u16, nb_rx_q: u16, nb_tx_q: u16) -> c_int;
+    pub fn shim_eth_max_mtu(port_id: u16) -> u16;
+    pub fn shim_eth_set_mtu(port_id: u16, mtu: u16) -> c_int;
     pub fn shim_adjust_nb_rx_tx_desc(port_id: u16, nb_rx_desc: *mut u16, nb_tx_desc: *mut u16);
     pub fn shim_rx_queue_setup(
         port_id: u16,
