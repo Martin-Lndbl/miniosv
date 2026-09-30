@@ -105,9 +105,11 @@ def cleanup_aws_resources(ec2_client, instance_id=None, ami_id=None,
         try:
             print(f"\nTerminating instance {instance_id}...", flush=True)
             ec2_client.terminate_instances(InstanceIds=[instance_id])
-            # AWS billing stops as soon as the instance reaches
-            # `shutting-down`; the full `terminated` state can take another
-            # 1-2 minutes and blocks the caller for no operational benefit.
+            # Billing stops at `shutting-down`, and with the spot vCPU quota
+            # raised past what a client and a long-living server need at once,
+            # the cores no longer have to be back before the next launch. So
+            # return as soon as the instance is on its way out: waiting for
+            # `terminated` costs 1-2 minutes a run and delays the row.
             for _ in range(30):
                 try:
                     desc = ec2_client.describe_instances(
