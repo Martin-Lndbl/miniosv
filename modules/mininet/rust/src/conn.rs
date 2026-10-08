@@ -332,7 +332,15 @@ impl Conn {
             // recovered every time, so a line here is 1150 lines of noise
             // hiding the failures that matter. service.rs reports the ones
             // that are still failures after the retry.
-            if !self.parser.headers_done() {
+            // Short of the length the head promised is a failure too, not a
+            // shorter body: the caller takes `bytes` as the object's.
+            let short = has_body(self.parser.status(), self.is_head)
+                && self
+                    .parser
+                    .head()
+                    .content_length
+                    .map_or(false, |want| self.parser.body_bytes() < want);
+            if !self.parser.headers_done() || short {
                 return self.finish(Step::Failed(Error::BadResponse));
             }
             return self.finish(Step::Complete);

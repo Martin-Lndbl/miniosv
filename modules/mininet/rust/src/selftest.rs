@@ -661,6 +661,16 @@ fn test_loopback_http(r: &mut Report) {
         r.check(!env.reusable(&conn), "a closed connection is not reused");
     }
 
+    // A length promised and not delivered: the FIN does not make it complete.
+    {
+        let mut env = Env::new();
+        let mut g = Guarded::new(10);
+        let mut conn = env.connect(GET, Box::new(g.sink()));
+        let step = env.drive(&mut conn, b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc", Server::ReplyThenClose);
+        r.check(step == Step::Failed(Error::BadResponse), "a body cut short of its length is a failure");
+        r.check(!env.reusable(&conn), "and the connection is not reused");
+    }
+
     // The server hangs up before answering.
     {
         let mut env = Env::new();
