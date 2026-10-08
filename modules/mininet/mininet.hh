@@ -59,7 +59,7 @@ struct response {
     char last_modified[DATE_MAX];
 };
 
-//! Call once; a second call is a no-op.
+//! Call once; a second call is a no-op, and a concurrent one returns once the first has its verdict.
 int up(const config &c);
 
 const char *host();

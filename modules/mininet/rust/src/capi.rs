@@ -4,7 +4,7 @@
 use alloc::boxed::Box;
 use core::ffi::{c_char, c_int, c_void, CStr};
 use core::ptr;
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 use crate::endpoint::Endpoint;
 use crate::error::Error;
@@ -54,6 +54,9 @@ struct Global {
 }
 
 static GLOBAL: AtomicPtr<Global> = AtomicPtr::new(ptr::null_mut());
+/// Held by the one call bringing the stack up; a concurrent second call
+/// waits on it rather than building a stack of its own.
+static STARTING: AtomicBool = AtomicBool::new(false);
 
 /// Mirrors `mininet::config`.
 #[repr(C)]
@@ -133,11 +136,25 @@ pub extern "C" fn mininet_up(cfg: *const mininet_config) -> c_int {
     if cfg.is_null() {
         return E_BAD_ARGUMENT;
     }
-    if !GLOBAL.load(Ordering::Acquire).is_null() {
-        return OK;
+    loop {
+        if !GLOBAL.load(Ordering::Acquire).is_null() {
+            return OK;
+        }
+        if STARTING
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            break;
+        }
+        core::hint::spin_loop();
     }
-    let cfg = unsafe { &*cfg };
+    let rc = up(unsafe { &*cfg });
+    STARTING.store(false, Ordering::Release);
+    rc
+}
 
+/// With `STARTING` held: nobody else is in here.
+fn up(cfg: &mininet_config) -> c_int {
     let host = match unsafe { cstr(cfg.host) } {
         Some(h) if !h.is_empty() => h,
         _ => return E_BAD_ARGUMENT,
@@ -177,10 +194,8 @@ pub extern "C" fn mininet_up(cfg: *const mininet_config) -> c_int {
         svc,
         host: host_z,
     }));
-    match GLOBAL.compare_exchange(ptr::null_mut(), global, Ordering::AcqRel, Ordering::Acquire) {
-        Ok(_) => OK,
-        Err(_) => OK,
-    }
+    GLOBAL.store(global, Ordering::Release);
+    OK
 }
 
 #[unsafe(no_mangle)]
