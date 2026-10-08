@@ -1951,6 +1951,20 @@ void libc_mmap()
         CHECK(munmap(p, size) == 0);
     }
 
+    test("mprotect reaches pages not yet backed, and takes only whole mappings");
+    {
+        const size_t size = 2ul << 20;
+        char *p = static_cast<char *>(mmap(nullptr, size, PROT_NONE,
+                                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+        CHECK(p != MAP_FAILED);
+        CHECK(mprotect(p, size, PROT_READ | PROT_WRITE) == 0);
+        p[0] = 1;              /* backed on first touch, with the new permission */
+        p[size - 1] = 2;
+        CHECK(p[0] == 1 && p[size - 1] == 2);
+        CHECK(mprotect(p, page, PROT_READ) != 0 && errno == EINVAL);
+        CHECK(munmap(p, size) == 0);
+    }
+
     test("MADV_DONTNEED gives the memory back and reads as zero");
     {
         const size_t size = 8ul << 20;
