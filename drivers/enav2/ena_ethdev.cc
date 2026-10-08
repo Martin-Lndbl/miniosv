@@ -2787,10 +2787,6 @@ static int ena_request_mgmnt_irq(ena_adapter *adapter) {
   }
 
   auto vec = assigned[0];
-  adapter->mgmnt_stop.store(false, std::memory_order_release);
-  adapter->mgmnt_pending.store(false, std::memory_order_release);
-  adapter->mgmnt_thread = sched::thread::make([adapter]() { ena_mgmnt_work(adapter); });
-  adapter->mgmnt_thread->start();
   // should be pinned
   if (!msi.assign_isr(vec, [adapter]() { ena_intr_msix_mgmnt(adapter); })) {
     msi.free_vectors(assigned);
@@ -2805,6 +2801,13 @@ static int ena_request_mgmnt_irq(ena_adapter *adapter) {
             ENA_MGMNT_IRQ_IDX);
     return (ENXIO);
   }
+
+  // Only now, with the vector set up and still masked: a failure above
+  // would otherwise leave the thread running with nothing to wake it.
+  adapter->mgmnt_stop.store(false, std::memory_order_release);
+  adapter->mgmnt_pending.store(false, std::memory_order_release);
+  adapter->mgmnt_thread = sched::thread::make([adapter]() { ena_mgmnt_work(adapter); });
+  adapter->mgmnt_thread->start();
 
   ena_irq *irq = &adapter->irq_tbl[ENA_MGMNT_IRQ_IDX];
   irq->vector = ENA_MGMNT_IRQ_IDX;
