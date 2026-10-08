@@ -243,7 +243,12 @@ def launch(ec2_client, run_kwargs: dict, market: str, zone=None) -> tuple[dict, 
     zone_of = lambda sn: (sn[1] if sn else "the default zone")
     sns = spot_subnets(ec2_client, run_kwargs.get("SubnetId"))
     if zone:
-        sns = [sn for sn in sns if sn[1] == zone]
+        # Without --subnet there is no VPC to look through, and a VPC
+        # without a subnet in the zone cannot launch there either.
+        sns = [sn for sn in sns if sn and sn[1] == zone]
+        if not sns:
+            raise SystemExit(f"--zone {zone}: no subnet of the VPC is in it"
+                             + ("" if run_kwargs.get("SubnetId") else " (--zone needs --subnet)"))
         run_kwargs = dict(run_kwargs, SubnetId=sns[0][0])
     if market == "on-demand":
         return submit(ec2_client, run_kwargs), "on-demand", zone_of(sns[0])
@@ -266,10 +271,11 @@ def launch(ec2_client, run_kwargs: dict, market: str, zone=None) -> tuple[dict, 
         except ClientError as e:
             last = e.response.get("Error", {})
             print(f"Spot not provided in {zone_of(sn)} ({last.get('Code')})", flush=True)
+    last = last or {}
     if market != "spot-or-on-demand":
         raise SystemExit(f"spot requested but not provided: {last.get('Code')}: "
                          f"{last.get('Message')}")
-    print("Falling back to on-demand")
+    print("Falling back to on-demand", flush=True)
     return submit(ec2_client, run_kwargs), "on-demand", zone_of(sns[0])
 
 
