@@ -130,9 +130,20 @@ inline uint64_t pmcr_read() {
   return pmcr;
 }
 
-// Defined below; enable_pmu() probes the counter width while no counter has
-// been reserved yet, because the probe writes PMEVCNTR0.
-inline uint32_t pmu_probe_event_counter_width();
+inline uint32_t pmu_version() {
+  uint64_t dfr0;
+  // ID_AA64DFR0_EL1.PMUVer, bits 11:8: 0 no PMU, 1 PMUv3, 4 v3p1, 5 v3p4,
+  // 6 v3p5, ..., 0xF IMPLEMENTATION DEFINED
+  // (Arm ARM DDI 0487, ID_AA64DFR0_EL1).
+  asm volatile("mrs %0, id_aa64dfr0_el1" : "=r"(dfr0));
+  return (dfr0 >> 8) & 0xF;
+}
+
+// Support for 64-bit event counters (FEAT_PMUv3p5, PMCR_EL0.LP).
+inline bool pmu_has_long_event_counters() {
+  uint32_t version = pmu_version();
+  return version >= 6 && version != 0xF;
+}
 
 inline void enable_pmu() {
   // Clear all counter enables, interrupt enables and overflow flags: they are
@@ -144,23 +155,19 @@ inline void enable_pmu() {
                "isb" ::"r"((uint64_t)0xFFFFFFFF)
                : "memory");
 
-  // LC|LP widen the counters to 64 bits; LP is RES0 before FEAT_PMUv3p5.
-  uint64_t pmcr = (pmcr_read() | pmcr_e | pmcr_p | pmcr_c | pmcr_lc | pmcr_lp) &
-                  ~pmcr_d;
+  // LC|LP widen the counters to 64 bits; LP needs FEAT_PMUv3p5.
+  uint64_t lp = pmu_has_long_event_counters() ? pmcr_lp : 0;
+  uint64_t pmcr =
+      (pmcr_read() | pmcr_e | pmcr_p | pmcr_c | pmcr_lc | lp) & ~pmcr_d;
   asm volatile("msr pmcr_el0, %0\n\tisb" ::"r"(pmcr) : "memory");
 
   static bool warned = false;
-  if (!warned && !(pmcr_read() & pmcr_lp)) {
+  if (!warned && !lp) {
     warned = true;
     std::cout << "This PMU has no FEAT_PMUv3p5: the event counters are 32 bits "
                  "wide and wrap after 2^32 events."
               << std::endl;
   }
-
-  // Probe here, while no counter has been handed out: the probe writes
-  // PMEVCNTR0, and doing it lazily from Event::start() would corrupt a
-  // measurement that is already running on counter 0.
-  (void)pmu_probe_event_counter_width();
 }
 
 inline void pmc_stop(uint32_t counter) {
@@ -267,15 +274,10 @@ inline void pmc_ack_overflow_mask(uint64_t mask, PMCIntHandle) {
   asm volatile("msr pmovsclr_el0, %0\n\tisb" ::"r"(mask) : "memory");
 }
 
-inline uint32_t pmu_probe_event_counter_width() {
-  static const uint32_t width = [] {
-    uint64_t saved = pmc_read(0);
-    pmc_write_counter(0, 1ull << 32);
-    uint64_t back = pmc_read(0);
-    pmc_write_counter(0, saved);
-    return back ? 64u : 32u;
-  }();
-  return width;
+// Width of the event counters: 64 bits with support for FEAT_PMUv3p5 and
+// PMCR_EL0.LP set, 32 otherwise.
+inline uint32_t pmu_event_counter_width() {
+  return pmu_has_long_event_counters() && (pmcr_read() & pmcr_lp) ? 64 : 32;
 }
 
 // Where overflow is recorded, not the register size: PMCCNTR_EL0 counts 64-bit
@@ -283,7 +285,7 @@ inline uint32_t pmu_probe_event_counter_width() {
 inline uint32_t pmc_overflow_width(uint32_t counter) {
   if (counter == (1u << 31))
     return (pmcr_read() & pmcr_lc) ? 64 : 32;
-  return (pmcr_read() & pmcr_lp) ? pmu_probe_event_counter_width() : 32;
+  return pmu_event_counter_width();
 }
 
 // PMOVSCLR_EL0 reads as the overflow status; writing clears the bits set.
@@ -513,7 +515,8 @@ inline void pmu_dump_state() {
             << pmcr_read() << " pmceid0=0x" << pmceid0_read() << " pmceid1=0x"
             << pmceid1_read() << " pmcntenset=0x" << pmcnten << std::dec
             << " counters=" << pmu_num_counters()
-            << " event-counter-width=" << pmu_probe_event_counter_width()
+            << " pmuver=0x" << std::hex << pmu_version() << std::dec
+            << " event-counter-width=" << pmu_event_counter_width()
             << std::endl;
 
   std::cout << "PMU implemented events:";
