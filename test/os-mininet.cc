@@ -14,6 +14,7 @@ extern "C" {
 uint32_t mininet_selftest(int verbose);
 int mininet_get(const char *head, uint64_t head_len, void *buf, uint64_t cap, void *out);
 int mininet_is_up(void);
+size_t mininet_stats_size(void);
 const char *mininet_strerror(int rc);
 }
 
@@ -121,6 +122,11 @@ void test_stats_zeroed()
 {
 	printf("-- conn_stats\n");
 
+	check(sizeof(mininet::conn_stats) == mininet_stats_size(),
+	      "conn_stats is laid out like stats::Stats");
+	if (sizeof(mininet::conn_stats) != mininet_stats_size()) {
+		return;   /* stats() would write past c */
+	}
 	mininet::conn_stats c = mininet::stats();
 	check(c.requests_served == 0, "no requests served before the stack is up");
 	check(c.requests_reused == 0, "no requests reused before the stack is up");

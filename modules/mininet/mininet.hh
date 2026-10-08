@@ -114,6 +114,9 @@ struct conn_stats {
     uint64_t get_calls;
     uint64_t get_ns_total;
     uint64_t active_ns_total;
+    uint64_t rx_jumbo_pkts;
+    uint64_t rx_jumbo_bytes;
+    uint64_t rx_len_max;
     uint64_t nic_ipackets;
     uint64_t nic_ibytes;
     uint64_t nic_imissed;

@@ -277,6 +277,13 @@ pub extern "C" fn mininet_conn_stats() -> crate::stats::Stats {
     crate::stats::snapshot()
 }
 
+/// What `mininet_conn_stats` writes through its return slot, for a caller to
+/// check against its own struct before the first call.
+#[unsafe(no_mangle)]
+pub extern "C" fn mininet_stats_size() -> usize {
+    core::mem::size_of::<crate::stats::Stats>()
+}
+
 /// Zero the counters, so what follows is measured on its own. For a caller
 /// that runs several pieces of work in one boot: the sums can be recovered by
 /// differencing two snapshots, but the maxima and the setup/dial averages
