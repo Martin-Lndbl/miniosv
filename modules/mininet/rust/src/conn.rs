@@ -418,8 +418,11 @@ impl Conn {
                     progress = true;
                 }
                 ConnectionState::EncodeTlsData(mut et) => {
+                    // Room for one record past what is queued; a plain
+                    // resize to the cap would cut a longer queue short and
+                    // then index past its end.
                     let head = self.outgoing.len();
-                    self.outgoing.resize(TLS_BUF_CAP, 0);
+                    self.outgoing.resize(core::cmp::max(TLS_BUF_CAP, head + RECORD_MAX), 0);
                     match et.encode(&mut self.outgoing[head..]) {
                         Ok(n) => {
                             self.outgoing.truncate(head + n);
