@@ -351,7 +351,7 @@ struct Event {
       return;
     poll();
     after = pmc->read();
-    if (after < last)
+    if (width < 64 && after < last)
       polled += 1ull << width;
     pmc->stop();
     pmcs.disarm_wrap_counting(pmc);
