@@ -274,14 +274,38 @@ impl Worker {
         }
     }
 
-    /// Open `slot` on the next port in the rotation.
+    /// Open `slot` on the next port in the rotation that no live socket holds.
     pub fn connect_next(&mut self, slot: usize, head: &[u8], sink: Box<dyn BodySink>) -> Result<(), Error> {
         if self.resolve {
             self.adopt(); // before the port: the rotation is the address's
         }
-        let src_port = self.rotation[self.next_port % self.rotation.len()];
-        self.next_port = self.next_port.wrapping_add(1);
+        // smoltcp does not check: a SYN on a 4-tuple the peer still has open
+        // draws a challenge ACK on that connection and never a SYN-ACK, and
+        // a kept-alive slot can outlive a whole turn of the rotation.
+        let n = self.rotation.len();
+        let mut src_port = None;
+        for _ in 0..n {
+            let p = self.rotation[self.next_port % n];
+            self.next_port = self.next_port.wrapping_add(1);
+            if !self.port_in_use(p) {
+                src_port = Some(p);
+                break;
+            }
+        }
+        let Some(src_port) = src_port else {
+            println!("p{}q{}[{}] every port in the rotation is open", self.port, self.queue_id, slot);
+            return Err(Error::ConnectRejected);
+        };
         self.connect_on(slot, src_port, head, sink)
+    }
+
+    fn port_in_use(&self, port: u16) -> bool {
+        self.sockets.iter().any(|(_, s)| match s {
+            smoltcp::socket::Socket::Tcp(t) => {
+                t.state() != tcp::State::Closed && t.local_endpoint().map_or(false, |e| e.port == port)
+            }
+            _ => false,
+        })
     }
 
     fn connect_on(&mut self, slot: usize, src_port: u16, head: &[u8], sink: Box<dyn BodySink>) -> Result<(), Error> {
