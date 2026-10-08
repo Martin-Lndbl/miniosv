@@ -8,6 +8,7 @@
 #include <cstring>
 
 #include "modules/mininet/mininet.hh"
+#include "modules/mininet/shim/shim.hh"
 
 extern "C" {
 // The Rust side's unit tests: returns how many checks failed.
@@ -48,11 +49,16 @@ void test_get_argument_validation()
 	      "null buffer with nonzero cap on a down stack reports not-up");
 }
 
-// With no NIC, up() reports it and leaves the stack down.
+// With no NIC, up() reports it and leaves the stack down. With one, the
+// same call would bring the stack up for real, so the check is skipped.
 void test_up_without_nic()
 {
 	printf("-- up without a NIC\n");
 
+	if (shim_eth_dev_count() != 0) {
+		printf("  skipped: a NIC is present\n");
+		return;
+	}
 	mininet::config c {};
 	c.host = "bucket.example";
 	c.address = "10.0.0.1";
