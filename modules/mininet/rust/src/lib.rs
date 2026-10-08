@@ -104,13 +104,16 @@ impl Stack {
     pub fn up(cfg: &Config<'_>) -> Result<Stack, Error> {
         let n_ports = nic::count();
         let available: u16 = (0..n_ports).map(|p| nic::clamp_queues(p, u16::MAX)).sum();
-        // 0 asks for everything the hardware has.
-        let want = if cfg.queues == 0 { available } else { cfg.queues.max(1) };
-        let queues = core::cmp::min(want, available.max(1));
+        // One cpu stays with the application: a worker never yields its own.
+        let cpus = unsafe { crate::ffi::shim_cpu_count() } as u16;
+        let ceiling = core::cmp::min(available.max(1), cpus.saturating_sub(1).max(1));
+        // 0 asks for everything the hardware and the cpus allow.
+        let want = if cfg.queues == 0 { ceiling } else { cfg.queues.max(1) };
+        let queues = core::cmp::min(want, ceiling);
         if queues != want {
             println!(
-                "clamping workers {} -> {} ({} port(s), device max)",
-                want, queues, n_ports
+                "clamping workers {} -> {} ({} port(s), {} queues, {} cpus)",
+                want, queues, n_ports, available, cpus
             );
         }
         if n_ports > 1 {
