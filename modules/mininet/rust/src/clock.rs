@@ -31,6 +31,3 @@ impl Default for MonoClock {
         Self::new()
     }
 }
-
-/// Poll-iteration budget for the setup phase.
-pub const ITER_BUDGET: u64 = 20_000_000_000;

@@ -10,13 +10,18 @@ use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address};
 
 use crate::arp;
-use crate::clock::{MonoClock, ITER_BUDGET};
+use crate::clock::MonoClock;
 use crate::device::DpdkDevice;
 use crate::dns;
 use crate::error::Error;
 use crate::ffi::{shim_mbuf_alloc_tx, shim_mbuf_free, shim_mbuf_rx_burst_n, shim_mbuf_tx_burst};
 use crate::nic::PktPool;
 use crate::Netif;
+
+/// Wall-clock limits on the two things boot waits for. DHCP on EC2 answers
+/// within a second; a fresh ENI's first ARP can take a few.
+const DHCP_TIMEOUT_MS: i64 = 30_000;
+const ARP_TIMEOUT_MS: i64 = 10_000;
 
 fn acquire(
     iface: &mut Interface,
@@ -26,7 +31,6 @@ fn acquire(
     clk: &MonoClock,
 ) -> Result<(smoltcp::wire::Ipv4Cidr, Ipv4Address, [u8; 4]), Error> {
     println!("DHCP: requesting lease...");
-    let mut iter: u64 = 0;
     loop {
         let now_ms = clk.elapsed_ms();
         iface.poll(Instant::from_millis(now_ms), dev, sockets);
@@ -59,8 +63,7 @@ fn acquire(
             Some(dhcpv4::Event::Deconfigured) => println!("DHCP: deconfigured"),
             None => {}
         }
-        iter = iter.wrapping_add(1);
-        if iter > ITER_BUDGET / 10 {
+        if now_ms > DHCP_TIMEOUT_MS {
             println!("DHCP: timeout after {} ms", now_ms);
             return Err(Error::DhcpTimeout);
         }
@@ -132,7 +135,7 @@ pub(crate) fn learn_network(
         let _ = shim_mbuf_tx_burst(port, 0, &mut handle, &(n as u16), 1);
     }
 
-    let mut iter: u64 = 0;
+    let arp_start_ms = clk.elapsed_ms();
     loop {
         let mut handle = [ptr::null_mut::<c_void>(); 1];
         let mut data = [ptr::null::<u8>(); 1];
@@ -153,9 +156,8 @@ pub(crate) fn learn_network(
                 return Ok(netif);
             }
         }
-        iter = iter.wrapping_add(1);
-        if iter > ITER_BUDGET / 20 {
-            println!("FAIL: gateway ARP timed out");
+        if clk.elapsed_ms() - arp_start_ms > ARP_TIMEOUT_MS {
+            println!("FAIL: gateway ARP timed out after {} ms", ARP_TIMEOUT_MS);
             return Err(Error::ArpTimeout);
         }
     }
