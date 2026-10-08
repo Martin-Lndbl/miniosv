@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::ffi::c_void;
 use core::ptr;
-use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use crate::endpoint::Endpoint;
 use crate::error::Error;
@@ -93,7 +93,15 @@ struct Queue {
     tail: UnsafeCell<*mut Slot>,
     /// Boxed so its address survives the queue being moved into its `Arc`.
     stub: Box<Slot>,
+    /// Worker::new's verdict, for [`Service::start`] to wait on: `BOOTING`,
+    /// `UP`, or `DOWN` with the error in `boot_err`.
+    ready: AtomicU8,
+    boot_err: UnsafeCell<Option<Error>>,
 }
+
+const BOOTING: u8 = 0;
+const UP: u8 = 1;
+const DOWN: u8 = 2;
 
 unsafe impl Send for Queue {}
 unsafe impl Sync for Queue {}
@@ -106,6 +114,8 @@ impl Queue {
             head: AtomicPtr::new(p),
             tail: UnsafeCell::new(p),
             stub,
+            ready: AtomicU8::new(BOOTING),
+            boot_err: UnsafeCell::new(None),
         }
     }
 
@@ -181,7 +191,9 @@ fn worker_cpu(q: u16) -> usize {
 }
 
 impl Service {
-    /// Spawn a worker per queue, each pinned to a cpu of its own, never joined.
+    /// Spawn a worker per queue, each pinned to a cpu of its own, never
+    /// joined, and wait for every one to come up: a worker that cannot is
+    /// the stack's failure, not a share of every request's.
     pub fn start(stack: &Stack, cfg: &ServiceConfig) -> Result<Service, Error> {
         let mut queues = Vec::with_capacity(stack.queues() as usize);
         for q in 0..stack.queues() {
@@ -195,6 +207,16 @@ impl Service {
                 Some(worker_cpu(q)),
             );
             queues.push(queue);
+        }
+        for q in &queues {
+            while q.ready.load(Ordering::Acquire) == BOOTING {
+                core::hint::spin_loop();
+            }
+            if q.ready.load(Ordering::Acquire) == DOWN {
+                // The workers that did come up keep polling; nothing is
+                // handed to them, and the pools are never freed.
+                return Err(unsafe { *q.boot_err.get() }.unwrap_or(Error::NoDevice));
+            }
         }
         Ok(Service {
             queues,
@@ -364,14 +386,13 @@ fn serve(
         Ok(w) => w,
         Err(e) => {
             println!("FAIL: q{}: {:?}", queue_id, e);
-            loop {
-                if let Some(p) = queue.pop() {
-                    unsafe { Slot::complete(p, Err(e)) };
-                }
-                core::hint::spin_loop();
-            }
+            // Written before the flag; Service::start reads it after.
+            unsafe { *queue.boot_err.get() = Some(e) };
+            queue.ready.store(DOWN, Ordering::Release);
+            return;
         }
     };
+    queue.ready.store(UP, Ordering::Release);
 
     let mut pending: Vec<Option<Pending>> = (0..w.slots()).map(|_| None).collect();
     let epoch_ns = w.clock().epoch_ns();
