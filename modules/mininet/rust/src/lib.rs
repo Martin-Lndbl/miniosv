@@ -174,16 +174,15 @@ impl Stack {
     }
 }
 
-/// Print, then stop: the console is all there is.
+/// Print, then the kernel's abort: a halted guest is a verdict the harness
+/// sees, a worker spinning on its cpu with every submitter parked is not.
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     println!("mininet: PANIC: {}", info.message());
     if let Some(loc) = info.location() {
         println!("mininet: at {}:{}", loc.file(), loc.line());
     }
-    loop {
-        core::hint::spin_loop()
-    }
+    unsafe { ffi::shim_abort(c"mininet: panic".as_ptr()) }
 }
 
 /// Named by the eh_frame rustc emits; there is no unwinding.

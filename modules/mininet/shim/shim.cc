@@ -11,6 +11,7 @@
 #include <minidpdk/defs.hh>
 #include <minidpdk/net.hh>
 #include <minidpdk/rss.hh>
+#include <osv/debug.hh>
 #include <osv/sched.hh>
 
 namespace {
@@ -320,6 +321,8 @@ uint64_t shim_time_ns(void) {
   return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull +
          static_cast<uint64_t>(ts.tv_nsec);
 }
+
+void shim_abort(const char *what) { abort("%s\n", what); }
 
 uint64_t shim_cpu_count(void) {
   return static_cast<uint64_t>(sched::cpus.size());

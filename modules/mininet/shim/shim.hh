@@ -67,6 +67,9 @@ uint64_t shim_time_ns(void);
 
 uint64_t shim_cpu_count(void);
 
+// The kernel's abort: message, backtrace, halt. For the crate's panic handler.
+void shim_abort(const char *what) __attribute__((noreturn));
+
 void *shim_malloc(uint64_t size);
 void  shim_free(void *ptr);
 void *shim_realloc(void *ptr, uint64_t size);

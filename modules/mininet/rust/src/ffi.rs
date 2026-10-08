@@ -18,6 +18,7 @@ extern "C" {
     /// Monotonic, for smoltcp's timers.
     pub fn shim_time_ns() -> u64;
     pub fn shim_cpu_count() -> u64;
+    pub fn shim_abort(what: *const core::ffi::c_char) -> !;
     pub fn write(fd: c_int, buf: *const u8, count: usize) -> isize;
 
     pub fn shim_eth_dev_count() -> u16;
