@@ -25,6 +25,7 @@ enum : int {
     E_NOT_UP          = -12,
     E_BAD_ARGUMENT    = -13,
     E_DNS             = -14,  // no resolver from DHCP, or no answer
+    E_CONNECTION_LOST = -15,  // peer reset, or silent for 30 s, with a request open
 };
 
 struct config {

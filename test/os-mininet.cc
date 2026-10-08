@@ -80,7 +80,8 @@ void test_strerror()
 		mininet::E_RSS,       mininet::E_DHCP,        mininet::E_ARP,
 		mininet::E_NO_PORTS,  mininet::E_CONNECT,     mininet::E_SYN_TIMEOUT,
 		mininet::E_TLS,       mininet::E_BAD_RESPONSE, mininet::E_BUFFER_TOO_SMALL,
-		mininet::E_NOT_UP,    mininet::E_BAD_ARGUMENT,
+		mininet::E_NOT_UP,    mininet::E_BAD_ARGUMENT, mininet::E_DNS,
+		mininet::E_CONNECTION_LOST,
 	};
 	const size_t n = sizeof(codes) / sizeof(codes[0]);
 

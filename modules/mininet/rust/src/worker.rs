@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 use rustls::client::ClientConfig;
 use smoltcp::iface::{Config, Interface, PollResult, SocketHandle, SocketSet, SocketStorage};
 use smoltcp::socket::tcp;
-use smoltcp::time::Instant;
+use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address};
 
 use crate::arp;
@@ -159,6 +159,8 @@ impl Worker {
                 Box::leak(alloc::vec![0u8; cfg.tx_buffer].into_boxed_slice());
             let mut sock = tcp::Socket::new(tcp::SocketBuffer::new(rx), tcp::SocketBuffer::new(tx));
             sock.set_ack_delay(None);
+            sock.set_keep_alive(Some(Duration::from_secs(crate::conn::KEEP_ALIVE_S)));
+            sock.set_timeout(Some(Duration::from_secs(crate::conn::PEER_TIMEOUT_S)));
             handles.push(sockets.add(sock));
         }
         let refresher = (cfg.resolve && h.port == 0 && h.queue_id == 0)

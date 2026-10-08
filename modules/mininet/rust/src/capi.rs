@@ -27,6 +27,7 @@ const E_BUFFER_TOO_SMALL: c_int = -11;
 const E_NOT_UP: c_int = -12;
 const E_BAD_ARGUMENT: c_int = -13;
 const E_DNS: c_int = -14;
+const E_CONNECTION_LOST: c_int = -15;
 
 fn code(e: Error) -> c_int {
     match e {
@@ -42,6 +43,7 @@ fn code(e: Error) -> c_int {
         Error::BadResponse => E_BAD_RESPONSE,
         Error::BufferTooSmall => E_BUFFER_TOO_SMALL,
         Error::Dns => E_DNS,
+        Error::ConnectionLost => E_CONNECTION_LOST,
     }
 }
 
@@ -323,6 +325,7 @@ pub extern "C" fn mininet_strerror(rc: c_int) -> *const c_char {
         E_NOT_UP => "mininet is not up\0",
         E_BAD_ARGUMENT => "bad argument\0",
         E_DNS => "DNS: no resolver from DHCP, or no answer\0",
+        E_CONNECTION_LOST => "connection lost: peer reset, or silent past the timeout\0",
         _ => "unknown error\0",
     };
     s.as_ptr() as *const c_char

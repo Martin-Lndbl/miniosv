@@ -18,4 +18,7 @@ pub enum Error {
     BufferTooSmall,
     /// No resolver from DHCP, or no answer.
     Dns,
+    /// The socket closed under an open request: the peer's RST, or no packet
+    /// from it in PEER_TIMEOUT_S.
+    ConnectionLost,
 }

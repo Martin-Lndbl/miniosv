@@ -18,6 +18,11 @@ use crate::stats;
 use crate::tls::TLS_BUF_CAP;
 
 const SYN_TIMEOUT_NS: u64 = 5_000_000_000;
+/// A peer gone quiet: probed every KEEP_ALIVE_S once idle, and the socket
+/// aborts after PEER_TIMEOUT_S without a packet from it. S3 answers a probe
+/// at once, so only a dead peer, or a path that lost its state, trips it.
+pub(crate) const KEEP_ALIVE_S: u64 = 5;
+pub(crate) const PEER_TIMEOUT_S: u64 = 30;
 /// A TLS record at most: header, 2^14 of payload, the AEAD's expansion.
 const RECORD_MAX: usize = 5 + 16384 + 256;
 
@@ -250,6 +255,16 @@ impl Conn {
                 stats::conn_failed(since_syn);
             }
             return self.finish(Step::Failed(Error::SynTimeout));
+        }
+
+        // Closed under us -- smoltcp's timeout, or the peer's RST -- with the
+        // request still open: nothing more will arrive on it.
+        if state == tcp::State::Closed {
+            if !self.settled {
+                self.settled = true;
+                stats::conn_failed(since_syn);
+            }
+            return self.finish(Step::Failed(Error::ConnectionLost));
         }
 
         if self.tls.is_none() && !self.request_queued && s.may_send() {
