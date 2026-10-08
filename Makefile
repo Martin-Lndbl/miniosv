@@ -546,7 +546,7 @@ endif
 # in its own directory with a Makefile fragment that lists its objects in
 # $(app-objects); the kernel compiles and links them with its own flags.
 #   make            -> the user application   (app/)
-#   make app=test   -> the test application   (test/)
+#   make app=tests  -> the test application   (tests/)
 app ?= app
 include $(app)/Makefile
 objects += $(app-objects)
