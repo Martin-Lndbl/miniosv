@@ -90,7 +90,7 @@ else
 $(error unsupported architecture $(arch))
 endif
 
-CROSS_PREFIX ?= $(if $(filter-out $(arch),$(host_arch)),$(arch)-linux-gnu-)
+CROSS_PREFIX ?= $(if $(filter-out $(arch),$(host_arch)),$(ARCH_STR)-linux-gnu-)
 # Pure-LLVM toolchain: one clang/clang++ that cross-compiles by target triple
 # (no per-arch GNU gcc). When building for a non-host arch, point clang at the
 # target with --target=<triple> derived from CROSS_PREFIX (strip trailing '-').
@@ -403,6 +403,11 @@ $(out)/%.o: %.cc | generated-headers $(out)/.libcxx-built
 	$(makedir)
 	$(call quiet, $(CXX) $(CXXFLAGS) -c -o $@ $<, CXX $*.cc)
 
+# The kernel itself uses .cc throughout; .cpp is here for the applications
+$(out)/%.o: %.cpp | generated-headers $(out)/.libcxx-built
+	$(makedir)
+	$(call quiet, $(CXX) $(CXXFLAGS) -c -o $@ $<, CXX $*.cpp)
+
 $(out)/%.o: %.c | generated-headers
 	$(makedir)
 	$(call quiet, $(CC) $(CFLAGS) -c -o $@ $<, CC $*.c)
@@ -537,17 +542,13 @@ endif
 # The application is statically linked into the kernel image and entered via
 # osv_app_main(). There is no separate app .so or filesystem image.
 #
-# Two build modes select which application is linked in. Each application lives
+# The build mode select which application is linked in. Each application lives
 # in its own directory with a Makefile fragment that lists its objects in
 # $(app-objects); the kernel compiles and links them with its own flags.
 #   make            -> the user application   (app/)
-#   make app=tests  -> the test application   (test/)
-app ?= default
-ifeq ($(app),tests)
-include test/Makefile
-else
-include app/Makefile
-endif
+#   make app=test   -> the test application   (test/)
+app ?= app
+include $(app)/Makefile
 objects += $(app-objects)
 
 # Record the selected app mode so that switching between `make` and
@@ -560,6 +561,17 @@ $(app_mode_dep): app_mode_phony
 	@if [ "$$(cat $(app_mode_dep) 2>/dev/null)" != "$(app)" ]; then \
 		echo -n "$(app)" > $(app_mode_dep); \
 	fi
+
+# Set the location of the application for the defered constructors.
+# see .init_array_late in arch/$(arch)/loader.ld)
+app_init_late = $(out)/app_init_late.ld
+app_objs = *$(patsubst %/,%,$(app))/*
+app_init_late_pattern = KEEP($(app_objs)(SORT_BY_INIT_PRIORITY(.init_array.*) SORT_BY_INIT_PRIORITY(.ctors.*))) KEEP($(app_objs)(.init_array .ctors))
+$(app_init_late): app_mode_phony
+	$(call very-quiet, $(makedir))
+	@if [ "$$(cat $(app_init_late) 2>/dev/null)" != "$(app_init_late_pattern)" ]; then \
+		echo '$(app_init_late_pattern)' > $(app_init_late); \
+	fi
 # Minimal boot-time self-relocator (replaces the relocation half of the old
 # ELF loader). Per-arch: the relocation-type switch differs (x64 vs aarch64).
 objects += arch/$(arch)/relocate.o
@@ -570,6 +582,11 @@ objects += arch/$(arch)/smp.o
 objects += arch/$(arch)/tlsdesc.o
 objects += arch/$(arch)/entry.o
 objects += arch/$(arch)/mmu.o
+# Arch-specific memcmp, overriding the generic libc's. x64 only
+ifeq ($(arch),x64)
+objects += arch/$(arch)/string.o
+$(out)/arch/$(arch)/string.o: CXXFLAGS += -fno-builtin
+endif
 objects += arch/$(arch)/exceptions.o
 objects += arch/$(arch)/dump.o
 objects += arch/$(arch)/cpuid.o
@@ -855,10 +872,22 @@ def_symbols = --defsym=OSV_KERNEL_BASE=$(kernel_base) \
               --defsym=OSV_KERNEL_VM_SHIFT=$(kernel_vm_shift)
 endif
 
-$(out)/loader.elf: $(stage1_targets) arch/$(arch)/loader.ld $(app_mode_dep) $(llvm_libc_dep) $(libcxx_dep) $(compiler_rt_dep)
+# The objects go to the linker through a response file, one per line: a large
+# application overflows the argument list.
+empty :=
+space := $(empty) $(empty)
+define newline
+
+
+endef
+link-inputs = $(patsubst %.ld,-T %.ld,$(filter-out $(app_mode_dep) $(app_init_late) $(llvm_libc_dep) $(libcxx_dep) $(compiler_rt_dep),$^))
+
+$(out)/loader.elf: $(stage1_targets) arch/$(arch)/loader.ld $(app_mode_dep) $(app_init_late) $(llvm_libc_dep) $(libcxx_dep) $(compiler_rt_dep)
+	$(call very-quiet, $(makedir))
+	$(file > $@.objects,$(subst $(space),$(newline),$(link-inputs)))
 	$(call quiet, $(LD) -o $@ $(def_symbols) \
-		-static --eh-frame-hdr -L$(out)/arch/$(arch) \
-            $(patsubst %.ld,-T %.ld,$(filter-out $(app_mode_dep) $(llvm_libc_dep) $(libcxx_dep) $(compiler_rt_dep),$^)) \
+		-static --eh-frame-hdr -L$(out)/arch/$(arch) -L$(out) \
+	    @$@.objects \
 	    $(linker_archives_options) $(conf_linker_extra_options), \
 		LINK loader.elf)
 
