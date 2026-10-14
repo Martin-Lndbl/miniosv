@@ -288,6 +288,10 @@ inline std::vector<PMC> make_default_core_pmcs() {
                         PMClass::CORE);
   }
 #elif defined(__aarch64__)
+  // Without PMUv3 there is nothing to hand out, and every counter register
+  // would trap.
+  if (pmu_version() == 0)
+    return pmcs;
   // Armv8 PMUv3 usually has 6 counters (ids 0-5).
   for (uint32_t i = 0; i < 6; ++i)
     pmcs.emplace_back(i, i, PMClass::CORE);

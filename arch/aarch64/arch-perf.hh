@@ -18,7 +18,19 @@ inline constexpr uint32_t midr_cortex_a76 = 0x410F'D0B0u;
 inline constexpr uint32_t midr_cortex_a55 = 0x410F'D050u;
 
 // Number of hardware event counters (PMCR_EL0.N, bits 15:11).
+inline uint32_t pmu_version() {
+  uint64_t dfr0;
+  // ID_AA64DFR0_EL1.PMUVer, bits 11:8: 0 no PMU, 1 PMUv3, 4 v3p1, 5 v3p4,
+  // 6 v3p5, ..., 0xF IMPLEMENTATION DEFINED
+  // (Arm ARM DDI 0487, ID_AA64DFR0_EL1).
+  asm volatile("mrs %0, id_aa64dfr0_el1" : "=r"(dfr0));
+  return (dfr0 >> 8) & 0xF;
+}
+
 inline uint32_t pmu_num_counters() {
+  // PMCR_EL0 and the rest of the PMU registers are undefined without PMUv3.
+  if (pmu_version() == 0)
+    return 0;
   uint64_t pmcr;
   asm volatile("mrs %0, pmcr_el0" : "=r"(pmcr));
   return (pmcr >> 11) & 0x1F;
@@ -96,6 +108,8 @@ inline uint64_t pmceid1_read() {
 enum class event_support { yes, no, unknown };
 
 inline event_support pmu_event_support(uint64_t value) {
+  if (pmu_version() == 0)
+    return event_support::no;
   uint64_t pmceid;
   uint64_t bit;
   if (value < 0x20) {
@@ -148,15 +162,6 @@ inline uint64_t pmcr_read() {
   return pmcr;
 }
 
-inline uint32_t pmu_version() {
-  uint64_t dfr0;
-  // ID_AA64DFR0_EL1.PMUVer, bits 11:8: 0 no PMU, 1 PMUv3, 4 v3p1, 5 v3p4,
-  // 6 v3p5, ..., 0xF IMPLEMENTATION DEFINED
-  // (Arm ARM DDI 0487, ID_AA64DFR0_EL1).
-  asm volatile("mrs %0, id_aa64dfr0_el1" : "=r"(dfr0));
-  return (dfr0 >> 8) & 0xF;
-}
-
 // Support for 64-bit event counters (FEAT_PMUv3p5, PMCR_EL0.LP).
 inline bool pmu_has_long_event_counters() {
   uint32_t version = pmu_version();
@@ -164,6 +169,8 @@ inline bool pmu_has_long_event_counters() {
 }
 
 inline void enable_pmu() {
+  if (pmu_version() == 0)
+    return;
   // Clear all counter enables, interrupt enables and overflow flags: they are
   // unknown at reset, and a stale flag whose interrupt is still enabled keeps
   // the level-triggered PMU interrupt asserted forever.
@@ -535,6 +542,10 @@ inline constexpr L2DCacheMissEvent L2D_CACHE_MISS{};
 } // namespace PERF_COUNT_HW
 
 inline void pmu_dump_state() {
+  if (pmu_version() == 0) {
+    std::cout << "PMU: none (ID_AA64DFR0_EL1.PMUVer is 0)" << std::endl;
+    return;
+  }
   uint64_t pmcnten;
   asm volatile("mrs %0, pmcntenset_el0" : "=r"(pmcnten));
   std::cout << "PMU: core=" << midr_core_name(midr_read()) << " midr=0x"
