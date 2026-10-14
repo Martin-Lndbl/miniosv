@@ -163,6 +163,12 @@ inline PMCIntHandle pmc_attach_overflow_handler(std::function<void()> handler) {
   return vector;
 }
 
+// LVTPC carries one vector per handler, so there is nothing to claim.
+inline PMCIntHandle pmc_attach_overflow_handler(std::function<bool()>,
+                                                std::function<void()> handler) {
+  return pmc_attach_overflow_handler(std::move(handler));
+}
+
 inline void pmc_detach_overflow_handler(PMCIntHandle vector, uint64_t /*mask*/) {
   processor::apic->write(processor::apicreg::LVTPC, 1u << 16);
   idt.unregister_handler(vector);

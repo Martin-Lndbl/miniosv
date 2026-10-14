@@ -163,7 +163,13 @@ struct PMCSelect {
     if (pmc_overflow_width(0) > 32)
       return;
     unsigned cpu = sched::cpu::current()->id;
-    wrap_irq = pmc_attach_overflow_handler([this, cpu] {
+    wrap_irq = pmc_attach_overflow_handler(
+        [this, cpu] {
+          return sched::cpu::current()->id == cpu &&
+                 (pmu_overflow_status() &
+                  armed_mask.load(std::memory_order_relaxed)) != 0;
+        },
+        [this, cpu] {
       // One PMU interrupt is shared by every handler: the other cpus' tables
       // and any PMCSampler are attached to it too. Touch only the counters
       // this table armed on its own cpu, and ack only those -- acking the
@@ -647,7 +653,8 @@ struct PMCSampler {
     // in: the PMU interrupt is level-triggered, so a stale flag would fire the
     // handler the moment it is attached.
     pmc_clear_overflow(ack);
-    vector = pmc_attach_overflow_handler([this] {
+    vector = pmc_attach_overflow_handler(
+        [this] { return pmc_overflow_pending(ack); }, [this] {
       // The interrupt is shared with the wrap-counting handler and with the
       // other clusters' tables, so it fires for overflows that are not ours.
       if (!pmc_overflow_pending(ack))

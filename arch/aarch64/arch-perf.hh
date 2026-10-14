@@ -364,6 +364,15 @@ inline PMCIntHandle pmc_attach_overflow_handler(std::function<void()> handler) {
                            std::move(handler));
 }
 
+// The PMU interrupt is one PPI shared by every handler on the cpu, and the
+// dispatcher runs the first handler whose ack claims the interrupt. "mine"
+// is that claim, so each handler only runs for its own overflows.
+inline PMCIntHandle pmc_attach_overflow_handler(std::function<bool()> mine,
+                                                std::function<void()> handler) {
+  return new ppi_interrupt(gic::irq_type::IRQ_TYPE_LEVEL, pmu_irq_id(),
+                           std::move(mine), std::move(handler));
+}
+
 // Disables only the counters named by `mask`. Clearing PMINTENSET wholesale
 // would silently switch off the wrap-counting handler, which shares this
 // interrupt and has no way to notice.
