@@ -94,7 +94,7 @@ struct PMC {
 // calling cpu's one.
 struct PMCSelect {
   explicit PMCSelect(std::vector<PMC> pmcs)
-      : design_id(pmu_design_id()), pmcs(std::move(pmcs)) {}
+      : pmcs(std::move(pmcs)) {}
   virtual ~PMCSelect() = default;
 
   bool erase_counter(uint32_t perfEvtSel, uint32_t perfCtr, PMClass pmClass) {
@@ -227,9 +227,6 @@ struct PMCSelect {
   }
 
 protected:
-  // MIDR (ARM) or CPUID signature (x86) of the cpu this table was built on.
-  // Every cpu has its own table, so this is per cpu as well.
-  uint32_t design_id;
   std::vector<PMC> pmcs;
 
 private:
@@ -321,7 +318,11 @@ struct PerCpuPMCSelect : PMCSelect {
       owner->release(pmc);
   }
 
-  void enable_wrap_counting() override { local().enable_wrap_counting(); }
+  void enable_wrap_counting() override {
+    // local() resolves the cpu, so hold it until the table has read its id.
+    std::lock_guard<migration_lock_t> stay(migration_lock);
+    local().enable_wrap_counting();
+  }
 
   bool counts_wraps() const override { return local().counts_wraps(); }
 
@@ -399,11 +400,13 @@ struct Event {
     }
     width = pmc_overflow_width(pmc->perfCtr);
     polled = 0;
+    // Asked here, on the cpu the counter was reserved on.
+    counted_wraps = pmcs.counts_wraps();
     // A counter left at zero never reports an overflow in a KVM guest: the
     // host derives the sample period from -counter truncated to the counter's
     // width, which is zero. One event in is enough, and "before" is read
     // afterwards, so the totals stay exact.
-    uint64_t initial = width < 64 && pmcs.counts_wraps() ? 1 : 0;
+    uint64_t initial = width < 64 && counted_wraps ? 1 : 0;
     if (!pmc->start_with_conf(pmce.bitmap, initial)) {
       // The event is not implemented here; the counter stays disabled and
       // would otherwise report a plausible-looking zero.
@@ -442,7 +445,6 @@ struct Event {
     pmc->stop();
     pmcs.disarm_wrap_counting(pmc);
     wraps = pmc->wraps.load(std::memory_order_relaxed) - wraps_before;
-    counted_wraps = pmcs.counts_wraps();
     pmcs.release(pmc);
     // With the overflows added back a counter only ever counts up, so this is
     // not one: it is a read of a different cpu's PMU, or of a counter that was
@@ -485,7 +487,7 @@ struct PerfEvent {
   std::chrono::time_point<std::chrono::steady_clock> startTime;
   std::chrono::time_point<std::chrono::steady_clock> stopTime;
 
-  // Uses this instance's own core-local counter set.
+  // Measures with the calling cpu's counters.
   PerfEvent(bool set_default_counters = true) {
     enable_pmu();
 
