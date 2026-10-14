@@ -395,7 +395,12 @@ struct Event {
     }
     width = pmc_overflow_width(pmc->perfCtr);
     polled = 0;
-    if (!pmc->start_with_conf(pmce.bitmap)) {
+    // A counter left at zero never reports an overflow in a KVM guest: the
+    // host derives the sample period from -counter truncated to the counter's
+    // width, which is zero. One event in is enough, and "before" is read
+    // afterwards, so the totals stay exact.
+    uint64_t initial = width < 64 && pmcs.counts_wraps() ? 1 : 0;
+    if (!pmc->start_with_conf(pmce.bitmap, initial)) {
       // The event is not implemented here; the counter stays disabled and
       // would otherwise report a plausible-looking zero.
       pmcs.release(pmc);
