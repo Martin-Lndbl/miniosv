@@ -168,22 +168,42 @@ inline bool pmu_has_long_event_counters() {
   return version >= 6 && version != 0xF;
 }
 
-inline void enable_pmu() {
-  if (pmu_version() == 0)
+// Clears every counter enable, interrupt enable and overflow flag and resets
+// the counters: they are unknown at reset, and a stale flag whose interrupt
+// is still enabled keeps the level-triggered PMU interrupt asserted forever.
+// This stops whatever the cpu is counting, so it runs once per cpu, before
+// anything is armed there, not once per PerfEvent or PMCSampler: a sampler
+// built next to a running PerfEvent used to zero it, and vice versa. The bit
+// is set after the reset, so a preempting thread on the same cpu can at
+// worst reset twice while neither has armed a counter yet. Called with
+// migration off.
+inline void pmu_reset_once() {
+  static std::atomic<uint64_t> done{0};
+  static_assert(sched::max_cpus <= 64, "one bit per cpu");
+  uint64_t bit = 1ull << sched::cpu::current()->id;
+  if (done.load(std::memory_order_acquire) & bit)
     return;
-  // Clear all counter enables, interrupt enables and overflow flags: they are
-  // unknown at reset, and a stale flag whose interrupt is still enabled keeps
-  // the level-triggered PMU interrupt asserted forever.
   asm volatile("msr pmcntenclr_el0, %0\n\t"
                "msr pmintenclr_el1, %0\n\t"
                "msr pmovsclr_el0, %0\n\t"
                "isb" ::"r"((uint64_t)0xFFFFFFFF)
                : "memory");
+  asm volatile("msr pmcr_el0, %0\n\tisb" ::"r"(pmcr_read() | pmcr_p | pmcr_c)
+               : "memory");
+  done.fetch_or(bit, std::memory_order_acq_rel);
+}
+
+// Idempotent: only ever adds enable bits, so it is safe beside a running
+// counter on the same cpu.
+inline void enable_pmu() {
+  if (pmu_version() == 0)
+    return;
+  std::lock_guard<migration_lock_t> stay(migration_lock);
+  pmu_reset_once();
 
   // LC|LP widen the counters to 64 bits; LP needs FEAT_PMUv3p5.
   uint64_t lp = pmu_has_long_event_counters() ? pmcr_lp : 0;
-  uint64_t pmcr =
-      (pmcr_read() | pmcr_e | pmcr_p | pmcr_c | pmcr_lc | lp) & ~pmcr_d;
+  uint64_t pmcr = (pmcr_read() | pmcr_e | pmcr_lc | lp) & ~pmcr_d;
   asm volatile("msr pmcr_el0, %0\n\tisb" ::"r"(pmcr) : "memory");
 
   static bool warned = false;
